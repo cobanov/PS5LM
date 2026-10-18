@@ -1,0 +1,1398 @@
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 70b8d7d..7da0f33 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -25,6 +25,8 @@ add_library(${TARGET} STATIC
+     server-mcp.h
+     server-schema.cpp
+     server-schema.h
++    server-introspect.cpp
++    server-introspect.h
+ )
+ 
+ if (BUILD_SHARED_LIBS)
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 60c5633..8d21298 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -292,6 +292,13 @@ struct server_slot {
+ 
+     std::vector<completion_token_output> generated_token_probs;
+ 
++    // PS5LM fork: introspection results for the current task
++    server_introspect_result introspect;
++    int32_t                  introspect_n_full = 0;
++    int32_t                  introspect_n_gen  = 0;
++    int64_t                  introspect_n_bytes = 0;
++    std::vector<int64_t>     introspect_iv_modified;
++
+     bool has_next_token = true;
+     bool has_new_line   = false;
+     bool truncated      = false;
+@@ -397,6 +404,13 @@ struct server_slot {
+         generated_token_probs.clear();
+         json_schema = json();
+ 
++        // PS5LM fork: introspection state belongs to the task that just ended
++        introspect = {};
++        introspect_n_full = 0;
++        introspect_n_gen  = 0;
++        introspect_n_bytes = 0;
++        introspect_iv_modified.clear();
++
+         task_prev = std::move(task);
+         task.reset();
+ 
+@@ -953,6 +967,9 @@ public:
+ 
+     server_decision_context decision;
+ 
++    // PS5LM fork: introspection (interpretability)
++    bool is_introspect_enabled() const { return introspect_enabled; }
++
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
+@@ -1019,6 +1036,14 @@ private:
+     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+ 
++    // PS5LM fork: introspection (interpretability), env: LLAMA_INTROSPECT
++    // the capture engine is armed per request and consulted by the graph-eval
++    // callback; when nothing is armed it is a no-op on the decode path
++    bool                       introspect_enabled = false;
++    server_introspect_capture  introspect_capture;
++    int32_t                    introspect_n_layer = 0;
++    int64_t                    introspect_max_bytes = 256ll << 20; // env: LLAMA_INTROSPECT_MAX_BYTES
++
+     int n_empty_consecutive = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+@@ -1213,11 +1238,33 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // PS5LM fork: introspection (interpretability).
++        // Install the graph-eval callback that lets a request copy intermediate
++        // tensors out of the compute graph. It does nothing until a request arms
++        // it, so this does not change ordinary generation. The raw-logits half of
++        // the feature needs no callback at all: it reads the context's output
++        // buffer, which llama.cpp fills for every batch row that asks for it.
++        {
++            // Off unless asked for: LLAMA_INTROSPECT=1 in the environment, or
++            // the app's Developer setting, which sets it before the server starts.
++            const char * env = getenv("LLAMA_INTROSPECT");
++            introspect_enabled = env != nullptr && atoi(env) != 0;
++            const char * env_bytes = getenv("LLAMA_INTROSPECT_MAX_BYTES");
++            if (env_bytes != nullptr && atoll(env_bytes) > 0) {
++                introspect_max_bytes = atoll(env_bytes);
++            }
++            if (introspect_enabled) {
++                params_base.cb_eval           = server_introspect_cb;
++                params_base.cb_eval_user_data = &introspect_capture;
++            }
++            SRV_INF("introspection: %s (activation budget %" PRId64 " MiB)\n", introspect_enabled ?
++                    "enabled (POST /v1/introspect)" : "disabled (LLAMA_INTROSPECT=0)", introspect_max_bytes >> 20);
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+-
+         if (model_tgt == nullptr) {
+             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+             return false;
+@@ -1230,6 +1275,13 @@ private:
+ 
+         vocab = llama_model_get_vocab(model_tgt);
+ 
++        // PS5LM fork: number of layers, for building activation tensor names
++        introspect_n_layer = llama_model_n_layer(model_tgt);
++        if (introspect_enabled) {
++            SRV_INF("introspection: model has %d layers, vocab %d\n",
++                    introspect_n_layer, llama_vocab_n_tokens(vocab));
++        }
++
+         try {
+             decision.init(model_tgt);
+         } catch (const std::exception & e) {
+@@ -2290,6 +2342,27 @@ private:
+ 
+         res->generation_params = slot.task->params; // copy the parameters
+ 
++        // PS5LM fork: the raw logits / activations this request asked for
++        if (!slot.task->params.introspect.interventions.empty()) {
++            json ivs = json::array();
++            int64_t total = 0;
++            for (size_t k = 0; k < slot.task->params.introspect.interventions.size(); ++k) {
++                const auto & iv = slot.task->params.introspect.interventions[k];
++                json e = iv.to_json();
++                const int64_t applied = k < slot.introspect_iv_modified.size() ? slot.introspect_iv_modified[k] : 0;
++                e["modified"] = applied;
++                total += applied;
++                ivs.push_back(e);
++            }
++            slot.introspect.interventions = ivs;
++            if (total > 0) {
++                // the KV cache now holds intervened activations: do not let a later
++                // request reuse this prefix
++                slot.prompt_clear();
++            }
++        }
++        res->introspect = slot.introspect.to_json();
++
+         queue_results.send(std::move(res));
+     }
+ 
+@@ -3231,13 +3304,30 @@ private:
+         int32_t off_next = 0;
+         int32_t n_batch = llama_n_batch(ctx_tgt);
+         for (int32_t off = 0; off < batch.size(); off = off_next) {
+-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
++            // PS5LM fork: an all-positions introspection request renders one token at a
++            // time, so that every position is the newest row of its own graph
++            const int32_t introspect_step = introspect_prepare_step();
++            int32_t n_batch_use = n_batch;
++            if (introspect_step > 0) {
++                n_batch_use = std::min(n_batch, introspect_step);
++            }
++            const int32_t n_tokens = std::min(n_batch_use, batch.size() - off);
++            // PS5LM fork: the capture maps a tensor row back to a token index with this
++            introspect_capture.chunk_off = off;
+             try {
+                 scoped_timer t(t_decode, n_decode);
+                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+ 
+                 batch.render(off, n_tokens);
+-                bool ok = decode(n_batch, off);
++                bool ok = decode(n_batch_use, off);
++                if (n_batch_use != n_batch) {
++                    // decode() can shrink its batch size on failure: keep this loop in step
++                    n_batch = n_batch_use;
++                }
++                // PS5LM fork: harvest before post_decode(), which may release the slot
++                if (ok) {
++                    introspect_harvest(off, n_tokens);
++                }
+ #ifdef DEBUG_TIMINGS
+                 llama_synchronize(ctx_tgt);
+ #endif
+@@ -3978,13 +4068,21 @@ private:
+                             break;
+                         }
+ 
++                        // PS5LM fork: an introspection request may want the logits and
++                        // activations of every prompt position, and llama.cpp computes the
++                        // last layer's output only for rows that ask for it - so a
++                        // position-specific intervention needs the flag on every row too
++                        const bool introspect_all =
++                            slot.task->params.introspect.enabled &&
++                            slot.task->params.introspect.step_tokens() > 0;
++
+                         // embedding requires all tokens in the batch to be output;
+                         // MTP also wants logits at every prompt position so the
+                         // streaming hook can mirror t_h_nextn into ctx_dft.
+                         add_ok &= batch.add(slot.id,
+                             cur_tok,
+                             /* pos       = */ slot.prompt.tokens.pos_next(),
+-                            /* output    = */ slot.need_embd(),
++                            /* output    = */ slot.need_embd() || introspect_all,
+                             /* is_prompt = */ true);
+                         if (!slot.task->decision.order.empty()) {
+                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
+@@ -4286,6 +4384,159 @@ private:
+         return true;
+     }
+ 
++    // PS5LM fork: introspection (interpretability) -------------------------------
++
++    // Arms the graph-eval capture for the chunk that is about to be decoded and
++    // returns the render step: an all-positions request renders one token at a
++    // time, so that every position is the newest row of its own graph (and of the
++    // context's output buffer).
++    int32_t introspect_prepare_step() {
++        const server_slot * islot = nullptr;
++        if (introspect_enabled && batch.slot_batched != nullptr && batch.slot_batched->task != nullptr) {
++            const auto & p = batch.slot_batched->task->params.introspect;
++            if (p.enabled && p.any()) {
++                islot = batch.slot_batched;
++            }
++        }
++        if (islot == nullptr) {
++            introspect_capture.armed = false;
++            return 0;
++        }
++        introspect_capture.clear();
++        introspect_capture.row   = -1; // the newest token of the chunk
++        introspect_capture.armed = islot->task->params.introspect.want_activations() ||
++                                   islot->task->params.introspect.want_interventions();
++        if (introspect_capture.armed) {
++            introspect_capture.build_names(islot->task->params.introspect, introspect_n_layer);
++        }
++        return islot->task->params.introspect.step_tokens();
++    }
++
++    // Collects the logits of the rows that just decoded and the activations the
++    // graph-eval callback copied out of the graph. Runs on the main loop thread,
++    // between decode() and post_decode(), so the slot is still alive.
++    void introspect_harvest(int32_t off, int32_t n_tokens) {
++        if (!introspect_enabled) {
++            return;
++        }
++        // the capture engine keeps the newest row, i.e. the one this position belongs to
++        const int32_t act_index = off + n_tokens - 1;
++
++        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++
++        for (auto & slot : slots) {
++            if (slot.task == nullptr || !slot.task->params.introspect.enabled) {
++                continue;
++            }
++            const auto & p = slot.task->params.introspect;
++
++            if (slot.introspect.positions.is_null()) {
++                slot.introspect.positions = json::array();
++            }
++
++            // meta and the request's own tokenization, once per task: positions
++            // index into this list
++            if (slot.introspect.meta.is_null()) {
++                json toks = json::array();
++                for (size_t i = 0; i < slot.task->tokens.size(); ++i) {
++                    toks.push_back(json {
++                        {"index", (int) i},
++                        {"id",    slot.task->tokens[i]},
++                        {"piece", common_token_to_piece(vocab, slot.task->tokens[i], true)},
++                    });
++                }
++                slot.introspect.inputs = toks;
++                slot.introspect.meta   = json {
++                    {"model",       model_name},
++                    {"build",       llama_build_info()},
++                    {"n_vocab",     n_vocab},
++                    {"n_layer",     introspect_n_layer},
++                    {"n_ctx",       slot.n_ctx},
++                    {"n_tokens",    (int) slot.task->tokens.size()},
++                    {"n_prompt",    (int) slot.task->tokens.size()},
++                    {"request",     server_introspect_params_to_json(p)},
++                };
++            }
++
++            for (int32_t j = 0; j < n_tokens; ++j) {
++                const int32_t i = off + j;
++                const auto & bt = batch.tokens[i];
++                if (bt.id_slot != slot.id || !bt.output) {
++                    continue; // another slot's row, or a row nobody asked for
++                }
++                const bool generated = !bt.is_prompt;
++                if (generated && !p.capture_generated) {
++                    continue;
++                }
++                // the row's position is its index in the request's token list: prompt
++                // rows keep their prompt index even when a cached prefix is reused, and
++                // generated tokens continue past the prompt
++                const int32_t index = (int32_t) bt.pos[0];
++                if (!generated && !p.wants_position(index, (int32_t) slot.task->tokens.size())) {
++                    continue;
++                }
++
++                json e = json::object();
++                e["index"]     = index;
++                e["id"]        = bt.token;
++                e["piece"]     = common_token_to_piece(vocab, bt.token, true);
++                e["generated"] = generated;
++                if (generated) {
++                    e["step"] = slot.introspect_n_gen;
++                }
++
++                if (p.want_logits) {
++                    const float * logits = llama_get_logits_ith(ctx_tgt, j);
++                    if (logits != nullptr) {
++                        const bool allow_full = slot.introspect_n_full < p.max_full_rows;
++                        json lj;
++                        server_introspect_logits(logits, n_vocab, vocab, p, allow_full, lj);
++                        if (p.full && allow_full) {
++                            slot.introspect_n_full++;
++                        }
++                        e["logits"] = lj;
++                    }
++                }
++
++                if (p.want_activations() && i == act_index && !introspect_capture.data.empty()) {
++                    // bound the response: a wide activation request over a long prompt
++                    // would otherwise be gigabytes of base64
++                    size_t need = 0;
++                    for (const auto & kv : introspect_capture.data) {
++                        need += kv.second.data.size() * sizeof(float);
++                    }
++                    if (slot.introspect_n_bytes + (int64_t) need > introspect_max_bytes) {
++                        slot.introspect.truncated = true;
++                    } else {
++                        json act = json::object();
++                        for (const auto & kv : introspect_capture.data) {
++                            act[kv.first] = kv.second.to_json();
++                        }
++                        e["activations"] = act;
++                        slot.introspect_n_bytes += (int64_t) need;
++                    }
++                }
++
++                slot.introspect.positions.push_back(e);
++                if (generated) {
++                    slot.introspect_n_gen++;
++                }
++            }
++
++            // PS5LM fork: interventions are counted across the whole request
++            if (!introspect_capture.ivs.empty()) {
++                if (slot.introspect_iv_modified.size() != introspect_capture.ivs.size()) {
++                    slot.introspect_iv_modified.assign(introspect_capture.ivs.size(), 0);
++                }
++                for (size_t k = 0; k < introspect_capture.ivs.size(); ++k) {
++                    slot.introspect_iv_modified[k] += introspect_capture.ivs[k].modified;
++                }
++            }
++        }
++
++        introspect_capture.clear();
++    }
++
+     void post_decode(int32_t n_batch_tokens, int32_t off) {
+         // for checking if a given batch index is inside the current sub-batch
+         auto is_inside_view = [&](int32_t idx) {
+@@ -4842,6 +5093,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+ 
+             task.apply_chat_session(chat_session);
+ 
++            // PS5LM fork: introspection (interpretability).
++            // A request may ask for the raw logits of the positions it names and/or
++            // for the activations of the layers it names.
++            if (!task.params.introspect_json.is_null()) {
++                task.params.introspect = server_introspect_params_from_json(task.params.introspect_json);
++            }
++            if (task.params.introspect.enabled) {
++                if (!ctx_server.is_introspect_enabled()) {
++                    throw std::runtime_error("introspection is disabled on this server (start it without LLAMA_INTROSPECT=0)");
++                }
++                // one complete evaluation, no streaming: the caller wants the data, not a chat
++                task.params.stream = false;
++                task.params.verbose = true;
++                task.params.sampling.n_probs = 0;
++                // backend sampling records only the sampled candidates, which would
++                // hide the rest of the vocabulary from llama_get_logits_ith
++                task.params.sampling.backend_sampling = false;
++                if (task.params.introspect.all_positions) {
++                    // every position has to be evaluated in this request
++                    task.params.cache_prompt = false;
++                }
++                for (const auto & iv : task.params.introspect.interventions) {
++                    if (iv.position >= 0) {
++                        // the target position must be evaluated in this request
++                        task.params.cache_prompt = false;
++                    }
++                }
++            }
++
+             task.id_slot = json_value(data, "id_slot", -1);
+             sse_ping_interval = task.params.sse_ping_interval;
+ 
+@@ -5690,6 +5970,49 @@ void server_routes::init_routes() {
+         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+     };
+ 
++    // PS5LM fork: introspection (interpretability).
++    // Same task as /completion, but the request must carry an "introspect" field,
++    // the answer is never streamed, and the response gains an "introspection"
++    // object with the raw logits and/or the layer activations that were requested.
++    this->post_introspect = [this](const server_http_req & req) {
++        auto res = create_response();
++        if (!ctx_server.is_introspect_enabled()) {
++            res->error(format_error_response(
++                "introspection is disabled on this server (start it without LLAMA_INTROSPECT=0)",
++                ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++
++        json body = json::parse(req.body);
++        if (!body.is_object() || body.count("introspect") == 0 || body.at("introspect").is_null()) {
++            res->error(format_error_response(
++                "this endpoint needs an \"introspect\" field; see docs/INTROSPECTION.md",
++                ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++
++        // "messages" is welcome too: render the model's own chat template through the
++        // same code path as /v1/chat/completions, so the prompt that gets probed is
++        // exactly the prompt the model would be asked
++        json data = body;
++        if (body.count("messages") > 0 && !body.at("messages").is_null()) {
++            const json introspect_field = body.at("introspect");
++            common_chat_session session;
++            std::vector<raw_buffer> files;
++            json parsed = oaicompat_chat_params_parse(ctx_server.vocab, body, meta->chat_params, files, session);
++            parsed["introspect"] = introspect_field;
++            data = std::move(parsed);
++        }
++
++        std::vector<raw_buffer> files; // dummy
++        return handle_completions_impl(
++            req,
++            SERVER_TASK_TYPE_COMPLETION,
++            data,
++            files,
++            TASK_RESPONSE_TYPE_NONE);
++    };
++
+     this->post_rerank = [this](const server_http_req & req) {
+         auto res = create_response();
+         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index ed23f7d..d2ae01d 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -154,6 +154,8 @@ struct server_routes {
+     server_http_context::handler_t post_embeddings_oai;
+     server_http_context::handler_t post_rerank;
+     server_http_context::handler_t post_systemone;
++    // PS5LM fork: raw logits and per-layer activations
++    server_http_context::handler_t post_introspect;
+     server_http_context::handler_t get_lora_adapters;
+     server_http_context::handler_t post_lora_adapters;
+ 
+diff --git a/tools/server/server-introspect.cpp b/tools/server/server-introspect.cpp
+new file mode 100644
+index 0000000..29dce8b
+--- /dev/null
++++ b/tools/server/server-introspect.cpp
+@@ -0,0 +1,624 @@
++#include "server-introspect.h"
++
++#include "common.h"
++#include "log.h"
++
++#include "base64.hpp"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <stdexcept>
++
++const char * const server_introspect_default_tensors[] = {
++    "l_out",
++    "ffn_out",
++    "attn_out",
++    "result_norm",
++    nullptr,
++};
++
++//
++// params
++//
++
++static int32_t introspect_int_field(const json & j, const char * key, int32_t def, int32_t lo, int32_t hi) {
++    if (!j.contains(key) || j.at(key).is_null()) {
++        return def;
++    }
++    const int32_t v = j.at(key).get<int>();
++    if (v < lo || v > hi) {
++        throw std::runtime_error(std::string("introspect: '") + key + "' out of range");
++    }
++    return v;
++}
++
++static int64_t introspect_int_field64(const json & j, const char * key, int64_t def, int64_t lo, int64_t hi) {
++    if (!j.contains(key) || j.at(key).is_null()) {
++        return def;
++    }
++    const int64_t v = j.at(key).get<long long>();
++    if (v < lo || v > hi) {
++        throw std::runtime_error(std::string("introspect: '") + key + "' out of range");
++    }
++    return v;
++}
++
++server_introspect_params server_introspect_params_from_json(const json & j) {
++    server_introspect_params p;
++
++    if (j.is_null()) {
++        return p;
++    }
++    if (!j.is_object()) {
++        throw std::runtime_error("introspect: expected an object");
++    }
++
++    // "logits": true | {top_k, entropy, probs, full, max_full_rows}
++    if (j.contains("logits") && !j.at("logits").is_null()) {
++        const json & l = j.at("logits");
++        p.want_logits = true;
++        if (l.is_object()) {
++            p.top_k         = introspect_int_field(l, "top_k",         20, 0, 65536);
++            p.max_full_rows = introspect_int_field(l, "max_full_rows",  8, 0, 4096);
++            p.want_entropy  = l.value("entropy", true);
++            p.want_probs    = l.value("probs",   true);
++            p.full          = l.value("full",    false);
++        } else {
++            p.top_k = 20;
++        }
++    }
++
++    // "positions": "last" | "all" | [i, j, ...]
++    if (j.contains("positions") && !j.at("positions").is_null()) {
++        const json & pos = j.at("positions");
++        if (pos.is_string()) {
++            const std::string mode = pos.get<std::string>();
++            if (mode == "all") {
++                p.all_positions = true;
++            } else if (mode != "last") {
++                throw std::runtime_error("introspect: 'positions' must be \"last\", \"all\" or a list");
++            }
++        } else if (pos.is_array()) {
++            for (size_t i = 0; i < pos.size(); ++i) {
++                const int32_t v = pos.at(i).get<int>();
++                if (v < 0) {
++                    throw std::runtime_error("introspect: 'positions' entries must be >= 0");
++                }
++                p.positions.push_back(v);
++            }
++            // every position has to be visible, so the batch is rendered one token at a time
++            p.all_positions = true;
++        } else {
++            throw std::runtime_error("introspect: 'positions' must be a string or a list");
++        }
++    }
++
++    // "activations": ["l_out", ...] | {"tensors": [...], "layers": "all" | [i, ...]}
++    if (j.contains("activations") && !j.at("activations").is_null()) {
++        const json & a = j.at("activations");
++        const json * t = nullptr;
++        const json * l = nullptr;
++
++        if (a.is_object()) {
++            if (a.contains("tensors")) {
++                t = &a.at("tensors");
++            }
++            if (a.contains("layers")) {
++                l = &a.at("layers");
++            }
++        } else if (a.is_array()) {
++            t = &a;
++        } else {
++            throw std::runtime_error("introspect: 'activations' must be a list or an object");
++        }
++
++        if (t != nullptr) {
++            if (!t->is_array()) {
++                throw std::runtime_error("introspect: 'activations' tensors must be a list");
++            }
++            for (size_t i = 0; i < t->size(); ++i) {
++                p.tensors.push_back(t->at(i).get<std::string>());
++            }
++        } else {
++            // bare {"layers": [...]} is a shorthand for the default tensors
++            for (size_t i = 0; server_introspect_default_tensors[i] != nullptr; ++i) {
++                p.tensors.push_back(server_introspect_default_tensors[i]);
++            }
++        }
++
++        if (l != nullptr && !l->is_null()) {
++            if (l->is_string()) {
++                if (l->get<std::string>() != "all") {
++                    throw std::runtime_error("introspect: 'layers' must be \"all\" or a list");
++                }
++            } else if (l->is_array()) {
++                for (size_t i = 0; i < l->size(); ++i) {
++                    const int32_t v = l->at(i).get<int>();
++                    if (v < 0) {
++                        throw std::runtime_error("introspect: 'layers' entries must be >= 0");
++                    }
++                    p.layers.push_back(v);
++                }
++            } else {
++                throw std::runtime_error("introspect: 'layers' must be a string or a list");
++            }
++        }
++    }
++
++    if (j.contains("generated") && !j.at("generated").is_null()) {
++        p.capture_generated = j.at("generated").get<bool>();
++    }
++
++    // "interventions": [{"tensor": "ffn_out", "layers": [12], "channels": [3456], "op": "zero"}]
++    if (j.contains("interventions") && !j.at("interventions").is_null()) {
++        const json & arr = j.at("interventions");
++        if (!arr.is_array()) {
++            throw std::runtime_error("introspect: 'interventions' must be a list");
++        }
++        for (size_t i = 0; i < arr.size(); ++i) {
++            const json & e = arr.at(i);
++            if (!e.is_object()) {
++                throw std::runtime_error("introspect: each intervention must be an object");
++            }
++            server_introspect_intervention iv;
++            if (e.contains("tensor") && !e.at("tensor").is_null()) {
++                iv.tensor = e.at("tensor").get<std::string>();
++            }
++            if (iv.tensor.empty()) {
++                throw std::runtime_error("introspect: an intervention needs a 'tensor'");
++            }
++            if (e.contains("layers") && e.at("layers").is_array()) {
++                for (size_t k = 0; k < e.at("layers").size(); ++k) {
++                    iv.layers.push_back(e.at("layers").at(k).get<int>());
++                }
++            }
++            if (e.contains("channels") && e.at("channels").is_array()) {
++                for (size_t k = 0; k < e.at("channels").size(); ++k) {
++                    iv.channels.push_back(e.at("channels").at(k).get<long long>());
++                }
++            }
++            iv.channel_start = introspect_int_field64(e, "channel_start", -1, -1, 1 << 30);
++            iv.channel_end   = introspect_int_field64(e, "channel_end",   -1, -1, 1 << 30);
++            iv.position      = introspect_int_field64(e, "position",      -1, -1, 1 << 30);
++            if (e.contains("op") && !e.at("op").is_null()) {
++                iv.op = e.at("op").get<std::string>();
++            }
++            if (e.contains("value") && !e.at("value").is_null()) {
++                iv.value = e.at("value").get<float>();
++            }
++            if (iv.op != "zero" && iv.op != "scale" && iv.op != "add") {
++                throw std::runtime_error("introspect: intervention op must be \"zero\", \"scale\" or \"add\"");
++            }
++            if (iv.channels.empty() && iv.channel_start < 0 && iv.channel_end < 0) {
++                // no channel named: the whole tensor row is the target
++                iv.channel_start = 0;
++            }
++            p.interventions.push_back(std::move(iv));
++        }
++    }
++
++    p.enabled = p.any();
++    return p;
++}
++
++json server_introspect_params_to_json(const server_introspect_params & p) {
++    json j = json::object();
++    if (p.want_logits) {
++        j["top_k"]         = p.top_k;
++        j["entropy"]       = p.want_entropy;
++        j["probs"]         = p.want_probs;
++        j["full"]          = p.full;
++        j["max_full_rows"] = p.max_full_rows;
++    }
++    if (p.all_positions) {
++        if (p.positions.empty()) {
++            j["positions"] = "all";
++        } else {
++            json pos = json::array();
++            for (const int32_t v : p.positions) {
++                pos.push_back(v);
++            }
++            j["positions"] = pos;
++        }
++    } else {
++        j["positions"] = "last";
++    }
++    if (!p.tensors.empty()) {
++        json tensors = json::array();
++        for (const auto & t : p.tensors) {
++            tensors.push_back(t);
++        }
++        j["activations"] = json {
++            {"tensors", tensors},
++            {"layers",  p.layers.empty() ? json("all") : json(p.layers)},
++        };
++    }
++    if (!p.interventions.empty()) {
++        json arr = json::array();
++        for (const auto & iv : p.interventions) {
++            arr.push_back(iv.to_json());
++        }
++        j["interventions"] = arr;
++    }
++    j["generated"] = p.capture_generated;
++    return j;
++}
++
++//
++// capture
++//
++
++void server_introspect_intervention::build_names(int32_t n_layer) {
++    names.clear();
++    if (tensor.find('-') != std::string::npos) {
++        names.push_back(tensor); // an exact name, e.g. "ffn_out-12"
++        return;
++    }
++    if (layers.empty()) {
++        for (int32_t il = 0; il <= n_layer; ++il) {
++            names.push_back(tensor + "-" + std::to_string(il));
++        }
++    } else {
++        for (const int32_t il : layers) {
++            names.push_back(tensor + "-" + std::to_string(il));
++        }
++    }
++    names.push_back(tensor); // layer-less tensors (inp_embd, result_norm)
++}
++
++bool server_introspect_intervention::matches(const std::string & name) const {
++    for (const auto & n : names) {
++        if (n == name) {
++            return true;
++        }
++    }
++    return false;
++}
++
++json server_introspect_intervention::to_json() const {
++    json channels = json::array();
++    for (const int64_t c : this->channels) {
++        channels.push_back(c);
++    }
++    return json {
++        {"tensor",        tensor},
++        {"layers",        layers.empty() ? json("all") : json(layers)},
++        {"channels",      channels},
++        {"channel_start", channel_start},
++        {"channel_end",   channel_end},
++        {"position",      position},
++        {"op",            op},
++        {"value",         value},
++        {"modified",      modified},
++    };
++}
++
++void server_introspect_capture::build_names(const server_introspect_params & p, int32_t n_layer) {
++    names.clear();
++    for (const auto & base : p.tensors) {
++        // a name that already carries a layer suffix is matched as given
++        if (base.find('-') != std::string::npos) {
++            names.insert(base);
++            continue;
++        }
++        if (p.layers.empty()) {
++            for (int32_t il = 0; il <= n_layer; ++il) {
++                names.insert(base + "-" + std::to_string(il));
++            }
++        } else {
++            for (const int32_t il : p.layers) {
++                names.insert(base + "-" + std::to_string(il));
++            }
++        }
++        // layer-less tensors (inp_embd, result_norm, result_output) carry no suffix
++        names.insert(base);
++    }
++
++    ivs = p.interventions;
++    for (auto & iv : ivs) {
++        iv.build_names(n_layer);
++    }
++}
++
++bool server_introspect_capture::on_tensor(struct ggml_tensor * t, bool ask) {
++    if (!armed) {
++        return false;
++    }
++    const bool wanted = names.find(t->name) != names.end();
++
++    std::vector<server_introspect_intervention *> hits;
++    for (auto & iv : ivs) {
++        if (iv.matches(t->name)) {
++            hits.push_back(&iv);
++        }
++    }
++    if (!wanted && hits.empty()) {
++        return false;
++    }
++    if (ask) {
++        // tell the scheduler we want this node: for a device buffer that makes it
++        // the end of a split and copies the result back to the host. Everything
++        // below runs with the tensor complete and before its consumers run, which
++        // is what makes an in-place intervention safe.
++        return true;
++    }
++
++    // !ask: the node's buffer is complete and host-visible
++    const int64_t n_rows = t->ne[1];
++    if (n_rows <= 0 || t->ne[0] <= 0) {
++        return true;
++    }
++
++    const bool want_row = wanted && (row < 0 || row < n_rows) && n_bytes + ggml_row_size(t->type, t->ne[0]) <= max_bytes;
++    if (want_row) {
++        const int64_t r = row < 0 ? n_rows - 1 : row;
++        const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
++        std::vector<uint8_t> raw(row_bytes);
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            std::memcpy(raw.data(), (const uint8_t *) t->data + (size_t) r * t->nb[1], row_bytes);
++        } else {
++            ggml_backend_tensor_get(t, raw.data(), (size_t) r * t->nb[1], row_bytes);
++        }
++
++        server_introspect_tensor out;
++        out.name = t->name;
++        out.ne.assign(t->ne, t->ne + GGML_MAX_DIMS);
++        out.data.resize(t->ne[0]);
++
++        const int64_t n = t->ne[0];
++        bool ok = true;
++        switch (t->type) {
++            case GGML_TYPE_F32:
++                std::memcpy(out.data.data(), raw.data(), (size_t) n * sizeof(float));
++                break;
++            case GGML_TYPE_F16:
++                ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), out.data.data(), n);
++                break;
++            case GGML_TYPE_BF16:
++                ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), out.data.data(), n);
++                break;
++            default:
++                ok = false;
++                break;
++        }
++        if (ok) {
++            n_bytes += row_bytes;
++            data[t->name] = std::move(out); // the last write wins, i.e. the newest sub-batch
++        }
++    }
++
++    if (hits.empty()) {
++        return true;
++    }
++
++    // interventions: read the tensor (or the rows they touch), change it, write it back
++    const size_t nbytes = ggml_nbytes(t);
++    if (nbytes > (64u << 20)) {
++        return true; // refuse to buffer a tensor this large
++    }
++    const bool host = ggml_backend_buffer_is_host(t->buffer);
++    const int64_t ne0 = t->ne[0];
++    const int64_t ne1 = t->ne[1];
++    const int64_t ne2 = t->ne[2];
++    const bool direct = host && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] == (size_t) ne0 * sizeof(float);
++    if (!direct && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
++        return true; // not a float activation
++    }
++
++    std::vector<uint8_t> raw(nbytes);
++    if (host) {
++        std::memcpy(raw.data(), t->data, nbytes);
++    } else {
++        ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
++    }
++
++    // a layout with unit strides in dim 0/1 (how llama.cpp's graph tensors are laid out)
++    std::vector<float> v;
++    float * dense = nullptr; // mutable pointer into raw when the layout is already unit-stride
++    if (direct) {
++        dense = reinterpret_cast<float *>(raw.data());
++    } else {
++        v.resize((size_t) ne0 * ne1 * ne2);
++        if (t->type == GGML_TYPE_F32) {
++            std::memcpy(v.data(), raw.data(), (size_t) ne0 * ne1 * ne2 * sizeof(float));
++        } else if (t->type == GGML_TYPE_F16) {
++            ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), v.data(), (int64_t) ne0 * ne1 * ne2);
++        } else {
++            ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), v.data(), (int64_t) ne0 * ne1 * ne2);
++        }
++        dense = v.data();
++    }
++
++    bool changed = false;
++    for (auto * iv : hits) {
++        for (int64_t i1 = 0; i1 < ne1; ++i1) {
++            if (iv->position >= 0 && iv->position != chunk_off + i1) {
++                continue;
++            }
++            for (int64_t i0 = 0; i0 < ne0; ++i0) {
++                bool hit = false;
++                if (!iv->channels.empty()) {
++                    for (const int64_t c : iv->channels) {
++                        if (c == i0) {
++                            hit = true;
++                            break;
++                        }
++                    }
++                } else {
++                    hit = i0 >= (iv->channel_start < 0 ? 0 : iv->channel_start) &&
++                          (iv->channel_end < 0 || i0 < iv->channel_end);
++                }
++                if (!hit) {
++                    continue;
++                }
++                const size_t idx = (size_t) i0 + (size_t) i1 * ne0;
++                float * slot_v = dense + idx;
++                if (iv->op == "zero") {
++                    *slot_v = 0.0f;
++                } else if (iv->op == "scale") {
++                    *slot_v *= iv->value;
++                } else {
++                    *slot_v += iv->value;
++                }
++                iv->modified++;
++                changed = true;
++            }
++        }
++    }
++
++    if (changed) {
++        if (direct) {
++            // dense points into raw, write it back as-is
++        } else if (t->type == GGML_TYPE_F32) {
++            std::memcpy(raw.data(), v.data(), v.size() * sizeof(float));
++        } else if (t->type == GGML_TYPE_F16) {
++            for (size_t i = 0; i < v.size(); ++i) {
++                ((ggml_fp16_t *) raw.data())[i] = ggml_fp32_to_fp16(v[i]);
++            }
++        } else {
++            for (size_t i = 0; i < v.size(); ++i) {
++                ((ggml_bf16_t *) raw.data())[i] = ggml_fp32_to_bf16(v[i]);
++            }
++        }
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            std::memcpy(t->data, raw.data(), nbytes);
++        } else {
++            ggml_backend_tensor_set(t, raw.data(), 0, nbytes);
++        }
++    }
++
++    return true;
++}
++
++bool server_introspect_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * capture = (server_introspect_capture *) user_data;
++    if (capture == nullptr) {
++        return false;
++    }
++    return capture->on_tensor(t, ask);
++}
++
++json server_introspect_tensor::to_json() const {
++    json ne = json::array();
++    for (const int64_t d : this->ne) {
++        ne.push_back(d);
++    }
++    return json {
++        {"shape", ne},
++        {"dtype", "f32"},
++        {"encoding", "base64"},
++        {"data", base64::encode((const char *) data.data(), data.size() * sizeof(float))},
++    };
++}
++
++//
++// logits
++//
++
++// bounded top-k selection, no allocation proportional to the vocabulary
++static std::vector<int32_t> introspect_top_k(const float * logits, int32_t n_vocab, int32_t k) {
++    std::vector<int32_t> best;
++    if (k <= 0) {
++        return best;
++    }
++    best.reserve(k);
++
++    auto worse = [&](int32_t a, int32_t b) { return logits[a] > logits[b]; }; // min-heap on the logit
++
++    for (int32_t i = 0; i < n_vocab; ++i) {
++        if ((int32_t) best.size() < k) {
++            best.push_back(i);
++            std::push_heap(best.begin(), best.end(), worse);
++        } else if (logits[i] > logits[best.front()]) {
++            std::pop_heap(best.begin(), best.end(), worse);
++            best.back() = i;
++            std::push_heap(best.begin(), best.end(), worse);
++        }
++    }
++    std::sort(best.begin(), best.end(), [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
++    return best;
++}
++
++static json introspect_token_json(const llama_vocab * vocab, int32_t id, float logit, float prob, bool with_prob) {
++    json j = json {
++        {"id",    id},
++        {"piece", common_token_to_piece(vocab, id, true)},
++        {"logit", logit},
++    };
++    if (with_prob) {
++        j["prob"] = prob;
++    }
++    return j;
++}
++
++void server_introspect_logits(
++        const float *         logits,
++        int32_t               n_vocab,
++        const llama_vocab *   vocab,
++        const server_introspect_params & p,
++        bool                  allow_full,
++        json &                out) {
++    if (logits == nullptr || n_vocab <= 0) {
++        out = nullptr;
++        return;
++    }
++
++    int32_t best = 0;
++    for (int32_t i = 1; i < n_vocab; ++i) {
++        if (logits[i] > logits[best]) {
++            best = i;
++        }
++    }
++    const float best_logit = logits[best];
++
++    const bool need_norm = p.want_probs || p.want_entropy;
++    double log_sum = 0.0;
++    if (need_norm) {
++        double sum = 0.0;
++        for (int32_t i = 0; i < n_vocab; ++i) {
++            sum += std::exp((double) (logits[i] - best_logit));
++        }
++        log_sum = std::log(sum);
++    }
++    auto prob_of = [&](float logit) -> float {
++        return (float) std::exp((double) (logit - best_logit) - log_sum);
++    };
++
++    out = json::object();
++    out["n_vocab"] = n_vocab;
++    // the argmax's own probability is exp(0 - logsumexp), not 1.0
++    out["argmax"]  = introspect_token_json(vocab, best, best_logit,
++                                           need_norm ? (float) std::exp(-log_sum) : 0.0f, p.want_probs);
++
++    if (p.top_k > 0) {
++        const std::vector<int32_t> top = introspect_top_k(logits, n_vocab, p.top_k);
++        json arr = json::array();
++        for (const int32_t id : top) {
++            arr.push_back(introspect_token_json(vocab, id, logits[id], p.want_probs ? prob_of(logits[id]) : 0.0f, p.want_probs));
++        }
++        out["top"] = arr;
++    }
++
++    if (p.want_entropy) {
++        double h = 0.0;
++        for (int32_t i = 0; i < n_vocab; ++i) {
++            const double lp = (double) (logits[i] - best_logit) - log_sum;
++            const double pr = std::exp(lp);
++            if (pr > 0.0) {
++                h -= pr * lp;
++            }
++        }
++        out["entropy"] = h;
++    }
++
++    if (p.full && allow_full) {
++        out["full"] = json {
++            {"encoding", "base64"},
++            {"dtype",    "f32"},
++            {"n_vocab",  n_vocab},
++            {"data",     base64::encode((const char *) logits, (size_t) n_vocab * sizeof(float))},
++        };
++    }
++}
+diff --git a/tools/server/server-introspect.h b/tools/server/server-introspect.h
+new file mode 100644
+index 0000000..47f24cc
+--- /dev/null
++++ b/tools/server/server-introspect.h
+@@ -0,0 +1,205 @@
++#pragma once
++
++// PS5LM fork: the introspection ("interpretability") API.
++//
++// llama.cpp computes, but never exposes, the two things an interpretability
++// experiment needs: the raw logit distribution over the whole vocabulary at a
++// chosen position, and the intermediate activations of the transformer blocks
++// (the residual stream before and after each block, and the MLP/attention
++// outputs inside it). This module supplies both, driven by a request field
++// ("introspect") rather than by a second model pass:
++//
++//   - logits are read straight out of the context's output buffer with
++//     llama_get_logits_ith() after the existing decode step;
++//   - activations are copied out of the compute graph while it runs, through
++//     llama_context_params.cb_eval (ggml_backend_sched_eval_callback), which
++//     the scheduler calls for every node. The fetch is a no-op unless a
++//     request armed it, so ordinary generation pays nothing.
++//
++// Everything here is request-scoped: the capture engine is armed for one
++// decode step at a time and cleared straight after, on the server's own
++// (main loop) thread.
++
++#include "server-common.h" // json alias, common_token_to_piece
++
++#include <cstdint>
++#include <map>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++struct ggml_tensor;
++
++// Default activation tensors, in the order a llama-architecture graph emits
++// them (see src/models/llama.cpp):
++//   inp_embd            token embedding + position, the residual stream at the input
++//   attn_norm-<il>      residual stream after the block's input norm
++//   attn_out-<il>       attention output (before the residual add)
++//   ffn_norm-<il>       residual stream after the post-attention norm
++//   ffn_out-<il>        MLP output (before the residual add)
++//   l_out-<il>          residual stream after block il  (l_out-<il-1> is the block input)
++//   result_norm         final hidden state before the output projection
++//   result_output       logits tensor of the graph
++extern const char * const server_introspect_default_tensors[];
++
++// One in-place intervention on an activation tensor: zero, scale or add a value
++// to a channel (a single neuron, an attention head dimension, or a range), at one
++// position or at every position of the request. Applied inside the graph-eval
++// callback, i.e. after the tensor is computed and before its consumers run.
++struct server_introspect_intervention {
++    std::string          tensor;        // base name ("ffn_out") or exact name ("ffn_out-12")
++    std::vector<int32_t> layers;        // layer filter for a base name, empty = all
++    std::vector<int64_t> channels;      // explicit channel indices, empty = the range below
++    int64_t channel_start = -1;         // inclusive, -1 = from 0
++    int64_t channel_end   = -1;         // exclusive, -1 = to the end
++    int64_t position      = -1;         // token index of the request, -1 = every position
++    std::string op        = "zero";     // zero | scale | add
++    float   value         = 0.0f;       // operand of scale/add
++
++    std::vector<std::string> names;     // resolved ggml tensor names
++    int64_t modified = 0;               // elements changed, summed over the request
++
++    void build_names(int32_t n_layer);
++    bool matches(const std::string & name) const;
++    json to_json() const;
++};
++
++struct server_introspect_params {
++    bool enabled = false;
++
++    // logits
++    bool    want_logits   = false;
++    int32_t top_k         = 0;     // entries in "top" (0 = no list)
++    bool    want_entropy  = false; // one extra pass over the vocabulary
++    bool    want_probs    = true;  // probabilities for argmax/top (needs the same pass)
++    bool    full          = false; // include the whole float32 row (base64)
++    int32_t max_full_rows = 8;     // cap on the number of full rows, bounds the response
++
++    // which positions of the request to look at
++    bool                 all_positions = false;   // decode one token at a time so every position is visible
++    std::vector<int32_t> positions;               // explicit positions (implies all_positions)
++
++    // activations
++    std::vector<std::string> tensors;             // base names, e.g. {"l_out", "ffn_out"}
++    std::vector<int32_t>     layers;              // layer suffix filter, empty = all
++
++    bool capture_generated = true;                // also capture the tokens the model produces
++
++    std::vector<server_introspect_intervention> interventions;
++
++    int32_t step_tokens() const {
++        if (all_positions) {
++            return 1;
++        }
++        // a position-specific intervention needs every position to be its own row
++        for (const auto & iv : interventions) {
++            if (iv.position >= 0) {
++                return 1;
++            }
++        }
++        return 0;
++    }
++
++    bool wants_position(int32_t idx, int32_t n_prompt) const {
++        if (!all_positions) {
++            return idx == n_prompt - 1; // "last" = the final prompt token
++        }
++        if (positions.empty()) {
++            return true;
++        }
++        for (const int32_t p : positions) {
++            if (p == idx) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool want_activations() const { return !tensors.empty(); }
++    bool want_interventions() const { return !interventions.empty(); }
++    bool any() const { return want_logits || want_activations() || want_interventions(); }
++};
++
++// Parses (and validates) the "introspect" request field. Throws json_error on a bad field.
++server_introspect_params server_introspect_params_from_json(const json & j);
++json                    server_introspect_params_to_json(const server_introspect_params & p);
++
++// One tensor row copied out of the graph: ne is the tensor's full shape, data has ne[0] floats.
++struct server_introspect_tensor {
++    std::string          name;
++    std::vector<int64_t> ne;
++    std::vector<float>   data;
++
++    json to_json() const;
++};
++
++// The graph-eval capture engine. Armed by the slot for one decode step; the
++// scheduler then offers it every node of the graph being computed.
++struct server_introspect_capture {
++    bool armed = false;
++
++    std::unordered_set<std::string> names;  // exact ggml tensor names to match
++    int64_t row = -1;                       // row to keep within the tensor, -1 = the last row
++    int64_t chunk_off = 0;                  // token index of row 0 of the chunk being decoded
++
++    std::vector<server_introspect_intervention> ivs;  // applied when a tensor matches one
++
++    std::map<std::string, server_introspect_tensor> data;  // by tensor name, last write wins
++
++    size_t max_bytes = 256u << 20;  // hard bound on one captured step
++    size_t n_bytes   = 0;
++
++    void clear() {
++        data.clear();
++        n_bytes = 0;
++        for (auto & iv : ivs) {
++            iv.modified = 0;
++        }
++    }
++
++    void build_names(const server_introspect_params & p, int32_t n_layer);
++    bool on_tensor(struct ggml_tensor * t, bool ask);
++};
++
++// the callback installed on the context (never null; a no-op until armed)
++bool server_introspect_cb(struct ggml_tensor * t, bool ask, void * user_data);
++
++// Formats the raw logits of one position: argmax, optional top-k / entropy / full row.
++// allow_full=false suppresses the full row (used when the per-request cap is reached).
++void server_introspect_logits(
++        const float *         logits,
++        int32_t               n_vocab,
++        const llama_vocab *   vocab,
++        const server_introspect_params & p,
++        bool                  allow_full,
++        json &                out);
++
++// Accumulated result of one introspection request, serialized as the response's
++// "introspection" object.
++struct server_introspect_result {
++    json meta      = nullptr;  // model / context facts, filled once by the caller
++    json inputs    = nullptr;  // the request's token ids and pieces
++    json positions = nullptr;  // one entry per captured position
++    json interventions = nullptr; // what was changed, with the count of elements touched
++    bool truncated = false;    // the byte budget cut some activations out
++
++    bool empty() const {
++        return (positions.is_null() || positions.size() == 0) && interventions.is_null();
++    }
++
++    json to_json() const {
++        if (empty()) {
++            return nullptr;
++        }
++        json out = json {
++            {"meta",      meta},
++            {"inputs",    inputs},
++            {"positions", positions.is_null() ? json::array() : positions},
++            {"truncated", truncated},
++        };
++        if (!interventions.is_null()) {
++            out["interventions"] = interventions;
++        }
++        return out;
++    }
++};
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 54e126a..30efbbb 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -187,6 +187,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
+         ->set_desc("Use backend sampling instead of llama.cpp sampling"));
+ 
++    // PS5LM fork: interpretability. Keep the parsed value as json; the task
++    // parses it into task_params::introspect once the task is created.
++    add((new field_json("introspect"))
++        ->set_desc("Return raw logits and/or per-layer activations for this request. "
++                   "Object with any of: logits (true or {top_k, entropy, probs, full, max_full_rows}), "
++                   "positions (\"last\", \"all\" or a list of token indices), "
++                   "activations (list of tensor names, or {tensors, layers}), generated (bool)")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            ctx.params.introspect_json = data.at("introspect");
++        }));
++
+     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
+         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 3f30da2..542d559 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -351,6 +351,10 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
+     if (!stream && !probs_output.empty()) {
+         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
+     }
++    // PS5LM fork: raw logits and per-layer activations, when the request asked for them
++    if (!introspect.is_null()) {
++        res["introspection"] = introspect;
++    }
+     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
+ }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 50926ec..93b29ec 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -10,6 +10,7 @@
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
++#include "server-introspect.h" // PS5LM fork: introspection request/response types
+ 
+ 
+ enum server_task_type {
+@@ -99,6 +100,12 @@ struct task_params {
+     // Embeddings
+     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+ 
++    // PS5LM fork: interpretability ("introspect" request field).
++    // introspect_json is the raw request value; introspect is the parsed form,
++    // filled once the task is built (see server_introspect_params_from_json).
++    json introspect_json = nullptr;
++    struct server_introspect_params introspect;
++
+     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
+     json to_json(bool only_metrics = false) const;
+ };
+@@ -384,6 +391,9 @@ struct server_task_result_cmpl_final : server_task_result {
+ 
+     task_params generation_params;
+ 
++    // PS5LM fork: the introspection payload of this request (null unless requested)
++    json introspect = nullptr;
++
+     // response formatting
+     bool               verbose  = false;
+     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 871e827..12dd9bd 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -241,6 +241,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+         routes.post_systemone              = models_routes->proxy_post;
+         routes.post_tokenize               = models_routes->proxy_post;
+         routes.post_detokenize             = models_routes->proxy_post;
++        // PS5LM fork
++        routes.post_introspect             = models_routes->proxy_post;
+         routes.post_apply_template         = models_routes->proxy_post;
+         routes.post_chat_completions_tok   = models_routes->proxy_post;
+         routes.post_responses_tok_oai      = models_routes->proxy_post;
+@@ -289,6 +291,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+     ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
+     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
+     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
++    // PS5LM fork: raw logits and per-layer activations (interpretability)
++    ctx_http.post("/introspect",               ex_wrapper(routes.post_introspect));
++    ctx_http.post("/v1/introspect",            ex_wrapper(routes.post_introspect));
+     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+     // token counting
+     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));

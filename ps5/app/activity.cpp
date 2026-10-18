@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -20,6 +21,7 @@ namespace {
 
 std::mutex                    g_mutex;
 std::map<int, std::string>    g_partial;  // an answer's stream, up to its last full line
+std::map<int, bool>           g_ignored;  // requests whose answer must not be accumulated
 ps5lm::StatsCollector *       g_sink = nullptr;
 
 // One line, spaces collapsed, at most `cap` bytes, cut at a character's start.
@@ -203,6 +205,13 @@ void ps5lm_activity_begin(int id, const char * method, const char * path, const 
     if (!g_sink) {
         return;
     }
+    // an introspection answer can be tens of megabytes of logits and activations;
+    // the feed has nothing to show for it, so it is not accumulated at all
+    if (path != nullptr && strstr(path, "introspect") != nullptr) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_ignored[id] = true;
+        return;
+    }
     const json j = json::parse(body, body + body_len, nullptr, false);
     const int questions = j.is_object() && j.contains("questions") && j["questions"].is_object() ? (int) j["questions"].size() : 0;
     g_sink->activity_begin(id, remote ? remote : "", path ? path : "", one_line(printable(asked_from(path ? path : "", j)), 400), questions);
@@ -211,6 +220,12 @@ void ps5lm_activity_begin(int id, const char * method, const char * path, const 
 void ps5lm_activity_data(int id, const char * data, size_t len) {
     if (!g_sink) {
         return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_ignored.count(id) != 0) {
+            return;
+        }
     }
     std::string out;
     {
@@ -250,6 +265,9 @@ void ps5lm_activity_end(int id, int status) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_partial.erase(id);
+        if (g_ignored.erase(id) != 0) {
+            return;
+        }
     }
     if (g_sink) {
         g_sink->activity_end(id, status);

@@ -123,6 +123,25 @@ To update, copy the new folder over the old one. Settings, models and downloads 
 | Settings | D-pad, Cross | choose a category and a row; flip it, or pick from its list |
 | Settings, Diagnostics | Square, Triangle | app or server log; errors only |
 
+## Looking inside the model
+
+This fork adds an opt-in endpoint that returns the numbers the model computed.
+`POST /v1/introspect` answers with the whole logit row at the positions you name,
+the probabilities and the entropy, with one row of a named graph tensor for a
+named layer, and it can also change one channel in place before the rest of the
+model reads it.
+
+The endpoint is off by default. Turn it on in **Settings > Developer > Logits and
+activations API**.
+
+```sh
+python3 scripts/ps5lm-introspect.py --host <console> --prompt "Once upon a time" \
+    --positions last --top-k 10 --tensors l_out --layers 12
+```
+
+[Introspection](docs/INTROSPECTION.md) records the request fields, the tensor
+names, and the cost of each option.
+
 ## Want to tinker?
 
 C++ on [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui), llama.cpp with

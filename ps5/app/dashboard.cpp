@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir };
 
 struct SettingRow {
     Setting      id;
@@ -111,10 +111,14 @@ constexpr SettingCategory kCategories[] = {
       { { Setting::sounds, "Sounds", "Interface sounds on the TV" },
         { Setting::download_dir, "Save downloads to", "Internal storage, or PS5LM/models on an M.2 or USB drive" } },
       2 },
+    { "Developer",
+      { { Setting::introspect, "Logits and activations API",
+          "Off: /v1/introspect is closed. On: it answers with the model's raw numbers" } },
+      1 },
     { "Diagnostics", {}, 0 },
 };
-constexpr int kCategoryCount = 5;
-constexpr int kDiagnostics = 4;
+constexpr int kCategoryCount = 6;
+constexpr int kDiagnostics = 5;
 
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
@@ -404,10 +408,16 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
     }
 }
 
-bool is_toggle(Setting id) { return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools; }
+bool is_toggle(Setting id) { return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools || id == Setting::introspect; }
 
 bool toggle_value(const Settings & s, Setting id) {
-    return id == Setting::auto_load ? s.auto_load : id == Setting::sounds ? s.sounds : s.tools;
+    switch (id) {
+        case Setting::auto_load:  return s.auto_load;
+        case Setting::sounds:     return s.sounds;
+        case Setting::tools:      return s.tools;
+        case Setting::introspect: return s.introspect;
+        default:                  return false;
+    }
 }
 
 // A row's choices, for the list X opens under it: each with the settings it
@@ -967,7 +977,10 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
         request_ = { Request::clear_scratch, "" };
         feedback.play(Cue::select);
     } else if (is_toggle(id)) {
-        bool & on = id == Setting::auto_load ? settings_.auto_load : id == Setting::sounds ? settings_.sounds : settings_.tools;
+        bool & on = id == Setting::auto_load  ? settings_.auto_load
+                  : id == Setting::sounds     ? settings_.sounds
+                  : id == Setting::tools      ? settings_.tools
+                                              : settings_.introspect;
         on = !on;
         request_ = { Request::settings, "" };
         feedback.play(Cue::toggle);
