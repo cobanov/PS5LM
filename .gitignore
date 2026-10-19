@@ -1,6 +1,7 @@
 # toolchains and downloads
 .deps/
 .upstream/
+.tmp-wsl/
 
 # build outputs
 build/

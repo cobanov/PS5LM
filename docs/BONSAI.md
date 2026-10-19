@@ -39,3 +39,34 @@ The planner gives the model the longest context that fits, as always; put the `.
 - The fork predates llama.cpp's decision-model server (`/v1/systemone`): decision models are
   not served by this build. Chat, completions, Anthropic-style `/v1/messages`, the web UI,
   image mmproj, and the dashboard all work.
+
+## Building it on WSL1 (Ubuntu 26.04)
+
+The whole chain was built on WSL1 Ubuntu 26.04 (ext4 copy of this tree at
+`~/ps5lm`; never build under `/mnt/d`). Debian-family hosts need four fixes the
+Arch/Debian recipe in `BUILDING.md` takes for granted:
+
+- GNU tar fails on WSL1 (`openat2()` is unimplemented); put `bsdtar` at
+  `/usr/local/bin/tar` (from `libarchive-tools`) to shadow it.
+- Ubuntu splits LLVM so the static component archives Mesa wants are missing:
+  enable the apt.llvm.org `resolute-21` source, install `llvm-21-dev`,
+  `libclang-21-dev` and `libllvmspirvlib-21-dev`.
+- No Ubuntu package ships SPIRV-Tools as a *library*: build the pinned
+  Khronos tree once (`cmake` + `ninja`, headers and all six
+  `libSPIRV-Tools*.a` into `/usr/local`) and write a
+  `spirv-tools.pc` whose `Libs` lists every library — mesa_clc's linker
+  needs `-lSPIRV-Tools-link` for `spvtools::Link`, not just core and opt.
+- A checkout made on Windows carries CRLF sources: strip `\r` from every text
+  file before `git apply` sees them, `--unset core.autocrlf` in the copied
+  repos, and `chmod +x` the scripts (the exec bits do not survive the copy).
+
+`make libc` gives the checksummed `runtime/libc.prx`; PS5_Vulkan's own demo
+title then refuses to link at HEAD — that is expected, its run still leaves
+`build/host/ps5-native-tool`, which is what `scripts/build-app.sh` needs.
+
+Result on 2026-10-19 (WSL1, clang 21.1.8 host): RADV release archive 273 MB
+at patched Mesa `1d65ad07` plus the three driver patches; the app links to an
+fSELF `eboot.bin` of 120,160,472 bytes; `scripts/release-app.sh` produced
+`ps5lm-app-v0.9.0.zip` (39 MB, sha256 `defffc07…ba87384`). One patch needed a
+C++17 fix on the way: `SRV_INF("…")` with no varargs expands to a dangling
+comma in `common_log_add`, so 0005 now logs the rebind as `SRV_INF("%s", …)`.
