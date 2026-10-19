@@ -4,6 +4,11 @@
 
 <h1 align="center">PS5LM</h1>
 
+> **This fork: Ternary Bonsai models.** It swaps llama.cpp for the [PrismML fork](https://github.com/PrismML-Eng/llama.cpp), which adds the ternary
+> `PQ2_0` and `PTQ1_0` formats and their Vulkan and CPU kernels, so
+> [prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) loads and runs on the console GPU - confirmed working on our PS5 Slim, firmware 13.60.
+> The tradeoff: the fork-era server predates the decision-model endpoints (`/v1/systemone`), so this build drops those; chat, completions, Anthropic-style messages, the web UI and image input all stay. See [docs/BONSAI.md](docs/BONSAI.md).
+
 <p align="center">
   <b>Your PS5 runs the language model. Every device on your network uses it.</b><br>
   llama.cpp on the console's GPU, with OpenAI and Anthropic APIs and a screen made for the TV.
