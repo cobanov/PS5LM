@@ -39,7 +39,7 @@ index 2ec137a..62a30b5 100644
 +                pimpl->srv->stop(); // clears the failed state; the socket is closed already
 +            } while (!pimpl->stopping && !pimpl->srv->bind_to_port(host, bind_port));
 +            if (!pimpl->stopping) {
-+                SRV_INF("listener is back\n");
++                SRV_INF("%s", "listener is back\n");
 +            }
 +        }
 +    });
