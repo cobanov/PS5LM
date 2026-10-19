@@ -1,55 +1,56 @@
 diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
-index 33cbb156c..7ac78f9ad 100644
+index 2ec137a..62a30b5 100644
 --- a/tools/server/server-http.cpp
 +++ b/tools/server/server-http.cpp
-@@ -10,6 +10,7 @@
+@@ -6,6 +6,9 @@
+ 
+ #include <cpp-httplib/httplib.h>
+ 
++#include <atomic>
++#include <cerrno>
++#include <chrono>
+ #include <functional>
  #include <future>
  #include <memory>
- #include <string>
-+#include <atomic>
- #include <thread>
- 
- //
-@@ -23,6 +24,7 @@ public:
-     std::vector<std::thread> threads; // one thread per listener
-     std::unique_ptr<httplib::ThreadPool> pool; // single pool shared among all listeners
-     int n_threads_http = 0;
+@@ -19,6 +22,7 @@
+ class server_http_context::Impl {
+ public:
+     std::unique_ptr<httplib::Server> srv;
 +    std::atomic<bool> stopping{false}; // stop() was asked: a listener that ends stays ended
  };
  
- class server_http_task_queue : public httplib::TaskQueue {
-@@ -528,9 +530,23 @@ bool server_http_context::start() {
-     pimpl->pool = std::make_unique<httplib::ThreadPool>(pimpl->n_threads_http, pimpl->n_threads_http + 1024);
-     for (size_t i = 0; i < pimpl->servers.size(); ++i) {
-         const auto & srv = pimpl->servers[i];
--        pimpl->threads.emplace_back([srv = srv.get(), addr = listening_addresses[i]] {
--            if (!srv->listen_after_bind()) {
--                SRV_ERR("listener on %s stopped unexpectedly\n", addr.c_str());
-+        // PS5LM: when the network drops (link down, a new DHCP address),
-+        // accept() fails with an error httplib takes as fatal and closes the
-+        // listening socket: the model stays loaded with nothing to reach it.
-+        // Bind again, once a second, until it works or stop() is asked.
-+        const std::string host = pimpl->hosts[i];
-+        const int bind_port = port;
-+        pimpl->threads.emplace_back([srv = srv.get(), addr = listening_addresses[i], host, bind_port,
-+                                     stopping = &pimpl->stopping] {
-+            while (!srv->listen_after_bind() && !*stopping) {
-+                SRV_ERR("listener on %s stopped unexpectedly (errno %d); listening again\n", addr.c_str(), errno);
-+                do {
-+                    std::this_thread::sleep_for(std::chrono::seconds(1));
-+                    srv->stop(); // clears the failed state; the socket is closed already
-+                } while (!*stopping && !srv->bind_to_port(host, bind_port));
-+                if (!*stopping) {
-+                    SRV_INF("listener on %s is back\n", addr.c_str());
-+                }
-             }
-         });
-         srv->wait_until_ready();
-@@ -546,6 +562,7 @@ bool server_http_context::start() {
+ server_http_context::server_http_context()
+@@ -462,7 +466,24 @@ bool server_http_context::start() {
+     }
+ 
+     // run the HTTP server in a thread
+-    thread = std::thread([this] { pimpl->srv->listen_after_bind(); });
++    // PS5LM: when the network drops (link down, a new DHCP address), accept()
++    // fails with an error httplib takes as fatal and closes the listening
++    // socket: the model stays loaded with nothing to reach it. Bind again,
++    // once a second, until it works or stop() is asked.
++    const std::string host = hostname;
++    const int bind_port = is_sock ? 8080 : port;
++    thread = std::thread([this, host, bind_port] {
++        while (!pimpl->srv->listen_after_bind() && !pimpl->stopping) {
++            SRV_ERR("listener stopped unexpectedly (errno %d); listening again\n", errno);
++            do {
++                std::this_thread::sleep_for(std::chrono::seconds(1));
++                pimpl->srv->stop(); // clears the failed state; the socket is closed already
++            } while (!pimpl->stopping && !pimpl->srv->bind_to_port(host, bind_port));
++            if (!pimpl->stopping) {
++                SRV_INF("listener is back\n");
++            }
++        }
++    });
+     srv->wait_until_ready();
+ 
+     listening_address = is_sock ? string_format("unix://%s", hostname.c_str())
+@@ -471,6 +492,7 @@ bool server_http_context::start() {
  }
  
  void server_http_context::stop() const {
 +    pimpl->stopping = true;
-     for (const auto & srv : pimpl->servers) {
-         if (srv) {
-             srv->stop();
+     if (pimpl->srv) {
+         pimpl->srv->stop();
+     }

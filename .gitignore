@@ -1,5 +1,6 @@
 # toolchains and downloads
 .deps/
+.upstream/
 
 # build outputs
 build/
