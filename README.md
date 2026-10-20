@@ -8,6 +8,7 @@
 > `PQ2_0` and `PTQ1_0` formats and their Vulkan and CPU kernels, so
 > [prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) loads and runs on the console GPU - confirmed working on our PS5 Slim, firmware 13.60.
 > The tradeoff: the fork-era server predates the decision-model endpoints (`/v1/systemone`), so this build drops those; chat, completions, Anthropic-style messages, the web UI and image input all stay. See [docs/BONSAI.md](docs/BONSAI.md).
+> Measured on the console (11.0 GiB free heap): the 27B PQ2_0 runs at **128k context text-only** or **64k with the vision mmproj**; 128k+vision OOMs. The hybrid arch keeps KV at ~18 KiB/token (only 16 of 64 layers cache), so weights plus the logits/compute buffers set the ceiling, not the cache. The Settings row **Vision: Auto/On/Off** now lets you choose images explicitly and the planner sizes the longest fitting context for that choice; exact overrides go through `/data/PS5LM/app-args.txt`. Full recipe and reproduction steps: [docs/BONSAI.md#measured-ceilings](docs/BONSAI.md).
 
 <p align="center">
   <b>Your PS5 runs the language model. Every device on your network uses it.</b><br>

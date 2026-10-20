@@ -29,6 +29,78 @@ On a PS5 Slim the RADV heap holds 11.44 GiB. Measured file sizes from the HF rep
 The planner gives the model the longest context that fits, as always; put the `.gguf` in
 `/data/PS5LM/models` or download it in the app.
 
+## Measured ceilings (27B PQ2_0, firmware 13.60, 2026-10-20)
+
+The hybrid arch keeps KV small - only 16 of the 64 layers hold a cache
+(`full_attention_interval = 4`, 4 KV heads x 256 dims): about 18 KiB/token
+at q4_0. What eats the heap instead is the 6.71 GiB of weights plus the
+logits buffer (`vocab x 4 x batch`) and the compute/pinned-staging buffers,
+which PS5's Vulkan backend allocates out of the same RADV heap. Measured on
+the console with `-b 1024 -ub 512` unless noted:
+
+| Config | Result |
+|---|---|
+| 32k context + vision mmproj (`-b 2048 -ub 1024`) | loads, ~19 t/s generation |
+| 64k context + vision mmproj | loads clean |
+| 128k context, text only | loads clean (`n_ctx_slot = 131072`) |
+| 128k + vision | crash mid-load (hard fault, no allocation line) |
+| 144k / 192k text only | graceful OOM: `failed to allocate Vulkan0 buffer of size 341843972` |
+
+So the practical ceilings are **128k text-only** or **64k with images**; the
+model itself is trained to 262144. With the Settings row "Vision: Auto/On/Off"
+(the new `vision` key in `settings.json`) the planner picks these configs by
+itself now; to force an exact one, override the planner for one boot with
+`/data/PS5LM/app-args.txt` - one argument per line, e.g. for 128k text-only:
+
+```
+--log-file
+/data/PS5LM/llama.log
+-m
+/data/PS5LM/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
+-ngl
+999
+-fit
+off
+-lm
+none
+-c
+131072
+-fa
+on
+-ctk
+q4_0
+-ctv
+q4_0
+-b
+1024
+-ub
+512
+-np
+1
+-ctxcp
+1
+-cram
+0
+--host
+0.0.0.0
+--port
+8081
+--metrics
+--tools
+read_file,write_file,edit_file,file_glob_search,grep_search,get_info
+```
+
+Upload it with `curl -T args.txt ftp://<console>:2121/data/PS5LM/app-args.txt`
+(ftpsrv). The file applies at app start and is unlinked when the TV library
+starts a model instead, so it stays a one-shot override.
+
+After a reboot the title needs its payload trio again before any launch works:
+elfldr (from the exploit), then `scripts/console-setup.sh` (ftpsrv/klogsrv/shsrv)
+plus [kstuff-lite v1.11](https://github.com/EchoStretch/kstuff-lite/releases)
+and [ShadowMountPlus 1.7](https://github.com/drakmor/ShadowMountPlus/releases)
+sent to elfldr - without kstuff-lite the kernel log shows
+`sceSblAuthMgrAuthHeader ... error 46` and the menu says "not installed".
+
 ## Integration notes
 
 - The submodule URL in `.gitmodules` points at the fork; the pin is its HEAD commit.
