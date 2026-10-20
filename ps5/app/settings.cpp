@@ -21,6 +21,7 @@ Settings load_settings(const char * path) {
     s.default_model = j.value("default_model", s.default_model);
     s.ctx_cap       = j.value("ctx_cap", s.ctx_cap);
     s.kv_type       = j.value("kv_type", s.kv_type);
+    s.vision        = j.value("vision", s.vision);
     s.sounds        = j.value("sounds", s.sounds);
     s.tools         = j.value("tools", s.tools);
     s.scratch_limit_gib = j.value("scratch_limit_gib", s.scratch_limit_gib);
@@ -32,6 +33,7 @@ bool save_settings(const char * path, const Settings & s) {
     const nlohmann::json j = {
         { "auto_load", s.auto_load }, { "default_model", s.default_model }, { "ctx_cap", s.ctx_cap },
         { "kv_type", s.kv_type },     { "sounds", s.sounds },       { "tools", s.tools },
+        { "vision", s.vision },
         { "scratch_limit_gib", s.scratch_limit_gib }, { "download_dir", s.download_dir },
     };
     std::ofstream out(path);

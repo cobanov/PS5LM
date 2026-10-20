@@ -179,6 +179,9 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
         } else if (t == ARRAY) {
             const uint32_t et = r.get<uint32_t>();
             const uint64_t n  = r.get<uint64_t>();
+            if (key == "tokenizer.ggml.tokens") {
+                ints["tokenizer.ggml.tokens.count"] = n;  // the vocabulary's size
+            }
             if (et == STRING) {
                 for (uint64_t j = 0; j < n && !r.bad; j++) {
                     r.skip(r.get<uint64_t>());
@@ -225,11 +228,16 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     m.n_head_kv       = (uint32_t) num("attention.head_count_kv", n_head);
     const uint64_t n_embd = num("embedding_length");
     const uint64_t head_dim = n_head ? n_embd / n_head : 0;
+    m.n_embd          = (uint32_t) n_embd;
     m.key_length      = (uint32_t) num("attention.key_length", head_dim);
     m.value_length    = (uint32_t) num("attention.value_length", head_dim);
     m.full_attn_every = (uint32_t) std::max<uint64_t>(1, num("full_attention_interval", 1));
     m.n_ctx_train     = (uint32_t) num("context_length");
     m.n_expert        = (uint32_t) num("expert_count");
+    m.n_ffn           = (uint32_t) num("feed_forward_length");
+    if (auto it = ints.find("tokenizer.ggml.tokens.count"); it != ints.end()) {
+        m.vocab_size = (uint32_t) it->second;
+    }
 
     // Recurrent layers (Gated DeltaNet, Mamba): a fixed f32 state each,
     // the recurrent matrix plus the convolution window.
@@ -313,7 +321,38 @@ const Preset * find_preset(const ModelInfo & m) {
     return nullptr;
 }
 
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force) {
+// Shared tail: one UI line plus the full argument list, for either planner path.
+static Plan finish_plan(Plan p, const ModelInfo & m, const std::string & mmproj,
+                        const Preset * preset, double budget_gib) {
+    char why[160];
+    if (!p.fits) {
+        p.total_gib = p.weights_gib + p.state_gib + p.reserve_gib;
+        std::snprintf(why, sizeof(why), "needs %.1f GiB with a 4k context; %.1f GiB is free", p.total_gib, budget_gib);
+        p.why = why;
+        return p;
+    }
+    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s: %.1f of %.1f GiB",
+                  m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
+                  p.kv_type.c_str(), mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
+    p.why = why;
+
+    p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
+               "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
+               "-b", std::to_string(p.batch), "-ub", std::to_string(p.ubatch), "-np", "1",
+               // One prompt checkpoint and no RAM cache: llama-server's defaults
+               // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
+               "-ctxcp", "1", "-cram", "0",
+               "--host", "0.0.0.0", "--port", "8081" };
+    if (!mmproj.empty()) {
+        p.args.insert(p.args.end(), { "--mmproj", mmproj });
+    }
+    if (preset) {
+        p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
+    }
+    return p;
+}
+
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, const char * vision_mode) {
     Plan p;
     const Preset * preset = find_preset(m);
     if (preset && preset->max_ctx) {
@@ -326,22 +365,85 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (m.n_ctx_train) {
         ctx_cap = std::min(ctx_cap, m.n_ctx_train);
     }
-    p.weights_gib = (m.file_bytes + m.mmproj_bytes) / kGiB;
+    // Vision choice: auto keeps images when they fit, "on" demands them where a
+    // projector exists, "off" frees their heap for context.
+    bool want_img = !m.mmproj.empty();
+    if (vision_mode && std::strcmp(vision_mode, "off") == 0) {
+        want_img = false;
+    }
+    const std::string mmproj       = want_img ? m.mmproj : std::string();
+    const uint64_t    mmproj_bytes = want_img ? m.mmproj_bytes : 0;
+    p.vision = want_img;
+
+    p.weights_gib = (m.file_bytes + mmproj_bytes) / kGiB;
     p.state_gib   = m.state_bytes / kGiB;
-    // Compute buffers and the CPU side (the title heap shares the pool), plus
+
+    static const char *   types[] = { "f16", "q8_0", "q4_0" };
+    const bool decision = !m.decision.empty();
+
+    // Ternary Bonsai (PQ2_0/PTQ1_0), measured on the console: the pinned host
+    // staging and its device mirror come out of the same RADV heap as the
+    // weights, and the logits buffer is vocab * f32 * batch. A narrower ubatch
+    // and batch buy context, so both are chosen by fit rather than fixed.
+    const std::string low_name = lower(m.file_name);
+    const bool ternary = low_name.find("pq2_0") != std::string::npos || low_name.find("ptq1_0") != std::string::npos;
+    if (ternary && m.vocab_size && m.n_ffn && m.n_embd) {
+        static const uint32_t bu[][2] = { { 2048, 2048 }, { 2048, 1024 }, { 1024, 512 } };
+        static const uint32_t ctxs_tern[] = { 131072, 98304, 65536, 32768, 16384, 8192 };
+        const double vocab    = m.vocab_size;
+        const double per_ub   = 2.0 * (4.0 * m.n_ffn + 16.0 * m.n_embd);  // pinned host plus device copy
+        for (uint32_t ctx : ctxs_tern) {
+            if (ctx > ctx_cap) {
+                continue;
+            }
+            for (const auto & b_u : bu) {
+                if (decision && b_u[1] < 2048) {
+                    continue;  // a whole prompt in one ubatch, whatever else fits
+                }
+                for (const char * t : types) {
+                    if (kv_force && std::strcmp(t, kv_force) != 0) {
+                        continue;
+                    }
+                    if (!kv_force && std::strcmp(t, "f16") == 0 && ctx > 8192) {
+                        continue;  // f16 only where it is cheap
+                    }
+                    const double kv = kv_bytes_per_token(m, t) * ctx / kGiB;
+                    const double reserve = 0.7 + (want_img ? 0.5 : 0.0)
+                                         + vocab * 4.0 * b_u[0] / kGiB + per_ub * b_u[1] / kGiB;
+                    const double total = p.weights_gib + kv + p.state_gib + reserve;
+                    if (total <= budget_gib) {
+                        p.fits      = true;
+                        p.ctx       = ctx;
+                        p.batch     = b_u[0];
+                        p.ubatch    = b_u[1];
+                        p.kv_type   = t;
+                        p.kv_gib    = kv;
+                        p.reserve_gib = reserve;
+                        p.total_gib = total;
+                        break;
+                    }
+                }
+                if (p.fits) break;
+            }
+            if (p.fits) break;
+        }
+        return finish_plan(p, m, mmproj, preset, budget_gib);
+    }
+
+    // Everything else keeps the older estimate: compute buffers and the CPU side (the title heap shares the pool), plus
     // one prompt checkpoint of the recurrent state. Calibrated on the console:
     // Qwen3.8-27B UD-Q2_K_XL at 64k with a q4_0 cache ran with 11.38 GiB free.
     // ponytail: 0.25 GiB for the image encoder's buffers is a guess; measure on the console.
     // Decision models (laya, clef, vllm-d3, lfm2-d1-omni) and non-causal image
     // encoders (mtmd caps an image to the ubatch) need a whole prompt or image in
     // one ubatch, so they get 2048, the size #13 ran on the console.
-    const bool wide = !m.decision.empty() || !m.mmproj.empty();
+    const bool wide = decision || want_img;
     // shortcut: 0.5 GiB more compute buffer for the 2048 ubatch is a guess; measure on the console.
-    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0);
+    p.reserve_gib = 0.75 + p.state_gib + (want_img ? 0.25 : 0.0) + (wide ? 0.5 : 0.0);
+    p.batch  = wide ? 2048 : 256;
+    p.ubatch = wide ? 2048 : 64;
 
-    // The longest context first, and at each length the best cache that fits.
-    static const uint32_t ctxs[]  = { 131072, 65536, 32768, 16384, 8192, 4096 };
-    static const char *   types[] = { "f16", "q8_0", "q4_0" };
+    static const uint32_t ctxs[] = { 131072, 65536, 32768, 16384, 8192, 4096 };
     for (uint32_t ctx : ctxs) {
         if (ctx > ctx_cap) {
             continue;
@@ -350,17 +452,16 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             if (kv_force && std::strcmp(t, kv_force) != 0) {
                 continue;
             }
-            // f16 only where it is cheap: q8_0 costs nothing measurable in quality.
             if (!kv_force && std::strcmp(t, "f16") == 0 && ctx > 8192) {
                 continue;
             }
             const double kv    = kv_bytes_per_token(m, t) * ctx / kGiB;
             const double total = p.weights_gib + kv + p.state_gib + p.reserve_gib;
             if (total <= budget_gib) {
-                p.fits = true;
-                p.ctx = ctx;
-                p.kv_type = t;
-                p.kv_gib = kv;
+                p.fits      = true;
+                p.ctx       = ctx;
+                p.kv_type   = t;
+                p.kv_gib    = kv;
                 p.total_gib = total;
                 break;
             }
@@ -369,33 +470,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             break;
         }
     }
-
-    char why[160];
-    if (!p.fits) {
-        p.total_gib = p.weights_gib + p.state_gib + p.reserve_gib;
-        std::snprintf(why, sizeof(why), "needs %.1f GiB with a 4k context; %.1f GiB is free", p.total_gib, budget_gib);
-        p.why = why;
-        return p;
-    }
-    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s: %.1f of %.1f GiB",
-                  m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
-                  p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
-    p.why = why;
-
-    p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
-               "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
-               "-b", wide ? "2048" : "256", "-ub", wide ? "2048" : "64", "-np", "1",
-               // One prompt checkpoint and no RAM cache: llama-server's defaults
-               // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
-               "-ctxcp", "1", "-cram", "0",
-               "--host", "0.0.0.0", "--port", "8081" };
-    if (!m.mmproj.empty()) {
-        p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
-    }
-    if (preset) {
-        p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
-    }
-    return p;
+    return finish_plan(p, m, mmproj, preset, budget_gib);
 }
 
 std::vector<std::string> find_models(const std::vector<std::string> & dirs) {

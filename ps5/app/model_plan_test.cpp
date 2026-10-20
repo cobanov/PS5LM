@@ -62,6 +62,33 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan cp = ps5lm::plan_model(c, budget);
     assert(cp.fits && cp.ctx > 4096 && has_args(cp, "-ub", "64"));
 
+    // Ternary Bonsai 2 27B PQ2_0: hybrid like Qwen 3.5 (16 of 64 layers cache)
+    // plus a 248k vocabulary. Measured on the console at 11.0 GiB free: text-only
+    // runs at 128k with -b 1024 -ub 512; with the 0.6 GiB vision projector it
+    // takes 64k there; Vision Off keeps 128k.
+    Gguf bonsai;
+    bonsai.kv("general.architecture", "qwen35").kv("general.name", "Ternary Bonsai 2 27B")
+        .kv("qwen35.block_count", 64u).kv("qwen35.attention.head_count", 24u)
+        .kv("qwen35.attention.head_count_kv", 4u).kv("qwen35.embedding_length", 5120u)
+        .kv("qwen35.feed_forward_length", 17408u).kv("qwen35.attention.key_length", 256u)
+        .kv("qwen35.attention.value_length", 256u).kv("qwen35.full_attention_interval", 4u)
+        .kv("qwen35.context_length", 262144u);
+    bonsai.kvs += Gguf::str("tokenizer.ggml.tokens") + Gguf::raw<uint32_t>(9) + Gguf::raw<uint32_t>(8) +
+                 Gguf::raw<uint64_t>(248320) + std::string(8ull * 248320, '\0');
+    bonsai.n++;
+    ps5lm::ModelInfo b = ps5lm::read_model_header("Ternary-Bonsai-2-27B-PQ2_0.gguf", bonsai.bytes(), 7206168928ull);
+    assert(b.ok && b.vocab_size == 248320 && b.n_ffn == 17408 && b.n_kv_layers() == 16);
+    const double slim_budget = 11.0;
+    const ps5lm::Plan bt = ps5lm::plan_model(b, slim_budget, 131072, nullptr, "auto");
+    assert(bt.fits && bt.ctx == 131072 && has_args(bt, "-b", "1024") && has_args(bt, "-ub", "512"));
+    ps5lm::ModelInfo bv = b;
+    bv.mmproj = "/data/PS5LM/models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
+    bv.mmproj_bytes = 629246976ull;
+    const ps5lm::Plan bvo = ps5lm::plan_model(bv, slim_budget, 131072, nullptr, "auto");
+    assert(bvo.fits && bvo.ctx == 65536 && has_args(bvo, "-b", "1024") && bvo.vision);
+    const ps5lm::Plan bvt = ps5lm::plan_model(bv, slim_budget, 131072, nullptr, "off");
+    assert(bvt.fits && bvt.ctx == 131072 && !bvt.vision);
+
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
         return 0;

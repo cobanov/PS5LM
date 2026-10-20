@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, scratch_limit, clear_scratch, download_dir, vision };
 
 struct SettingRow {
     Setting      id;
@@ -100,8 +100,9 @@ constexpr SettingCategory kCategories[] = {
       2 },
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
-        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" } },
-      2 },
+        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
+        { Setting::vision, "Images", "Auto loads the vision projector if it fits; Off frees the heap for more context" } },
+      3 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
         { Setting::scratch_limit, "Warn above", "A notification when that folder grows past this" },
@@ -391,6 +392,7 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
         }
         case Setting::ctx_cap: return format("%.0fk tokens", s.ctx_cap / 1024.0);
         case Setting::kv_type: return s.kv_type == "auto" ? "Auto" : s.kv_type;
+        case Setting::vision: return s.vision == "auto" ? "Auto" : s.vision == "on" ? "On" : "Off";
         case Setting::scratch_limit: return format("%.0f GB", (double) s.scratch_limit_gib);
         case Setting::download_dir: {
             for (const auto & d : drives) {
@@ -449,6 +451,16 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
             for (int i = 0; i < 4; ++i) {
                 const std::string t = kKvSteps[i];
                 add(i == 0 ? "Auto" : t, notes[i], s.kv_type == t, [&](Settings & v) { v.kv_type = t; });
+            }
+            break;
+        }
+        case Setting::vision: {
+            const char * notes[] = { "Images if they fit beside the model", "Force the projector; context shrinks",
+                                     "No images: the longest context" };
+            const char * steps[] = { "auto", "on", "off" };
+            for (int i = 0; i < 3; ++i) {
+                const std::string t = steps[i];
+                add(i == 0 ? "Auto" : i == 1 ? "On" : "Off", notes[i], s.vision == t, [&](Settings & v) { v.vision = t; });
             }
             break;
         }

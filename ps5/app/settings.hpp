@@ -15,6 +15,7 @@ struct Settings {
     std::string default_model;      // a path from the library, or empty
     uint32_t    ctx_cap   = 65536;  // the planner's longest context
     std::string kv_type   = "auto"; // "auto", "f16", "q8_0" or "q4_0"
+    std::string vision    = "auto"; // "auto", "on" or "off": the vision projector and its images
     bool        sounds    = true;
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     uint32_t    scratch_limit_gib = 2;  // warn when the scratch folder grows past this

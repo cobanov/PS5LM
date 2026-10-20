@@ -31,6 +31,9 @@ struct ModelInfo {
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
+    uint32_t    n_ffn           = 0;   // feed_forward_length
+    uint32_t    n_embd          = 0;   // embedding_length
+    uint32_t    vocab_size      = 0;   // tokenizer vocabulary
     std::string mmproj;                // a vision projector beside the model, or empty
     uint64_t    mmproj_bytes    = 0;
     bool        ok              = false;
@@ -66,7 +69,9 @@ const Preset * find_preset(const ModelInfo & m);
 
 struct Plan {
     bool        fits = false;
+    bool        vision = false;       // images are on in this plan
     uint32_t    ctx  = 0;
+    uint32_t    batch = 0, ubatch = 0;
     std::string kv_type;      // cache type for K and V
     double      weights_gib  = 0;
     double      kv_gib       = 0;
@@ -79,7 +84,10 @@ struct Plan {
 
 // budget_gib: device memory free before loading (the app reads it from ggml).
 // kv_force: one cache type ("f16", "q8_0", "q4_0") instead of the best that fits.
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr);
+// vision_mode: "auto" keeps a projector if it fits, "on" demands it, "off" frees
+// the heap for context.
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536,
+                const char * kv_force = nullptr, const char * vision_mode = "auto");
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

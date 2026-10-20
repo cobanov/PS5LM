@@ -431,6 +431,7 @@ struct Models {
     static std::vector<ModelRow> plan_rows(const Settings & settings, double budget_gib, const std::string & running) {
         std::vector<ModelRow> rows;
         const char * kv = settings.kv_type == "auto" ? nullptr : settings.kv_type.c_str();
+        const char * vis = settings.vision == "auto" ? "auto" : settings.vision.c_str();
         for (const auto & path : find_models(kModelDirs)) {
             const ModelInfo m = read_model_info(path);
             ModelRow row;
@@ -442,7 +443,7 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, vis);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -468,7 +469,8 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(),
+                                 settings.vision == "auto" ? "auto" : settings.vision.c_str());
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -921,7 +923,8 @@ int main(int, char **) {
             const Settings was = models.settings;
             models.settings = dash.settings();
             save_settings(kSettings, models.settings);
-            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
+                was.vision != models.settings.vision) {
                 models.rescan(stats);
             }
             std::printf("ps5lm-app: settings saved\n");
