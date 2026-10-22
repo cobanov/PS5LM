@@ -80,7 +80,7 @@ constexpr int          kMarketChipCount = 7;
 // ---- Settings -------------------------------------------------------------------
 
 enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir,
-                           debug_report, report_kernel_log };
+                           storage, debug_report, report_kernel_log };
 
 struct SettingRow {
     Setting      id;
@@ -110,8 +110,9 @@ constexpr SettingCategory kCategories[] = {
       3 },
     { "Sound and storage",
       { { Setting::sounds, "Sounds", "Interface sounds on the TV" },
-        { Setting::download_dir, "Save downloads to", "Internal storage, or PS5LM/models on an M.2 or USB drive" } },
-      2 },
+        { Setting::download_dir, "Save downloads to", "Internal storage, or PS5LM/models on an M.2 or USB drive" },
+        { Setting::storage, "Where PS5LM keeps its files", "Full storage, or its own while the HEN keeps /data closed" } },
+      3 },
     { "Developer",
       { { Setting::introspect, "Logits and activations API",
           "Off: /v1/introspect is closed. On: the raw numbers. A change restarts the model" } },
@@ -408,7 +409,7 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
                     return d.name;
                 }
             }
-            return s.download_dir.rfind("/mnt/ext", 0) == 0 ? "M.2 drive, not found" : "USB drive, not found";
+            return drive_name(s.download_dir) + ", not found";
         }
         default: return "";
     }
@@ -435,6 +436,16 @@ bool toggle_value(const Settings & s, Setting id) {
 
 // A row that does something when pressed, with no value of its own.
 bool is_action(Setting id) { return id == Setting::clear_scratch || id == Setting::debug_report; }
+
+// Used and whole size of the app's storage, from its drive, as the row shows it.
+std::string app_storage_text(const std::vector<Drive> & drives, double size_gib) {
+    for (const auto & d : drives) {
+        if (d.name == "App storage" && d.total > 0) {
+            return format("App storage, %.1f", d.total - d.free) + format(" of %.0f GB used", d.total);
+        }
+    }
+    return format("App storage, %.0f GB", size_gib);
+}
 
 // A row's choices, for the list X opens under it: each with the settings it
 // would make, and whether it is the one set now.
@@ -601,7 +612,7 @@ void Dashboard::refilter_logs() {
 
 void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & feedback) {
     const hui::InputFrame none{};
-    const bool dialog = market_confirm_ || market_space_ || picker_ || report_dialog_;
+    const bool dialog = market_confirm_ || market_space_ || picker_ || report_dialog_ || storage_dialog_;
     const hui::InputFrame & input = busy() ? none : raw;  // busy: the screen says so, buttons wait
     age_ += dt;
     clock_ += dt;
@@ -630,7 +641,9 @@ void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & fee
     // L1/R1 walk the dock, unless a question is open. A message being typed
     // takes every button until it is sent or dropped.
     const int step = input.is_pressed(Action::page_next) ? 1 : input.is_pressed(Action::page_prev) ? -1 : 0;
-    if (prompt_.is_open()) {
+    if (storage_dialog_) {
+        update_storage_dialog(input, feedback);
+    } else if (prompt_.is_open()) {
         if (prompt_.handle(input, feedback) == ui::Event::activated) {
             request_ = { Request::ask, prompt_.text() };
         }
@@ -1004,6 +1017,14 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
     if (id == Setting::clear_scratch) {
         request_ = { Request::clear_scratch, "" };
         feedback.play(Cue::select);
+    } else if (id == Setting::storage) {
+        if (full_storage_) {
+            feedback.play(Cue::error);  // nothing to choose
+        } else {
+            storage_dialog_ = true;
+            storage_howto_ = false;
+            feedback.play(Cue::modal_open);
+        }
     } else if (id == Setting::debug_report) {
         if (report_busy_) {
             feedback.play(Cue::error);  // one is being written
@@ -1162,7 +1183,7 @@ void Dashboard::draw_hints(gfx::DrawList & l) const {
     layout.cy = 1018;
     layout.item_gap = 36;
     std::vector<ui::Hint> h;
-    if (market_confirm_ || market_space_ || report_dialog_ || prompt_.visible()) {
+    if (market_confirm_ || market_space_ || report_dialog_ || storage_dialog_ || prompt_.visible()) {
         return;  // the dialog has its own
     }
     if (picker_ && page_ == kSettingsPage) {
@@ -1217,6 +1238,11 @@ void Dashboard::draw_hints(gfx::DrawList & l) const {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Clear" } };
         } else if (id == Setting::debug_report) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, report_busy_ ? "Writing it" : "Create" } };
+        } else if (id == Setting::storage) {
+            h = { { ui::Button::circle, "Back" } };
+            if (!full_storage_) {
+                h.push_back({ ui::Button::cross, "Options" });
+            }
         } else if (is_toggle(id)) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Switch" } };
         } else {
@@ -1854,6 +1880,9 @@ void Dashboard::draw_settings(gfx::DrawList & l) const {
         const float cy = y + kRowH * 0.5f;
         if (is_toggle(r.id)) {
             toggle_switch(l, kRight - 28, cy, toggle_value(settings_, r.id));
+        } else if (r.id == Setting::storage) {
+            put(l, f.regular, full_storage_ ? "Full storage, /data/PS5LM" : app_storage_text(live_.drives, app_storage_gib_),
+                 kRight - 28, y + 50, 24, in_rows_ && i == setting_row_ ? kInk : kInk2, gfx::Align::right);
         } else if (!is_action(r.id)) {
             const bool focus = in_rows_ && i == setting_row_;
             const Color c = focus ? kInk : kInk2;
@@ -1945,6 +1974,10 @@ void sheet(gfx::DrawList & l, const Rect & r) {
 }  // namespace
 
 void Dashboard::draw_dialogs(gfx::DrawList & l) const {
+    if (storage_dialog_) {
+        draw_storage_dialog(l);
+        return;
+    }
     if (page_ == kSettingsPage && report_dialog_) {
         draw_report_dialog(l);
         return;
@@ -1974,6 +2007,74 @@ void Dashboard::draw_dialogs(gfx::DrawList & l) const {
         const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Save it there" } };
         ui::draw_hints(l, fonts_, style, h, market_dir_.empty() ? 1 : 2, r.x + r.w - 56, true, layout);
     }
+}
+
+// Full storage closed: the app's own storage, or how to open /data to it.
+void Dashboard::update_storage_dialog(const hui::InputFrame & input, ui::Feedback & feedback) {
+    if (!storage_howto_) {
+        if (input.is_pressed(Action::confirm)) {
+            storage_dialog_ = false;
+            request_ = { Request::storage_app, "" };
+            feedback.play(Cue::select);
+        } else if (input.is_pressed(Action::north)) {
+            storage_howto_ = true;
+            feedback.play(Cue::tab);
+        } else if (input.is_pressed(Action::back)) {
+            storage_dialog_ = false;  // asked again at the next start
+            feedback.play(Cue::modal_close);
+        }
+        return;
+    }
+    if (input.is_pressed(Action::confirm)) {
+        storage_dialog_ = false;
+        request_ = { Request::restart, "" };
+        feedback.play(Cue::launch);
+    } else if (input.is_pressed(Action::back)) {
+        storage_howto_ = false;
+        feedback.play(Cue::back);
+    }
+}
+
+void Dashboard::draw_storage_dialog(gfx::DrawList & l) const {
+    const ui::Fonts & f = fonts_;
+    const Rect r{ 960 - 580, 540 - 300, 1160, 600 };
+    sheet(l, r);
+    const float text_w = r.w - 112;
+    float y = r.y + 150;
+    const auto para = [&](const std::string & text, Color c) {
+        for (const auto & line : wrap(f.regular, text, 23, text_w)) {
+            put(l, f.regular, line, r.x + 56, y, 23, c);
+            y += 34;
+        }
+        y += 18;
+    };
+    std::vector<ui::Hint> h;
+    if (!storage_howto_) {
+        put(l, f.semibold, "Full storage is closed to PS5LM", r.x + 56, r.y + 86, 34, kInk);
+        para("The HEN did not open the console's storage (/data) to the app, so PS5LM cannot keep its models, "
+             "settings and logs there.", kInk2);
+        para("It can use its own storage instead: up to " + format("%.0f GB", app_storage_gib_) +
+             ", enough for one large model or a few small ones. Downloads that do not fit are refused before they start.",
+             kInk2);
+        para("Or open full storage to it and start again; models saved in the app's storage stay in the library.", kInk3);
+        h = { { ui::Button::circle, "Not now" }, { ui::Button::triangle, "How to open it" },
+              { ui::Button::cross, "Use the app's storage" } };
+    } else {
+        put(l, f.semibold, "Open full storage to PS5LM", r.x + 56, r.y + 86, 34, kInk);
+        para("OnionHEN: over FTP, add PPSA99575 to exact_title_ids in the [app_jailbreak] section of "
+             "/data/OnionHEN/config.ini.", kInk2);
+        para("etaHEN opens /data to homebrew before it starts; if it did not, load etaHEN again, up to date.", kInk2);
+        para("Other HENs: allow PPSA99575 in their app jailbreak list.", kInk2);
+        para("Then start PS5LM again: it asks the HEN for /data at every start.", kInk3);
+        h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Start again" } };
+    }
+    ui::GlyphStyle style = ui::GlyphStyle::dark();
+    style.label = kInk2;
+    ui::HintLayout layout;
+    layout.size = 32;
+    layout.text_size = 22;
+    layout.cy = r.y + r.h - 56;
+    ui::draw_hints(l, fonts_, style, h.data(), (int) h.size(), r.x + r.w - 56, true, layout);
 }
 
 // Before the first debug report: what goes in it, and what never does.

@@ -10,6 +10,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "storage.hpp"
+
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -154,8 +156,6 @@ class StatsCollector {
 std::vector<Drive> mounted_drives();
 std::vector<Drive> drives_from_metrics(const std::string & text);
 
-// The kind of drive holding `path`: "Internal storage", "M.2 drive", "USB drive".
-std::string drive_name(const std::string & path);
 
 bool send_payload(const char * path, int port);
 // Where llama-server's request hooks (activity.cpp) report.

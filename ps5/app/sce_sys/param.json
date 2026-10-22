@@ -11,7 +11,7 @@
   "contentBadgeType": 1,
   "contentId": "UP9000-PPSA99575_00-PS5LMVULKAN00001",
   "contentVersion": "01.010.000",
-  "downloadDataSize": 256,
+  "downloadDataSize": 16384,
   "gameIntent": {
     "permittedIntents": [
       {

@@ -4,6 +4,7 @@
 #include "fetch.hpp"
 #include "ftp_writer.hpp"
 #include "model_plan.hpp"
+#include "storage.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -11,6 +12,7 @@ extern "C" {
 #include "hash/sha256/sha256.h"
 }
 
+#include <cerrno>
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
@@ -225,7 +227,6 @@ bool Market::job(int repo, int file, const std::string & dir, MarketJob * out) {
 
 namespace {
 
-constexpr const char * kQueue = "/data/PS5LM/downloads.json";
 
 // Pieces at once, each on its own template (made once, one after the
 // other). Measured on the console (CHANGELOG 0.8.0): one connection gets 3
@@ -268,11 +269,11 @@ void Market::save_queue() {
         j.push_back({ { "repo", d.repo }, { "file", d.file }, { "sha256", d.sha256 }, { "dir", d.dir }, { "bytes", d.bytes },
                       { "state", state_name(d.state) }, { "note", d.note }, { "resume", d.resume }, { "save_as", d.save_as } });
     }
-    std::ofstream(kQueue) << j.dump(1) << "\n";
+    std::ofstream(data_path("downloads.json")) << j.dump(1) << "\n";
 }
 
 void Market::load_queue() {
-    std::ifstream in(kQueue);
+    std::ifstream in(data_path("downloads.json"));
     const nlohmann::json j = nlohmann::json::parse(in, nullptr, false);
     if (!j.is_array()) {
         return;
@@ -303,29 +304,51 @@ void Market::load_queue() {
     }
 }
 
-bool Market::enqueue(const MarketJob & job, double free) {
+bool Market::enqueue(const MarketJob & job, double free) { return enqueue(std::vector<MarketJob>{ job }, free); }
+
+bool Market::enqueue(const std::vector<MarketJob> & jobs, double free) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto & d : view_.downloads) {
-        if (d.repo == job.repo && d.file == job.file && d.state != DownloadState::done) {
-            view_.note = job.file + " is in Downloads already";
-            return false;
-        }
-    }
-    // Room for the file and 1 GiB to spare, so a download never fills a
-    // drive (a full /data upsets the system, not only this app).
-    if (free >= 0 && free < job.bytes / 1073741824.0 + 1.0) {
-        char text[256];
-        std::snprintf(text, sizeof(text), "Not enough space: %s needs %.1f GiB and 1 GiB spare, %s has %.1f GiB free",
-                      job.file.c_str(), job.bytes / 1073741824.0, job.dir.c_str(), free);
-        view_.note = text;
-        std::printf("ps5lm-app: download %s/%s: %s\n", job.repo.c_str(), job.file.c_str(), text);
+    if (jobs.empty()) {
         return false;
     }
-    Download d;
-    static_cast<MarketJob &>(d) = job;
-    d.resume = d.done = 0;  // ponytail: a stray partial file is fetched again, its progress is not known
-    view_.downloads.push_back(d);
-    view_.note = job.file + " added to Downloads";
+    for (const auto & job : jobs) {
+        for (const auto & d : view_.downloads) {
+            if (d.repo == job.repo && d.file == job.file && d.state != DownloadState::done) {
+                view_.note = job.file + " is in Downloads already";
+                return false;
+            }
+        }
+    }
+    // Room for the files, the downloads queued to the same drive before them,
+    // and 1 GiB to spare, so a download never fills a drive (a full /data
+    // upsets the system, not only this app) and never stops halfway for want
+    // of room. A model and its image projector are asked for together.
+    const std::string & dir = jobs[0].dir;
+    double need = 0, queued = 0;
+    for (const auto & job : jobs) {
+        need += job.bytes / 1073741824.0;
+    }
+    for (const auto & d : view_.downloads) {
+        if (d.dir == dir && d.state != DownloadState::done) {
+            queued += (double) (d.bytes - std::min(d.done, d.bytes)) / 1073741824.0;
+        }
+    }
+    if (free >= 0 && free - queued < need + 1.0) {
+        char text[320];
+        std::snprintf(text, sizeof(text), "Not enough space: %s%s needs %.1f GiB and 1 GiB spare, %s has %.1f GiB free%s",
+                      jobs[0].file.c_str(), jobs.size() > 1 ? " and its image projector" : "", need, drive_name(dir).c_str(),
+                      std::max(0.0, free - queued), queued > 0 ? " after the downloads queued there" : "");
+        view_.note = text;
+        std::printf("ps5lm-app: download %s/%s: %s\n", jobs[0].repo.c_str(), jobs[0].file.c_str(), text);
+        return false;
+    }
+    for (const auto & job : jobs) {
+        Download d;
+        static_cast<MarketJob &>(d) = job;
+        d.resume = d.done = 0;  // ponytail: a stray partial file is fetched again, its progress is not known
+        view_.downloads.push_back(d);
+    }
+    view_.note = jobs[0].file + " added to Downloads";
     save_queue();
     if (!working_.exchange(true)) {
         std::thread([this] { worker(); }).detach();
@@ -462,7 +485,13 @@ bool Market::fetch(Download & d) {
     }
     FtpWriter ftp;
     std::string ftp_error;
-    const bool via_ftp = connect_ftp_writer(ftp, ftp_error);
+    // The app's own storage (/download0) exists only in its sandbox; a payload
+    // writing that path would write somewhere else.
+    const bool own_storage = d.dir.rfind("/download0", 0) == 0;
+    if (own_storage) {
+        ftp_error = "the app's own storage is not visible to ftpsrv";
+    }
+    const bool via_ftp = !own_storage && connect_ftp_writer(ftp, ftp_error);
     const std::string direct_note = via_ftp ? "" : "written without ftpsrv, slower after about 2 GB";
     if (!via_ftp) {
         std::printf("ps5lm-app: download %s: the app writes the file itself, which gets slow after about 2.2 GB (%s)\n",
@@ -485,6 +514,7 @@ bool Market::fetch(Download & d) {
     std::atomic<int>      failures{ 0 };   // in a row, across connections
     std::atomic<int>      waiting{ 0 };    // connections waiting to try again
     std::atomic<bool>     fatal{ false };
+    std::atomic<int>      write_errno{ 0 };  // a write refused for want of room ends the download
     std::string           last_error;
     // Through ftpsrv: once the pieces before k are written, k at its place. A
     // piece counts once ftpsrv confirmed it (226); a failed one is cut off by
@@ -544,6 +574,7 @@ bool Market::fetch(Download & d) {
                 if (via_ftp) {
                     buf.insert(buf.end(), p, p + n);
                 } else if (pwrite(fd, p, n, (off_t) (off + got)) != (ssize_t) n) {
+                    write_errno = errno;
                     return false;
                 }
                 got += n;
@@ -576,6 +607,12 @@ bool Market::fetch(Download & d) {
             const int f = ++failures;
             std::printf("ps5lm-app: download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
                         (unsigned long long) off, (unsigned long long) got, text);
+            const int werr = write_errno;
+            if (werr == ENOSPC || werr == EDQUOT || werr == EFBIG) {
+                last_error = drive_name(d.dir) + " is full";
+                fatal = true;
+                return;
+            }
             // A 4xx other than 408/429 will not get better by asking again.
             if ((r.status >= 400 && r.status < 500 && r.status != 408 && r.status != 429) || r.status == 200 || f > 20 ||
                 (fetched && ftp_disk_full(write_error))) {

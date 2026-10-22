@@ -121,6 +121,11 @@ opened the console's storage to it:
   mode 777 (in FileZilla: File permissions, applied to subdirectories). Reported on etaHEN 2.6b,
   firmware 10.00.
 
+If the HEN has not opened the console's storage (`/data`) to PS5LM, the app says so on its first
+start and offers its own storage instead: up to 16 GB in `/download0/PS5LM`, for its settings, logs
+and models (a download that does not fit is refused before it starts). Models saved in the app's storage stay in the
+library. **Settings > Sound and storage** shows which one is in use.
+
 When something goes wrong, **Settings > Debug report** writes `/data/PS5LM/debug-report.txt` (and a copy
 to a USB drive, when one is in): the app's version, the system software, storage, models, settings, the
 end of both logs and which payload ports answer, with API keys and tokens taken out. Attach it to your

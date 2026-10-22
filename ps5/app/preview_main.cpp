@@ -452,9 +452,18 @@ int main(int argc, char ** argv) {
     shot("18-settings-context");
     step(20, press(A::back), false);
     step(20, press(A::back), false);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         step(15, nav(D::down), false);
     }
+    // Sound and storage, on a console where the HEN kept /data closed.
+    dash.set_storage(false, 16, false);
+    step(30, press(A::confirm), false);
+    step(20, nav(D::down), false);
+    step(20, nav(D::down), false);
+    shot("18-settings-app-storage");
+    step(20, press(A::back), false);
+    dash.set_storage(true, 16, false);
+    step(15, nav(D::down), false);
     step(30, press(A::confirm), false);
     shot("19-settings-report");
     step(30, press(A::confirm), false);
@@ -475,6 +484,14 @@ int main(int argc, char ** argv) {
     step(60, {}, true);
     shot("20-home-message");
     step(30, press(A::back), true);
+    // The first start without full storage.
+    dash.set_storage(false, 16, true);
+    step(30, {}, false);
+    shot("20-storage-closed");
+    step(20, press(A::north), false);
+    shot("20-storage-howto");
+    step(20, press(A::back), false);
+    step(20, press(A::confirm), false);
     dash.set_busy("Loading Qwen3.8 27B", "Restarting with the whole memory for it, about 90 seconds");
     step(30, {}, false);
     shot("21-busy");
