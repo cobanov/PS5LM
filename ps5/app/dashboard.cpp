@@ -79,7 +79,8 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir,
+                           debug_report, report_kernel_log };
 
 struct SettingRow {
     Setting      id;
@@ -115,10 +116,14 @@ constexpr SettingCategory kCategories[] = {
       { { Setting::introspect, "Logits and activations API",
           "Off: /v1/introspect is closed. On: the raw numbers. A change restarts the model" } },
       1 },
+    { "Debug report",
+      { { Setting::debug_report, "Create a debug report", "One file to attach to a GitHub issue, with no keys or tokens in it" },
+        { Setting::report_kernel_log, "Include the kernel log", "Its last 1 MiB, read from klogsrv; off unless you switch it on" } },
+      2 },
     { "Diagnostics", {}, 0 },
 };
-constexpr int kCategoryCount = 6;
-constexpr int kDiagnostics = 5;
+constexpr int kCategoryCount = 7;
+constexpr int kDiagnostics = 6;
 
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
@@ -409,17 +414,27 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
     }
 }
 
-bool is_toggle(Setting id) { return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools || id == Setting::introspect; }
+bool is_toggle(Setting id) {
+    return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools || id == Setting::introspect
+        || id == Setting::report_kernel_log;
+}
 
-bool toggle_value(const Settings & s, Setting id) {
+bool & toggle_ref(Settings & s, Setting id) {
     switch (id) {
-        case Setting::auto_load:  return s.auto_load;
-        case Setting::sounds:     return s.sounds;
-        case Setting::tools:      return s.tools;
-        case Setting::introspect: return s.introspect;
-        default:                  return false;
+        case Setting::auto_load:         return s.auto_load;
+        case Setting::sounds:            return s.sounds;
+        case Setting::introspect:        return s.introspect;
+        case Setting::report_kernel_log: return s.report_kernel_log;
+        default:                         return s.tools;
     }
 }
+
+bool toggle_value(const Settings & s, Setting id) {
+    return is_toggle(id) && toggle_ref(const_cast<Settings &>(s), id);
+}
+
+// A row that does something when pressed, with no value of its own.
+bool is_action(Setting id) { return id == Setting::clear_scratch || id == Setting::debug_report; }
 
 // A row's choices, for the list X opens under it: each with the settings it
 // would make, and whether it is the one set now.
@@ -586,7 +601,7 @@ void Dashboard::refilter_logs() {
 
 void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & feedback) {
     const hui::InputFrame none{};
-    const bool dialog = market_confirm_ || market_space_ || picker_;
+    const bool dialog = market_confirm_ || market_space_ || picker_ || report_dialog_;
     const hui::InputFrame & input = busy() ? none : raw;  // busy: the screen says so, buttons wait
     age_ += dt;
     clock_ += dt;
@@ -940,6 +955,18 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
         update_picker(input, feedback);
         return;
     }
+    // What a debug report holds, before the first one.
+    if (report_dialog_) {
+        if (input.is_pressed(Action::confirm)) {
+            report_dialog_ = false;
+            request_ = { Request::debug_report, "" };
+            feedback.play(Cue::select);
+        } else if (input.is_pressed(Action::back)) {
+            report_dialog_ = false;
+            feedback.play(Cue::modal_close);
+        }
+        return;
+    }
     if (!in_rows_) {
         if (input.nav == Direction::up || input.nav == Direction::down) {
             const int next = setting_category_ + (input.nav == Direction::down ? 1 : -1);
@@ -977,11 +1004,18 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
     if (id == Setting::clear_scratch) {
         request_ = { Request::clear_scratch, "" };
         feedback.play(Cue::select);
+    } else if (id == Setting::debug_report) {
+        if (report_busy_) {
+            feedback.play(Cue::error);  // one is being written
+        } else if (!settings_.report_explained) {
+            report_dialog_ = true;
+            feedback.play(Cue::modal_open);
+        } else {
+            request_ = { Request::debug_report, "" };
+            feedback.play(Cue::select);
+        }
     } else if (is_toggle(id)) {
-        bool & on = id == Setting::auto_load  ? settings_.auto_load
-                  : id == Setting::sounds     ? settings_.sounds
-                  : id == Setting::tools      ? settings_.tools
-                                              : settings_.introspect;
+        bool & on = toggle_ref(settings_, id);
         on = !on;
         request_ = { Request::settings, "" };
         feedback.play(Cue::toggle);
@@ -1128,7 +1162,7 @@ void Dashboard::draw_hints(gfx::DrawList & l) const {
     layout.cy = 1018;
     layout.item_gap = 36;
     std::vector<ui::Hint> h;
-    if (market_confirm_ || market_space_ || prompt_.visible()) {
+    if (market_confirm_ || market_space_ || report_dialog_ || prompt_.visible()) {
         return;  // the dialog has its own
     }
     if (picker_ && page_ == kSettingsPage) {
@@ -1181,6 +1215,8 @@ void Dashboard::draw_hints(gfx::DrawList & l) const {
         const Setting id = kCategories[setting_category_].rows[setting_row_].id;
         if (id == Setting::clear_scratch) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Clear" } };
+        } else if (id == Setting::debug_report) {
+            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, report_busy_ ? "Writing it" : "Create" } };
         } else if (is_toggle(id)) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Switch" } };
         } else {
@@ -1811,11 +1847,14 @@ void Dashboard::draw_settings(gfx::DrawList & l) const {
         const SettingRow & r = c.rows[i];
         const float y = kListY + kRowPitch * (float) i;
         put(l, f.regular, r.label, kListX + 28, y + 36, 26, kInk);
-        put(l, f.regular, r.help, kListX + 28, y + 66, 20, kInk3);
+        // The debug report's row says where the last one went, in place of its help.
+        const bool status = r.id == Setting::debug_report && !report_status_.empty();
+        put(l, f.regular, f.regular.font->fit(status ? report_status_ : std::string(r.help), 20, kRight - kListX - 140),
+             kListX + 28, y + 66, 20, status && report_status_.rfind("Failed", 0) == 0 ? kRed : status ? kInk2 : kInk3);
         const float cy = y + kRowH * 0.5f;
         if (is_toggle(r.id)) {
             toggle_switch(l, kRight - 28, cy, toggle_value(settings_, r.id));
-        } else if (r.id != Setting::clear_scratch) {
+        } else if (!is_action(r.id)) {
             const bool focus = in_rows_ && i == setting_row_;
             const Color c = focus ? kInk : kInk2;
             put(l, f.regular, setting_text(settings_, r.id, live_.models, live_.drives), kRight - 68, y + 50, 24, c,
@@ -1906,6 +1945,10 @@ void sheet(gfx::DrawList & l, const Rect & r) {
 }  // namespace
 
 void Dashboard::draw_dialogs(gfx::DrawList & l) const {
+    if (page_ == kSettingsPage && report_dialog_) {
+        draw_report_dialog(l);
+        return;
+    }
     if (!(page_ == kModelsPage && (market_confirm_ || market_space_))) {
         return;
     }
@@ -1931,6 +1974,46 @@ void Dashboard::draw_dialogs(gfx::DrawList & l) const {
         const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Save it there" } };
         ui::draw_hints(l, fonts_, style, h, market_dir_.empty() ? 1 : 2, r.x + r.w - 56, true, layout);
     }
+}
+
+// Before the first debug report: what goes in it, and what never does.
+void Dashboard::draw_report_dialog(gfx::DrawList & l) const {
+    const ui::Fonts & f = fonts_;
+    const Rect r{ 960 - 560, 540 - 330, 1120, 660 };
+    sheet(l, r);
+    put(l, f.semibold, "What a debug report holds", r.x + 56, r.y + 86, 34, kInk);
+    const char * items[] = {
+        "The app's version and the console's system software",
+        "Where PS5LM keeps its files, the drives and their free space",
+        "The models on this PS5, their plans, and the downloads",
+        "Your settings and the server's arguments",
+        "The last 256 KiB of app.log and of llama.log",
+        "Which payload ports answer on this console (ELF loader, FTP, kernel log, ...)",
+    };
+    float y = r.y + 150;
+    for (const char * it : items) {
+        l.circle(r.x + 66, y - 8, 4, kInk3);
+        put(l, f.regular, it, r.x + 86, y, 22, kInk2);
+        y += 40;
+    }
+    put(l, f.regular, settings_.report_kernel_log ? "And the last 1 MiB of the kernel log, as you switched on."
+                                                   : "Not the kernel log, unless you switch it on below.",
+         r.x + 86, y, 22, kInk2);
+    y += 56;
+    for (const auto & line : wrap(f.regular, "API keys and tokens are taken out. The logs can still name your models and the "
+                                             "addresses of the devices that used the server; read the file before you post it.",
+                                  22, r.w - 112)) {
+        put(l, f.regular, line, r.x + 56, y, 22, kInk3);
+        y += 32;
+    }
+    ui::GlyphStyle style = ui::GlyphStyle::dark();
+    style.label = kInk2;
+    ui::HintLayout layout;
+    layout.size = 32;
+    layout.text_size = 22;
+    layout.cy = r.y + r.h - 56;
+    const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Create the report" } };
+    ui::draw_hints(l, fonts_, style, h, 2, r.x + r.w - 56, true, layout);
 }
 
 // Slow work, often the app restarting for a model: the whole screen, the

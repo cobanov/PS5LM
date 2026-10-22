@@ -456,6 +456,16 @@ int main(int argc, char ** argv) {
         step(15, nav(D::down), false);
     }
     step(30, press(A::confirm), false);
+    shot("19-settings-report");
+    step(30, press(A::confirm), false);
+    shot("19-settings-report-dialog");
+    step(20, press(A::back), false);
+    dash.set_report_status(false, "Saved to /data/PS5LM/debug-report.txt and /mnt/usb0/PS5LM-debug-report.txt, 214 KB");
+    step(20, {}, false);
+    shot("19-settings-report-saved");
+    step(20, press(A::back), false);
+    step(15, nav(D::down), false);
+    step(30, press(A::confirm), false);
     shot("19-settings-diagnostics");
     step(20, press(A::back), false);
     for (int i = 0; i < 4; ++i) {

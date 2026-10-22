@@ -13,7 +13,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <pthread.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -21,10 +24,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +51,7 @@
 #include "display.hpp"
 #include "ggml-backend.h"
 #include "model_plan.hpp"
+#include "report.hpp"
 #include "settings.hpp"
 #include "stats.hpp"
 #include "suggested.hpp"
@@ -398,6 +404,213 @@ std::string base_name(const std::string & path) {
         n.resize(n.size() - 5);
     }
     return n;
+}
+
+// ---- the debug report ---------------------------------------------------------------
+
+std::string read_text(const std::string & path, size_t max_bytes = 4u << 20) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    const std::streamoff from = size > (std::streamoff) max_bytes ? size - (std::streamoff) max_bytes : 0;
+    in.seekg(from);
+    std::string text((size_t) (size - from), '\0');
+    in.read(text.data(), (std::streamsize) text.size());
+    text.resize((size_t) in.gcount());
+    return text;
+}
+
+// Whether something listens on a port of this console. The connection is
+// reset at once (SO_LINGER 0), so an ELF loader sees an error, never a payload.
+bool port_open(int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in to = {};
+#ifdef __FreeBSD__
+    to.sin_len = sizeof(to);
+#endif
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t) port);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool open = connect(fd, (sockaddr *) &to, sizeof(to)) == 0;
+    const linger reset = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    close(fd);
+    return open;
+}
+
+// The kernel log, from klogsrv (3232) or etaHEN's (9081): what it sends in a
+// few seconds, the last `max_bytes` of it.
+std::string kernel_log(size_t max_bytes) {
+    for (int port : { 3232, 9081 }) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            continue;
+        }
+        timeval tv = { 1, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        sockaddr_in to = {};
+#ifdef __FreeBSD__
+        to.sin_len = sizeof(to);
+#endif
+        to.sin_family = AF_INET;
+        to.sin_port = htons((uint16_t) port);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        std::string text;
+        if (connect(fd, (sockaddr *) &to, sizeof(to)) == 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+            char buf[65536];
+            while (std::chrono::steady_clock::now() < until) {
+                const ssize_t got = recv(fd, buf, sizeof(buf), 0);
+                if (got <= 0) {
+                    break;  // quiet for a second, or closed
+                }
+                text.append(buf, (size_t) got);
+                if (text.size() > 2 * max_bytes) {
+                    text = last_bytes(text, max_bytes);
+                }
+            }
+            close(fd);
+            return text.empty() ? "klog on port " + std::to_string(port) + " sent nothing in 4 s\n"
+                                : last_bytes(text, max_bytes);
+        }
+        close(fd);
+    }
+    return "No kernel log server answers (klogsrv on 3232, etaHEN on 9081).\n";
+}
+
+const char * state_name(ServerState s) {
+    switch (s) {
+        case ServerState::loading: return "loading";
+        case ServerState::ready: return "ready";
+        case ServerState::generating: return "generating";
+        case ServerState::failed: return "stopped with an error";
+        default: return "no model";
+    }
+}
+
+// What the report is made from, copied on the main thread.
+struct ReportJob {
+    Live                  live;
+    std::vector<Download> downloads;
+    Settings              settings;
+    std::string           storage;   // the data folder and how /data ended up
+    std::string           dir;       // where the report goes
+};
+
+std::mutex  g_report_mutex;
+std::string g_report_status;         // for the Settings row
+std::atomic<bool> g_report_busy{ false };
+
+void write_report(ReportJob job) {
+    const auto gib = [](double v) { char t[32]; std::snprintf(t, sizeof(t), "%.2f GiB", v); return std::string(t); };
+    ReportInput in;
+    const std::time_t now = std::time(nullptr);
+    std::tm tm = {};
+    char when[32] = "unknown";
+    if (localtime_r(&now, &tm)) {
+        std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+    }
+    in.created = when;
+    in.version = PS5LM_VERSION;
+    struct ps5_kernel_sw_version sw = {};
+    sw.size = sizeof(sw);
+    if (sceKernelGetSystemSwVersion(&sw) == 0) {
+        sw.text[sizeof(sw.text) - 1] = '\0';
+        char t[64];
+        std::snprintf(t, sizeof(t), "%s (0x%08x)", sw.text, sw.version);
+        in.firmware = t;
+        in.firmware.erase(0, in.firmware.find_first_not_of(' '));
+    }
+    in.storage = job.storage;
+    for (const auto & d : job.live.drives) {
+        in.drives.push_back(d.name + ": " + (d.total > 0 ? gib(d.free) + " free of " + gib(d.total) : "space unknown (ps5-exporter is not running)") +
+                            ", models in " + d.models);
+    }
+    size_t flex = 0, flex_free = 0;
+    sceKernelConfiguredFlexibleMemorySize(&flex);
+    sceKernelAvailableFlexibleMemorySize(&flex_free);
+    in.memory = { "Direct memory pool " + gib(job.live.pool_gib) + ", " + gib(job.live.free_gib) + " free, CPU heap " + gib(job.live.heap_gib),
+                  "Flexible memory " + std::to_string(flex >> 20) + " MiB, " + std::to_string(flex_free >> 20) + " MiB free" };
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(ggml_backend_dev_get(i), &free, &total);
+        in.memory.push_back(std::string(ggml_backend_dev_name(ggml_backend_dev_get(i))) + " (" +
+                            ggml_backend_dev_description(ggml_backend_dev_get(i)) + "): " + gib(free / 1073741824.0) + " free of " +
+                            gib(total / 1073741824.0));
+    }
+    const Live & L = job.live;
+    in.server = { std::string("State: ") + state_name(L.state), "Address: " + L.address };
+    if (!L.model_label.empty()) {
+        in.server.push_back("Model: " + L.model_file + (L.model_arch.empty() ? "" : " (" + L.model_arch + ")"));
+        in.server.push_back("Plan: " + L.plan);
+        in.server.push_back("Requests answered: " + std::to_string(L.served) + ", tokens generated: " + std::to_string(L.tokens));
+    }
+    in.args = L.args;
+    in.ports = report_ports();
+    for (const auto & [port, what] : in.ports) {
+        if (port_open(port)) {
+            in.open_ports.push_back(port);
+        }
+    }
+    for (const auto & m : L.models) {
+        in.models.push_back(m.file + " (" + m.drive + ", " + gib(m.size_gib) + (m.arch.empty() ? "" : ", " + m.arch) + "): " +
+                            m.plan + (m.current ? " [loaded]" : ""));
+    }
+    for (const auto & d : job.downloads) {
+        static const char * states[] = { "queued", "running", "retrying", "paused", "failed", "done" };
+        in.downloads.push_back(d.repo + "/" + d.file + " to " + d.dir + ": " + states[(int) d.state] + ", " +
+                               std::to_string(d.done >> 20) + " of " + std::to_string(d.bytes >> 20) + " MiB" +
+                               (d.note.empty() ? "" : ", " + d.note));
+    }
+    in.settings_json = read_text(kSettings);
+    for (const char * f : { kEnv, kArgs }) {
+        const std::string text = read_text(f, 64u << 10);
+        if (!text.empty()) {
+            in.files.emplace_back(std::string(f).substr(std::string(f).find_last_of('/') + 1), text);
+        }
+    }
+    in.logs = { { "app.log, the last 256 KiB", last_bytes(read_text(kLog), 256u << 10) },
+                { "llama.log, the last 256 KiB", last_bytes(read_text(kLlamaLog), 256u << 10) } };
+    in.kernel_log_asked = job.settings.report_kernel_log;
+    if (in.kernel_log_asked) {
+        in.kernel_log = kernel_log(1u << 20);
+    }
+
+    const std::string text = build_report(in);
+    const std::string path = job.dir + "/debug-report.txt";
+    bool ok = false;
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        ok = (bool) (out << text);
+    }
+    // A copy on a USB drive, for a console without FTP.
+    std::string usb;
+    for (const char * drive : { "/mnt/usb0", "/mnt/usb1" }) {
+        std::ofstream out(std::string(drive) + "/PS5LM-debug-report.txt", std::ios::binary | std::ios::trunc);
+        if (out && (out << text)) {
+            usb = drive;
+            break;
+        }
+    }
+    char status[256];
+    if (ok) {
+        std::snprintf(status, sizeof(status), "Saved to %s%s, %zu KB", path.c_str(),
+                      usb.empty() ? "" : (" and " + usb + "/PS5LM-debug-report.txt").c_str(), (text.size() + 1023) / 1024);
+    } else {
+        std::snprintf(status, sizeof(status), "Failed: cannot write %s%s", path.c_str(),
+                      usb.empty() ? "" : ("; saved to " + usb + "/PS5LM-debug-report.txt").c_str());
+    }
+    std::printf("ps5lm-app: debug report: %s\n", status);
+    notify((std::string("PS5LM: debug report ") + (ok ? "saved to " + path : status)).c_str());
+    std::lock_guard<std::mutex> lock(g_report_mutex);
+    g_report_status = status;
+    g_report_busy = false;
 }
 
 // ---- the server thread ------------------------------------------------------------
@@ -1132,6 +1345,26 @@ int main(int, char **) {
             stats.set_scratch(folder_bytes(kScratch) / 1073741824.0);
             notify("PS5LM: scratch folder cleared");
             std::printf("ps5lm-app: scratch folder cleared\n");
+        }
+        // A debug report, on a thread of its own: the ports and the kernel log
+        // take seconds. The first one was explained on the screen; remember it.
+        if (req.kind == Dashboard::Request::debug_report && !g_report_busy.exchange(true)) {
+            if (!models.settings.report_explained) {
+                models.settings.report_explained = true;
+                dash.set_settings(models.settings);
+                save_settings(kSettings, models.settings);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_report_mutex);
+                g_report_status = "Writing the report";
+            }
+            ReportJob job{ stats.snapshot(), market.snapshot().downloads, models.settings,
+                           std::string("/data/PS5LM, ") + data, "/data/PS5LM" };
+            std::thread(write_report, std::move(job)).detach();
+        }
+        if (n % 10 == 5) {
+            std::lock_guard<std::mutex> lock(g_report_mutex);
+            dash.set_report_status(g_report_busy, g_report_status);
         }
         // The same requests from the PC (scripts/ps5lm-app.sh load|unload).
         if (n % 60 == 30 && req.kind == Dashboard::Request::none) {

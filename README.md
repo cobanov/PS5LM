@@ -121,7 +121,13 @@ opened the console's storage to it:
   mode 777 (in FileZilla: File permissions, applied to subdirectories). Reported on etaHEN 2.6b,
   firmware 10.00.
 
-Using it from coding tools (opencode, Codex, Claude Code) is in [docs/CLI.md](docs/CLI.md).
+When something goes wrong, **Settings > Debug report** writes `/data/PS5LM/debug-report.txt` (and a copy
+to a USB drive, when one is in): the app's version, the system software, storage, models, settings, the
+end of both logs and which payload ports answer, with API keys and tokens taken out. Attach it to your
+[issue](https://github.com/cobanov/PS5LM/issues). The kernel log goes in only if you switch it on there.
+
+Using it from coding tools (opencode, Codex, Claude Code) is in
+[docs/CLI.md](docs/CLI.md).
 
 | Where | Button | Does |
 |---|---|---|
@@ -134,6 +140,7 @@ Using it from coding tools (opencode, Codex, Claude Code) is in [docs/CLI.md](do
 | Console | L2 / R2 | the last two minutes / the last hour |
 | Settings | D-pad, Cross | choose a category and a row; flip it, or pick from its list |
 | Settings, Diagnostics | Square, Triangle | app or server log; errors only |
+| Settings, Debug report | Cross | write one file to attach to an issue |
 
 ## Looking inside the model
 
