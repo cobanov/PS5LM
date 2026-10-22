@@ -36,6 +36,10 @@ v0.1.x are the upstream payload releases by cobanov.
   files** shows which one is in use and how full it is. Models saved there stay in the library
   once full storage opens.
 
+- The TV's request feed shows OpenAI Responses requests (`/v1/responses`, what codex sends): the
+  question from `input`, the answer from the response or its `output_text` deltas. They showed
+  blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
+
 ### Changed
 - **The fleet worker is part of the app.** There is no separate fleet build or
   `ps5lm-app-fleet` zip any more: every PS5LM can be a fleet worker, and stays the normal app

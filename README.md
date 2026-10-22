@@ -44,8 +44,8 @@ no PC while it runs, no cloud and no account.
 - **It runs on the GPU.** llama.cpp's Vulkan backend on the console's RDNA 2 GPU, with 11.4 GB of the
   shared memory for the model and its context. Every architecture and quantization llama.cpp knows
   comes along.
-- **It answers your network.** OpenAI's `/v1/chat/completions`, Anthropic's `/v1/messages` (Claude Code
-  works against it) and a chat page in any browser. Point a client at `http://<console>:8081` and use
+- **It answers your network.** OpenAI's `/v1/chat/completions` and `/v1/responses` (Codex works against
+  it), Anthropic's `/v1/messages` (Claude Code too) and a chat page in any browser. Point a client at `http://<console>:8081` and use
   any model name: the loaded one answers.
 - **It decides, too.** Load a decision model and the console answers TypeSafe's `/v1/systemone`:
   choice, score and yes-or-no questions about text and images, the API Ollaya serves on a PC.

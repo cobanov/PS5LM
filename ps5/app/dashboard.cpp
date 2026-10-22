@@ -1694,6 +1694,7 @@ void Dashboard::draw_api(gfx::DrawList & l) const {
     struct Ep { const char * method; const char * path; const char * about; bool decision; };
     const Ep all[] = {
         { "POST", "/v1/chat/completions", "OpenAI chat, streaming and tools", false },
+        { "POST", "/v1/responses", "OpenAI Responses, for Codex and the Agents SDK", false },
         { "POST", "/v1/messages", "Anthropic Messages, for Claude Code and its SDKs", false },
         { "POST", "/v1/completions", "Plain text completion", false },
         { "POST", "/v1/systemone", "TypeSafe decisions: choice, score and yes-or-no questions", true },
@@ -1706,7 +1707,7 @@ void Dashboard::draw_api(gfx::DrawList & l) const {
         put(l, f.mono, e.method, kLeft, y, 24, kInk3);
         put(l, f.mono, e.path, kLeft + 96, y, 24, here ? kInk : kInk3);
         put(l, f.regular, e.about, kLeft + 96, y + 34, 20, here ? kInk2 : kInk3);
-        y += 84;
+        y += 72;
     }
 
     // An example for what is loaded, in a quiet panel.
