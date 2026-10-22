@@ -1410,6 +1410,8 @@ int main(int, char **) {
                 std::thread(probe_fetch, u).detach();
             } else if (!take_request_file(data_path("bench-write")).empty()) {
                 std::thread(probe_write).detach();
+            } else if (!take_request_file(data_path("memory")).empty()) {
+                log_memory("asked");  // scripts/bench-ubatch.py: what a prompt left allocated
             } else if (std::string q = take_request_file(data_path("search")); !q.empty()) {
                 market.search(q == "-" ? std::string() : q);  // a query typed on the PC
             }

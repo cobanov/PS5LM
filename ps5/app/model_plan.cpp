@@ -221,6 +221,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     // block_count includes the MTP blocks some files carry (Qwen 3.8's
     // UD-Q2_K_XL has 65); they are not part of the main stack.
     m.n_layer         = (uint32_t) (num("block_count") - num("nextn_predict_layers"));
+    m.n_ff            = (uint32_t) num("feed_forward_length");
     const uint64_t n_head = num("attention.head_count");
     m.n_head_kv       = (uint32_t) num("attention.head_count_kv", n_head);
     const uint64_t n_embd = num("embedding_length");
@@ -313,7 +314,7 @@ const Preset * find_preset(const ModelInfo & m) {
     return nullptr;
 }
 
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force) {
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch) {
     Plan p;
     const Preset * preset = find_preset(m);
     if (preset && preset->max_ctx) {
@@ -336,8 +337,15 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // encoders (mtmd caps an image to the ubatch) need a whole prompt or image in
     // one ubatch, so they get 2048, the size #13 ran on the console.
     const bool wide = !m.decision.empty() || !m.mmproj.empty();
+    p.ubatch = wide ? 2048 : std::max<uint32_t>(ubatch, 1);
+    // Compute buffers grow with the ubatch, by about 38 bytes a token for each
+    // unit of feed-forward width: on Qwen 3.8 27B (17,408 wide), at 64k with a
+    // q4_0 cache, ggml-vulkan's device and host compute buffers took 41 MiB
+    // at -ub 64 and 321 MiB at 512, measured on a PC with the console's shader
+    // paths. The 0.75 GiB above holds the 64 the console was calibrated at.
+    const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
     // shortcut: 0.5 GiB more compute buffer for the 2048 ubatch is a guess; measure on the console.
-    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0);
+    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0) + ub_extra;
 
     // The longest context first, and at each length the best cache that fits.
     static const uint32_t ctxs[]  = { 131072, 65536, 32768, 16384, 8192, 4096 };
@@ -384,7 +392,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
                "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
-               "-b", wide ? "2048" : "256", "-ub", wide ? "2048" : "64", "-np", "1",
+               "-b", std::to_string(std::max<uint32_t>(256, p.ubatch)), "-ub", std::to_string(p.ubatch), "-np", "1",
                // One prompt checkpoint and no RAM cache: llama-server's defaults
                // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
                "-ctxcp", "1", "-cram", "0",

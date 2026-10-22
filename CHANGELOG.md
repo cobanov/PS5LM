@@ -16,6 +16,9 @@ v0.1.x are the upstream payload releases by cobanov.
   tokens and passwords are taken out of everything in it. The kernel log goes in only when
   **Include the kernel log** is on (off by default), at most its last 1 MiB, read from klogsrv
   or etaHEN's. Before the first report a dialog says what it holds.
+- `scripts/bench-ubatch.py`: prompt and generation speed and memory of one model at several prompt
+  batch sizes on the console (2,048-token prompt, each size a restart with the planner's arguments),
+  as a table; and `scripts/ps5lm-app.sh memory`, which logs the memory pools on request.
 - **The app's own storage** when the HEN keeps `/data` closed (#16, #23, #24). The app used to
   stop there: no log, no settings, every download failing. It now keeps its files in
   `/download0/PS5LM` instead, and on the first such start asks, over the screen: use the app's
@@ -29,6 +32,10 @@ v0.1.x are the upstream payload releases by cobanov.
   `ps5lm-app-fleet` zip any more: every PS5LM can be a fleet worker, and stays the normal app
   unless `/data/PS5LM/fleet-worker.txt` asks for one, as before. `PS5LM_FLEET` is gone from
   `scripts/build-app.sh`, and CI builds one title again.
+- The planner counts the compute buffers' growth with the prompt batch (`-ub`, about 38 bytes a
+  token per unit of feed-forward width, measured with ggml-vulkan on the console's shader paths),
+  and the batch for language models is one constant, `kPromptUbatch`, still 64 until
+  `scripts/bench-ubatch.py` has measured the others on a console. See docs/CONSOLE.md.
 - `downloadDataSize` in `sce_sys/param.json` is 16 GiB (16384 MiB, was 256 MiB): the size of
   the app's own storage. The app counts what it holds itself, as a title's `statvfs` is a stub.
   Whether the system sets the whole 16 GiB aside on internal storage at the first start, or
@@ -41,7 +48,9 @@ v0.1.x are the upstream payload releases by cobanov.
   template. With them the system gave the app 11.44 GiB of direct memory (the 12,280,922,112 bytes
   in #23's log); titles that leave them out, PS5_Vulkan's and PS5_RetroArch's, get 12 GiB, and
   neither the GL stack nor RADV uses what the blocks configure. The planner reads the memory free,
-  so every model's plan grows with it. Not yet measured on a console: `app.log` now records the pool
+  so every model's plan grows with it: with the dashboard up, v0.9.1 had 11.04 GiB free before a
+  model and gave Qwen 3.8 27B UD-Q2_K_XL a 32k context, not the 64k it was suggested with; with
+  the 12 GiB pool it plans 64k again. Not yet measured on a console: `app.log` now records the pool
   and the flexible memory at start (`memory at start`) and once the model serves (`memory when
   ready`).
 

@@ -129,6 +129,28 @@ What a title has to do differently from a payload, each found by a crash:
 - **No `HOME`**: llama.cpp throws looking for its cache directory without one.
 - C++ exceptions and RTTI are off by default for the PS5 target and must be turned on for llama.cpp.
 
+### Prompt batch
+
+llama-server's `-ub` is how many prompt tokens go through the GPU at once. The planner gives language
+models 64 (`kPromptUbatch` in `ps5/app/model_plan.hpp`), what the console has run since the first
+release; decision models and image encoders get 2048. A larger batch needs larger compute buffers.
+Measured on a PC (RTX 3090, ggml-vulkan with cooperative matrices, integer dot products and bf16 off,
+so it takes the console's shader paths): Qwen3.8-27B UD-Q2_K_XL at 64k with a q4_0 cache, flash
+attention on, a 2,048-token prompt and 128 tokens generated, the faster of two runs.
+
+| `-ub` | Device compute buffer | Host compute buffer | Prompt, PC | Generation, PC |
+|---|---|---|---|---|
+| 64 | 27 MiB | 13 MiB | 270 tok/s | 35.1 tok/s |
+| 128 | 54 MiB | 26 MiB | 307 tok/s | 34.9 tok/s |
+| 256 | 108 MiB | 52 MiB | 332 tok/s | 34.4 tok/s |
+| 512 | 216 MiB | 104 MiB | 355 tok/s | 34.2 tok/s |
+
+The speeds are the PC's, not the console's. The buffers carry over: on the console both come from the
+pool, about 38 bytes a token for each unit of feed-forward width, which the planner now counts. With
+the 11.04 GiB a v0.9.1 console had free before a model (#23), the 27B gets 32k at any of these sizes;
+with the 12 GiB pool it keeps 64k at 64 to 256 (11.4 of 11.6 GiB expected) and only just fits at 512.
+`scripts/bench-ubatch.py` measures speed and memory on the console, size by size.
+
 ### Switching models
 
 Unloading a model in the running app leaves part of its GPU memory held: with Qwen3.8-27B UD-IQ2_XXS at 64k, the pool went from 11.01 GiB free before loading to 5.77 GiB free after `llama_server` returned, and ggml's Vulkan figure fell the same way, so the next model could not get its KV cache. The app therefore changes model by restarting itself: it writes the choice to `/data/PS5LM/model.txt` (read once by the new process, then deleted, so a plain launch loads nothing and opens the library) and calls `sceSystemServiceLoadExec("/app0/eboot.bin", NULL)`. The system replaces the process (`Kill for LoadExec(0x11d) => 0`, then a new `EXEC`) without the crash reporter, and the new process starts from the whole pool (11.01 GiB free). Where the memory is held is still open.
