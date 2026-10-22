@@ -1,14 +1,14 @@
-# Fleet validation — 2026-10-21
+# Fleet validation — 2026-10-21–22
 
 ## Result
 
 A working host-side increment: **one model split over two real CPU RPC processes**,
 including the actual `python3 -m fleet serve` path. Experimental PS5 worker source
-is integrated, and the worker/RPC objects now cross-compile for the PS5 target.
-**No complete PS5 title link or console inference has been validated.**
+is integrated. **The complete RPC-enabled native PS5 title now cross-builds and
+passes static ELF/FSELF validation. No console inference has been tested.**
 At the time of the initial local validation below, no public listener or console
 deployment was performed. Hosted CI results are reported separately in the PR
-checks. This is not an installable, hardware-validated PS5 release.
+checks. This is not a hardware-validated PS5 release.
 
 ## Revisions
 
@@ -18,7 +18,7 @@ checks. This is not an installable, hardware-validated PS5 release.
 | llama.cpp | `04f7226a2c12c7f382c545a6db5a034266aa53cb` |
 | ps5-homebrew-ui | `bf44d80384d5b8f8f4f213cf98d748887211328d` |
 
-All existing llama.cpp patches 0001–0008 and new patches 0009–0010 were applied.
+All existing llama.cpp patches 0001–0008 and new patches 0009–0011 were applied.
 `fleet-build.json` records the exact patch hashes and local host binary checksum.
 The wire protocol remains upstream RPC 8.0.0; a handshake is not revision
 attestation. Both ends must be built from the same sources.
@@ -110,8 +110,8 @@ PR/fork Actions run for the hosted result on the current commit.
 
 The upstream tree had no checked-in CI workflow. Its documented route is a Linux
 cross-build using PS5_Vulkan, its pinned forks, RADV and homebrew SDK tooling.
-The workflow now separates host inference and native-object compilation. Neither
-job proves a complete title build. The evidence below records the initial local
+The workflow now separates host inference, native-object compilation and the
+full-title cross-build. The first two jobs alone do not prove a title build. The evidence below records the initial local
 full-title build attempt; the SDK/runtime gaps were subsequently resolved for
 the native-object gate below.
 
@@ -168,15 +168,49 @@ recorded hashes, including signed `libc.prx`:
 `e6ff45d16adf687855cc3b33b0c8a4132b6504360b221e0a34c7e99fb3ba0036`.
 No Sony implementation or console dump is downloaded. Local Clang 19 validation
 passed; the repeatable `scripts/test-fleet-native.sh` also passed from a fresh
-dependency cache using Clang 18.1.8, which is the CI compiler family.
+dependency cache using Clang 18.1.8, which is the object-only CI compiler family.
 The separate native job's status is in the fork Actions checks.
 
-A full linked title still needs the patched RADV archive, OpenGL/UI build and
-final ELF/FSELF inspection. This compile-only check must not be described as
-that full build, a console boot, Vulkan validation or PS5 emulation. [QEMU's
+The object-only check must not be described as a full build, console boot,
+Vulkan validation or PS5 emulation. The full-title follow-up below is separate. [QEMU's
 documented system/user modes](FLEET.md#ps5-target-compile-and-runtime-check-no-console)
 do not provide the PS5-specific AGC/loader/direct-memory environment, so a generic
 Linux/FreeBSD VM is not an equivalent hardware gate.
+
+## Full native title cross-build — 2026-10-22
+
+`scripts/test-fleet-title.sh` passed locally using public Debian 13/Clang 19
+packages and the documented upstream build scripts:
+
+- Mesa base `1ba9874f478657ccf6da72ce55f0260164cc0bd0` plus all three `patches/mesa`
+  commits yields deterministic source revision
+  `9e0a7c63bc6d4b6bcb60831163bb3fe9f46e91ea`.
+- All 389 host shader-tool tasks and 794 PS5 RADV tasks completed; the archive
+  includes the actual PS5 winsys, not a stub or host Vulkan replacement.
+- The real title CMake build exposed `strnlen` hidden by `_XOPEN_SOURCE=600`.
+  Patch 0011 replaces it with the equivalent bounded C++ scan. The faster native
+  check now uses those actual CMake feature-test macros, so it catches regressions.
+- The patched Vulkan/RPC/server libraries and native console dashboard compiled
+  and linked into a complete title folder. Optional downloaded browser assets
+  are omitted, not the console UI. No trained model or proprietary firmware
+  was downloaded.
+- `eboot.elf` and `eboot.bin` both pass upstream `tools/inspect.sh` with zero
+  static errors: FreeBSD OSABI 9, ABI 2, type `0xfe10`, aligned LOADs and required
+  process metadata. The native tool's FSELF check also reports valid integrity.
+
+The first local passing `eboot.bin` was 100,329,398 bytes, SHA-256
+`58a2bd3aec133b8d1bffe7a63f534fb3ff8271857ca3bf74b595055b263a0317`.
+That identifies this local artifact, not a promise of bit-identical builds across
+paths/compiler versions. Only the upstream clean-room runtime has a fixed
+reproduction checksum. Package binaries, SDKs and logs are not committed.
+
+Evidence: `build/fleet-native-full/title-validation.log` and
+`build/fleet-title/result.json`. Reproduce using the package list in the
+workflow's digest-pinned Debian `ps5-title` job and `scripts/test-fleet-title.sh`.
+The fresh hosted run, rather than this local cache-backed aggregate, establishes
+whether the entire CI bootstrap works from scratch; see fork Actions results.
+
+This is a real cross-build/package check, **not a console boot or hardware test**.
 
 ## Review fixes and remaining boundaries
 
@@ -190,7 +224,7 @@ Independent review plus real host execution found and corrected:
   (server-side NO_COMM rejection plus forced worker/controller setting).
 - PS5/BSD socket `sin_len` initialization and SIGPIPE portability concerns.
 
-Not verified: PS5 title linkage, imports, driver/device memory allocations,
+Not verified: actual console boot/runtime import resolution, driver/device memory allocations,
 Vulkan kernels, actual worker-screen rendering, real network drops on PS5,
 thermal behaviour, sustained inference, large GGUF models or multi-console
 performance. Fresh HTTPS GGUF acquisition is covered by offline downloader
@@ -203,7 +237,7 @@ guessed. See `FLEET.md` for the narrow supported layouts and extension path.
 
 ## Next hardware gate
 
-After a successful PS5 title build: use an isolated wired network, two consoles,
+With a title built as above: use an isolated wired network, two consoles,
 one controller and a small admitted dense model. Verify both RPC handshakes,
 actual per-device allocation logs, identical greedy output against a local
 reference, memory high-water marks, disconnect/close recovery and title restarts

@@ -105,7 +105,7 @@ GPU backends and RDMA, and builds the RPC tools plus the upstream multi-server
 regression. It does not fetch model weights or start a listener. Set `CMAKE`,
 `NINJA` or `CMAKE_BUILD_PARALLEL_LEVEL` for local tool locations/resources.
 
-### PS5 worker title — target objects compiled, full title still unvalidated
+### PS5 worker title — cross-built, not hardware validated
 
 Follow [BUILDING.md](BUILDING.md) to prepare PS5_Vulkan, its pinned PS5_Mesa and
 PS5_PayloadSDK forks, patched RADV, native packaging tool, `libc.prx` and the
@@ -123,8 +123,8 @@ is not the same memory environment as the native Vulkan title.
 The ordinary build currently points at a removed ps5-opengl release. The
 repository already documents the archive mirror and checksum check in
 [BUILDING.md](BUILDING.md); see [FLEET-VALIDATION.md](FLEET-VALIDATION.md) for the
-actual build attempt and missing prerequisite evidence. Host CI cannot recreate
-Sony's runtime, direct-memory pool, RADV driver or console networking.
+resolved download/prerequisite history and successful full cross-build evidence.
+Host CI cannot execute the console-specific GPU, direct-memory or network stack.
 
 ### PS5-target compile and runtime check (no console)
 
@@ -153,6 +153,33 @@ provide a PS5-specific loader/AGC environment. A Linux/FreeBSD VM can exercise
 its own socket/CPU code, not the console's GPU or direct-memory behavior. Passing a VM test would not validate multi-console inference. Use
 native-target compilation plus real-console hardware gates, rather than call a
 Linux guest a PS5 emulator.
+
+### Full native title cross-build and package check (no console)
+
+On Debian 13, install the public packages listed in the workflow's `ps5-title`
+job, then run:
+
+```sh
+git submodule update --init --depth 1
+PATH="/usr/lib/llvm-19/bin:$PATH" LLVM_CONFIG=/usr/bin/llvm-config-19 scripts/test-fleet-title.sh
+```
+
+This reuses the native bootstrap/check above, applies the three repository Mesa
+patches deterministically, builds the actual PS5 RADV archive, verifies the
+OpenGL SDK from the documented mirror, and runs `scripts/build-app.sh`. It
+packages the native console dashboard and RPC-enabled server, then runs the
+upstream structural ELF/FSELF validators and records hashes in
+`build/fleet-title/result.json`. No target binary is executed or deployed.
+
+The optional embedded **browser** UI is omitted: upstream otherwise falls back
+to a floating Hugging Face asset download. The native console dashboard is still
+built. Ordinary `scripts/build-app.sh` keeps its previous browser-UI default;
+`PS5LM_PREBUILT_UI=OFF` opts out. The test clears only that generated browser-asset
+cache under `build/app-ps5/llama/tools/ui/dist`, and rejects custom source-tree
+browser assets rather than modifying them. Build parallelism defaults to two.
+
+A successful link/structural check does not prove runtime import resolution,
+console boot, Vulkan correctness or real multi-console inference.
 
 ## Configure workers (only after building and validating the title)
 
@@ -245,15 +272,18 @@ loopback only and clean up their child processes.
 on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only
 repository permissions and per-ref cancellation. The host job has two parallel
 compiler processes and a 25-minute timeout; the separate native-object/runtime
-job has a 15-minute timeout.
+job has a 15-minute timeout. Full title CI uses a digest-pinned official Debian
+container on an ordinary Ubuntu runner, a two-CPU quota and a 45-minute timeout.
 Actions are pinned to commits; fixture dependencies are version-pinned.
-Both jobs check out the pinned llama.cpp submodule and install build tools.
+Jobs check out the pinned submodules they need and install public build tools.
 The host job downloads no trained model, PS5 SDK or driver. The native job does
 fetch the pinned public homebrew SDK and source dependencies, but no proprietary
-firmware, trained model, OpenGL SDK or RADV driver. No secrets,
+firmware, trained model, OpenGL SDK or RADV driver. The full-title job also
+builds patched RADV, downloads the checksum-verified OpenGL SDK and public
+ps5-exporter payload for packaging, and builds presentation assets. No secrets,
 `pull_request_target`, private runners or console are required.
 
 The inspected upstream revision had no checked-in workflow to reuse. This new
-workflow separates host inference from native-object compilation; the PS5 title
-still requires the full build and hardware gate. See the validation report for
-local evidence and the PR checks for the current hosted result.
+workflow separates host inference, native-object compilation and full title
+cross-building. All three remain separate from the hardware gate. See the
+validation report for local evidence and the PR checks for hosted results.

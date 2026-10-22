@@ -65,7 +65,8 @@ grep -qx '#define __FreeBSD__ 9' "$out/target-macros.txt"
 "${cxx[@]}" -Wall -Wextra -Werror -I "$llama/ggml/include" \
     -c "$root/ps5/app/fleet_worker.cpp" -o "$out/fleet_worker.o"
 for source in ggml-rpc transport; do
-    "${cxx[@]}" -DGGML_BACKEND_BUILD -DNDEBUG \
+    # Match the feature-test macros set by ggml CMake for the actual PS5 build.
+    "${cxx[@]}" -DGGML_BACKEND_BUILD -DNDEBUG -D_XOPEN_SOURCE=600 -D__BSD_VISIBLE \
         -I "$llama/ggml/include" -I "$llama/ggml/src" \
         -c "$llama/ggml/src/ggml-rpc/$source.cpp" -o "$out/$source.o"
 done

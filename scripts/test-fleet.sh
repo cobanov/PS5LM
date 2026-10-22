@@ -14,7 +14,7 @@ build/fleet-tests/worker-config
 build/fleet-tests/worker-runtime
 "$cxx" -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/fleet-tests/existing-model-plan
 build/fleet-tests/existing-model-plan
-bash -n scripts/build-fleet-host.sh scripts/build-app.sh scripts/test-fleet.sh scripts/test-fleet-native.sh
+bash -n scripts/build-fleet-host.sh scripts/build-app.sh scripts/test-fleet.sh scripts/test-fleet-native.sh scripts/test-fleet-title.sh
 if [[ ${1:-} == --rpc ]]; then
     # Fail fast on a clean runner, before the C++ build, if fixture imports
     # are missing. This uses the pinned submodule, never a separately installed gguf.
