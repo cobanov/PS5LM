@@ -52,6 +52,7 @@
 #include "display.hpp"
 #include "ggml-backend.h"
 #include "model_plan.hpp"
+#include "probes.hpp"
 #include "report.hpp"
 #include "settings.hpp"
 #include "storage.hpp"
@@ -150,72 +151,6 @@ std::vector<std::string> tail_lines(const std::string & path) {
         lines.emplace_back(text, start, end - start);
     }
     return lines;
-}
-
-// Probe: download a URL over HTTPS to fetch.out in the data folder, logging the
-// status, size and speed (scripts/ps5lm-app.sh fetch <url>).
-void probe_fetch(std::string url) {
-    FILE * out = std::fopen(data_path("fetch.out").c_str(), "wb");
-    const FetchResult r = https_get(url, "", [&](const char * p, size_t n) { return out && std::fwrite(p, 1, n, out) == n; });
-    if (out) {
-        std::fclose(out);
-    }
-    std::printf("ps5lm-app: fetch %s: status %d, length %lld, %llu bytes in %.1f s (%.2f MB/s)%s%s\n", url.c_str(),
-                r.status, (long long) r.length, (unsigned long long) r.bytes, r.seconds,
-                r.seconds > 0 ? r.bytes / 1e6 / r.seconds : 0.0, r.error.empty() ? "" : ", ", r.error.c_str());
-}
-
-// Probe: how fast the app can write, by method and place, fsync included
-// (scripts/ps5lm-app.sh bench-write). 128 MiB each.
-void probe_write() {
-    const size_t total = 128u << 20;
-    std::vector<char> buf(8u << 20, 'x');
-    for (const std::string & dir : { data_root(), std::string("/mnt/usb0") }) {
-        struct statvfs v = {};
-        if (statvfs(dir.c_str(), &v) != 0) {
-            continue;
-        }
-        const std::string path = std::string(dir) + "/write-bench.tmp";
-        struct Method {
-            const char * name;
-            size_t       chunk;
-            bool         stdio;
-            int          flags;
-        } methods[] = {
-            { "stdio 8M", 8u << 20, true, 0 },
-            { "write 1M", 1u << 20, false, 0 },
-            { "write 8M", 8u << 20, false, 0 },
-            { "write 8M direct", 8u << 20, false, O_DIRECT },
-        };
-        for (const auto & m : methods) {
-            const auto t0 = std::chrono::steady_clock::now();
-            bool ok = true;
-            if (m.stdio) {
-                FILE * f = std::fopen(path.c_str(), "wb");
-                for (size_t done = 0; f && ok && done < total; done += m.chunk) {
-                    ok = std::fwrite(buf.data(), 1, m.chunk, f) == m.chunk;
-                }
-                ok = f && ok && std::fflush(f) == 0 && fsync(fileno(f)) == 0;
-                if (f) {
-                    std::fclose(f);
-                }
-            } else {
-                const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | m.flags, 0666);
-                for (size_t done = 0; fd >= 0 && ok && done < total; done += m.chunk) {
-                    ok = write(fd, buf.data(), m.chunk) == (ssize_t) m.chunk;
-                }
-                ok = fd >= 0 && ok && fsync(fd) == 0;
-                if (fd >= 0) {
-                    close(fd);
-                }
-            }
-            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("ps5lm-app: write-bench %s %s: %s, %.1f MB/s\n", dir.c_str(), m.name, ok ? "ok" : strerror(errno),
-                        ok ? total / 1e6 / s : 0.0);
-            unlink(path.c_str());
-        }
-    }
-    std::printf("ps5lm-app: write-bench done\n");
 }
 
 // A system notification on the TV.
@@ -1412,6 +1347,10 @@ int main(int, char **) {
                 std::thread(probe_write).detach();
             } else if (!take_request_file(data_path("memory")).empty()) {
                 log_memory("asked");  // scripts/bench-ubatch.py: what a prompt left allocated
+            } else if (std::string f = take_request_file(data_path("bench-read")); !f.empty()) {
+                std::thread(probe_read, f).detach();
+            } else if (!take_request_file(data_path("bench-memory")).empty()) {
+                std::thread(probe_memory, !models.running.empty()).detach();
             } else if (std::string q = take_request_file(data_path("search")); !q.empty()) {
                 market.search(q == "-" ? std::string() : q);  // a query typed on the PC
             }

@@ -151,6 +151,22 @@ the 11.04 GiB a v0.9.1 console had free before a model (#23), the 27B gets 32k a
 with the 12 GiB pool it keeps 64k at 64 to 256 (11.4 of 11.6 GiB expected) and only just fits at 512.
 `scripts/bench-ubatch.py` measures speed and memory on the console, size by size.
 
+### Probes
+
+Measurements the app makes only when the PC asks, each on a thread of its own, with the results in
+`app.log` (`ps5/app/probes.cpp`). They are for decisions not taken yet, such as reading MoE experts
+from a drive instead of holding them in memory (Qwen3.8-Flash-Next on the roadmap).
+
+| `scripts/ps5lm-app.sh` | Logs |
+|---|---|
+| `bench-read <model file>` | Sequential reads (8 MiB, up to 2 GiB), then three seconds each of random reads of 64 KiB, 256 KiB, 1 MiB and 4 MiB with one and four threads, through the cache and with `O_DIRECT`: MB/s, reads a second, median and p99 latency |
+| `bench-memory` | The direct pool and what the system keeps of a nominal 12 GiB, its largest free block, the flexible pool; with no model loaded, also the largest block that allocates and maps, given back at once |
+| `bench-write` | Write speed by method to the data folder and a USB drive |
+| `memory` | One `memory asked` line: pools, CPU heap and ggml's devices |
+
+Point `bench-read` at a model of several GiB on the drive in question (internal storage, the M.2
+drive or USB), so the cache holds little of it; the `O_DIRECT` lines are the drive itself.
+
 ### Switching models
 
 Unloading a model in the running app leaves part of its GPU memory held: with Qwen3.8-27B UD-IQ2_XXS at 64k, the pool went from 11.01 GiB free before loading to 5.77 GiB free after `llama_server` returned, and ggml's Vulkan figure fell the same way, so the next model could not get its KV cache. The app therefore changes model by restarting itself: it writes the choice to `/data/PS5LM/model.txt` (read once by the new process, then deleted, so a plain launch loads nothing and opens the library) and calls `sceSystemServiceLoadExec("/app0/eboot.bin", NULL)`. The system replaces the process (`Kill for LoadExec(0x11d) => 0`, then a new `EXEC`) without the crash reporter, and the new process starts from the whole pool (11.01 GiB free). Where the memory is held is still open.

@@ -36,6 +36,11 @@ v0.1.x are the upstream payload releases by cobanov.
   files** shows which one is in use and how full it is. Models saved there stay in the library
   once full storage opens.
 
+- Two probes for later decisions, out of the app's way (`ps5/app/probes.cpp`, run from the PC):
+  `scripts/ps5lm-app.sh bench-read <model file>` measures a drive's sequential and random read
+  speed at the sizes MoE experts come in (64 KiB to 4 MiB, one and four threads, cached and
+  `O_DIRECT`), and `bench-memory` logs what the system keeps of the title's memory and the
+  largest block that really allocates. The download and write probes moved there from `main.cpp`.
 - The TV's request feed shows OpenAI Responses requests (`/v1/responses`, what codex sends): the
   question from `input`, the answer from the response or its `output_text` deltas. They showed
   blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
