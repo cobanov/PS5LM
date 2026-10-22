@@ -71,7 +71,7 @@ cmake -S "$llama" -B "$out/llama" -G Ninja \
     -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$cxxflags" \
     -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF \
     -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF \
-    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON \
+    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF \
     -DVulkan_INCLUDE_DIR="$headers/include" -DVulkan_LIBRARY="$archive" \
     -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DSPIRV-Headers_DIR="$headers/cmake" \
     -DMATH_LIBRARY=SceLibcInternal \
@@ -88,6 +88,8 @@ cxx -std=c++20 -fexceptions -fcxx-exceptions -frtti -I "$headers/include" -I "$l
     -I "$glsdk/include" -DGL_GLEXT_PROTOTYPES=1 \
     -c "$root/ps5/app/main.cpp" -o "$obj/main.o"
 cxx -fexceptions -fcxx-exceptions -c "$root/ps5/app/model_plan.cpp" -o "$obj/model_plan.o"
+cxx -fexceptions -fcxx-exceptions -I "$llama/ggml/include" \
+    -c "$root/ps5/app/fleet_worker.cpp" -o "$obj/fleet_worker.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/settings.cpp" -o "$obj/settings.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/fetch.cpp" -o "$obj/fetch.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/market.cpp" -o "$obj/market.o"
@@ -182,7 +184,7 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \

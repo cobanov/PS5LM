@@ -1,0 +1,17 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 45fa8a4..a832f6f 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2189,6 +2189,12 @@ void rpc_server::sync_all_backends() {
+ // so it gets the same transport upgrades (e.g. RDMA).
+ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
+     response.ok = 0;
++    // PS5LM layer fleets do not use pairwise allreduce. Enforce this on the
++    // server as well as the client: COMM_INIT otherwise opens an extra wildcard
++    // listener or connects to a peer chosen by the RPC caller.
++    if (std::getenv("GGML_RPC_NO_COMM") != nullptr) {
++        return true;
++    }
+     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
+         return true;
+     }
