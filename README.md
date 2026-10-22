@@ -67,6 +67,17 @@ no PC while it runs, no cloud and no account.
 | Qwen 3.8 27B, UD-Q2_K_XL | 9.2 GB | about 20 tokens a second, 64k context |
 | d1 Omni 600M, a decision model | 1.1 GB | 3 questions in 0.3 s; a 720p image and 7 questions in 2.9 s |
 
+### Ternary Bonsai 2
+
+PrismML's Bonsai 2 27B is Qwen 3.8 27B in ternary weights, 7.1 GB as `Q2_0`, which leaves a 64k context
+plenty of room. Its `Q2_0` file is in **Models > Suggested**, and the app's llama.cpp applies the
+model's Hadamard rotation itself. PrismML's main repository ships `PQ2_0` instead, a type only their
+fork reads; convert it on a PC, losslessly (the result is byte for byte PrismML's own `Q2_0`):
+
+```sh
+python3 scripts/bonsai-pq2-to-q2.py Ternary-Bonsai-2-27B-PQ2_0.gguf   # writes Ternary-Bonsai-2-27B-Q2_0.gguf
+```
+
 ## Decision models, powered by Ollaya
 
 [Ollaya](https://github.com/ollaya-dev/ollaya) runs open decision models on a PC the way Ollama runs

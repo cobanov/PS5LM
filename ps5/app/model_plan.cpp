@@ -212,6 +212,16 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     if (!strs["general.name"].empty()) {
         m.name = strs["general.name"];
     }
+    // PrismML's own packings of Bonsai models (their fork's types 142 and 143,
+    // file types 141 and 143), which this llama.cpp refuses at load.
+    if (ints.count("prism.hadamard.version") && ints.count("general.file_type")) {
+        const uint64_t ftype = ints["general.file_type"];
+        if (ftype == 141 || ftype == 143) {
+            m.error = ftype == 141 ? "PrismML's PQ2_0: convert it to Q2_0 on a PC with scripts/bonsai-pq2-to-q2.py"
+                                   : "PrismML's PTQ1_0, which llama.cpp cannot load; get its Q2_0 file";
+            return m;
+        }
+    }
     const std::string a = m.arch + ".";
     m.decision = strs[a + "decision.type"];
     auto num = [&](const std::string & k, uint64_t def = 0) {
@@ -277,6 +287,9 @@ double kv_bytes_per_token(const ModelInfo & m, const std::string & type) {
 // out (context, cache type) are not here.
 const std::vector<Preset> & presets() {
     static const std::vector<Preset> table = {
+        // PrismML's model card (thinking mode); min_p 0.05 is not in the file.
+        { "bonsai", "Bonsai 2", "Qwen 3.8 27B in ternary weights; Q2_0 is 7.1 GiB and keeps 64k with room to spare",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05" }, 65536 },
         { "qwen3.8", "Qwen 3.8", "27B hybrid Gated DeltaNet; UD-Q2_K_XL holds 64k context on the GPU",
           { "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0" } },
         { "qwen3.6", "Qwen 3.6", "MoE 35B-A3B or dense 27B; the MoE decodes fastest",

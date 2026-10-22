@@ -16,6 +16,15 @@ v0.1.x are the upstream payload releases by cobanov.
   tokens and passwords are taken out of everything in it. The kernel log goes in only when
   **Include the kernel log** is on (off by default), at most its last 1 MiB, read from klogsrv
   or etaHEN's. Before the first report a dialog says what it holds.
+- **Ternary Bonsai 2**: a **Bonsai 2** preset (PrismML's sampling, 64k context at most) and
+  **Bonsai 2 27B** in Suggested, upstream's `Q2_0` (7.1 GiB). The app's llama.cpp already reads the
+  `prism.hadamard.*` rotation those files carry: checked on a PC with the 2B and the 27B, on the CPU
+  and on ggml-vulkan with the console's shader paths. Not yet run on the console.
+- `scripts/bonsai-pq2-to-q2.py`: PrismML's `PQ2_0` files, which upstream llama.cpp (b11827 too)
+  refuses, to `Q2_0`, with no loss: each 128-weight block becomes two 64-weight blocks with the same
+  scale and codes. Python only, about 80 s for the 27B; the 2B and the 27B come out byte for byte
+  as the `Q2_0` files PrismML publishes. The library says what to do with a `PQ2_0` file (and that a
+  `PTQ1_0` one does not load) instead of failing at load.
 - `scripts/bench-ubatch.py`: prompt and generation speed and memory of one model at several prompt
   batch sizes on the console (2,048-token prompt, each size a restart with the planner's arguments),
   as a table; and `scripts/ps5lm-app.sh memory`, which logs the memory pools on request.

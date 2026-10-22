@@ -23,6 +23,7 @@ The console has 16 GB shared by everything. How much one PS5LM process can hold 
 | **Qwen 3.8 27B** | `qwen3.8` | UD-IQ2_XXS / UD-Q2_K_XL | 6.77 / 9.15 GiB | qwen35 | the headline target |
 | Muse Glimmer 30B | `muse-glimmer` | IQ2_XXS | 8.31 GiB | muse-glimmer | |
 | Qwen 3.6 27B | `qwen3.6:27b` | UD-IQ2_XXS | 8.74 GiB | qwen35 | Ollama's most pulled model |
+| Bonsai 2 27B | | Q2_0 | 7.10 GiB | qwen35 | Qwen 3.8 27B in ternary weights (PrismML); 64k with a q8_0 cache in 10.3 GiB. PrismML's PQ2_0 converts losslessly with `scripts/bonsai-pq2-to-q2.py`; PTQ1_0 does not load |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b` | UD-IQ2_XXS | 10.02 GiB | qwen35moe | MoE, 3B active |
 | gpt-oss 20B | `gpt-oss:20b` | MXFP4 | 10.7 GiB | gpt-oss | MoE, 3.6B active; every quant is about this size |
 
