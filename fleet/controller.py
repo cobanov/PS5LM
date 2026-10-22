@@ -19,7 +19,7 @@ import sys
 from .models import ModelError, fetch_model, inspect_file
 from .planner import FleetError, MIB, inventory, plan
 
-LLAMA_REVISION = '04f7226a2c12c7f382c545a6db5a034266aa53cb'
+LLAMA_REVISION = '970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc'
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / 'build/fleet-host/bin/llama-server'
 
