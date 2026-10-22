@@ -9,6 +9,8 @@
 # tools/build-radv.sh release and `make app` (for the host tool and libc.prx).
 #
 #   scripts/build-app.sh            configure, build and package
+#   PS5LM_PREBUILT_UI=OFF ...       omit the optional downloaded browser UI
+# CMAKE_BUILD_PARALLEL_LEVEL also bounds the native dashboard compilers.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,7 +78,9 @@ cmake -S "$llama" -B "$out/llama" -G Ninja \
     -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DSPIRV-Headers_DIR="$headers/cmake" \
     -DMATH_LIBRARY=SceLibcInternal \
     -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON > "$out.configure.log" 2>&1 ||
+    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
+    -ULLAMA_BUILD_WEBUI -ULLAMA_USE_PREBUILT_WEBUI \
+    -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI="${PS5LM_PREBUILT_UI:-ON}" > "$out.configure.log" 2>&1 ||
     { tail -30 "$out.configure.log" >&2; exit 1; }
 cmake --build "$out/llama" --target llama-server-impl
 
@@ -134,6 +138,9 @@ mkdir -p "$obj/kit"
 mapfile -t kit_sources < <(find "$kit/src/gfx" "$kit/src/ui" "$kit/src/core" "$kit/src/audio" "$kit/src/third_party" \
     "$kit/src/platform/ps5" -type f \( -name '*.cpp' -o -name '*.c' \) ! -name display_egl.cpp | sort)
 kit_objects=()
+kit_pending=()
+jobs_limit=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}
+[[ $jobs_limit =~ ^[1-9][0-9]*$ ]] || { echo "build-app: invalid job limit" >&2; exit 2; }
 for src in "${kit_sources[@]}"; do
     o="$obj/kit/$(echo "${src#"$kit/src/"}" | tr '/' '_').o"
     kit_objects+=("$o")
@@ -143,9 +150,14 @@ for src in "${kit_sources[@]}"; do
     else
         cxx "${kitflags[@]}" -w -c "$src" -o "$o" &
     fi
-    (( $(jobs -r | wc -l) >= $(nproc) )) && wait -n
+    # Retain each PID: bare wait can hide an already-finished compiler failure.
+    kit_pending+=("$!")
+    if (( ${#kit_pending[@]} >= jobs_limit )); then
+        wait "${kit_pending[0]}"
+        kit_pending=("${kit_pending[@]:1}")
+    fi
 done
-wait
+for pid in "${kit_pending[@]}"; do wait "$pid"; done
 rm -f "$obj/libps5lm_kit.a"
 "$sdk/bin/llvm-ar" rcs "$obj/libps5lm_kit.a" "${kit_objects[@]}"
 for src in display dashboard stats; do

@@ -27,6 +27,10 @@ works too.
 
 ## Build
 
+For the automated, pinned-source Debian build and its validation limits, see
+[CI validation](CI.md). `scripts/test-native-build.sh` builds and statically checks
+the existing app without a console, model download, or proprietary firmware.
+
 On Arch, the host packages (or run them in an `archlinux` container with the repository mounted):
 
 ```sh
