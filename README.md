@@ -136,6 +136,15 @@ ggml-vulkan on [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)'s RADV, bui
 [Research](docs/RESEARCH.md) · [Models that fit](docs/MODELS.md) · [Roadmap](docs/ROADMAP.md) ·
 [Changelog](CHANGELOG.md) · [The original payload](docs/PAYLOAD.md)
 
+## Experimental multi-console fleet
+
+A source-only [fleet prototype](docs/FLEET.md) splits one dense `llama`/`qwen2`
+GGUF across RPC workers, controlled by one host—not independent model replicas.
+Real two-worker CPU inference is tested; the PS5 worker title is **not yet
+cross-built or hardware-validated**, and Qwen 3.8's `qwen35` layout is not admitted
+by this first estimator. RPC is unauthenticated and requires an explicitly opted-in,
+isolated trusted network. See [validation and limits](docs/FLEET-VALIDATION.md).
+
 ## Thanks
 
 - [abhi245y](https://github.com/abhi245y), who built the native GPU app this one grew from (PS5LM Plus).

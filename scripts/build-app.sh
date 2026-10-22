@@ -60,6 +60,7 @@ for p in "$root"/patches/*.patch; do
     git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
 done
 
+# CI may omit the optional browser UI download; the console dashboard is unaffected.
 flags="-DSUBPROCESS_HAVE_CWD=0 -I$headers/include"
 # llama.cpp throws, catches and uses dynamic_cast; the PS5 target turns
 # exceptions and RTTI off by default.
@@ -71,12 +72,14 @@ cmake -S "$llama" -B "$out/llama" -G Ninja \
     -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$cxxflags" \
     -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF \
     -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF \
-    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON \
+    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF \
     -DVulkan_INCLUDE_DIR="$headers/include" -DVulkan_LIBRARY="$archive" \
     -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DSPIRV-Headers_DIR="$headers/cmake" \
     -DMATH_LIBRARY=SceLibcInternal \
     -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON > "$out.configure.log" 2>&1 ||
+    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
+    -ULLAMA_BUILD_WEBUI -ULLAMA_USE_PREBUILT_WEBUI \
+    -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI="${PS5LM_PREBUILT_UI:-ON}" > "$out.configure.log" 2>&1 ||
     { tail -30 "$out.configure.log" >&2; exit 1; }
 cmake --build "$out/llama" --target llama-server-impl
 
@@ -88,6 +91,8 @@ cxx -std=c++20 -fexceptions -fcxx-exceptions -frtti -I "$headers/include" -I "$l
     -I "$glsdk/include" -DGL_GLEXT_PROTOTYPES=1 \
     -c "$root/ps5/app/main.cpp" -o "$obj/main.o"
 cxx -fexceptions -fcxx-exceptions -c "$root/ps5/app/model_plan.cpp" -o "$obj/model_plan.o"
+cxx -fexceptions -fcxx-exceptions -I "$llama/ggml/include" \
+    -c "$root/ps5/app/fleet_worker.cpp" -o "$obj/fleet_worker.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/settings.cpp" -o "$obj/settings.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/fetch.cpp" -o "$obj/fetch.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/market.cpp" -o "$obj/market.o"
@@ -134,6 +139,9 @@ mkdir -p "$obj/kit"
 mapfile -t kit_sources < <(find "$kit/src/gfx" "$kit/src/ui" "$kit/src/core" "$kit/src/audio" "$kit/src/third_party" \
     "$kit/src/platform/ps5" -type f \( -name '*.cpp' -o -name '*.c' \) ! -name display_egl.cpp | sort)
 kit_objects=()
+kit_pending=()
+jobs_limit=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}
+[[ $jobs_limit =~ ^[1-9][0-9]*$ ]] || { echo "build-app: invalid job limit" >&2; exit 2; }
 for src in "${kit_sources[@]}"; do
     o="$obj/kit/$(echo "${src#"$kit/src/"}" | tr '/' '_').o"
     kit_objects+=("$o")
@@ -143,9 +151,14 @@ for src in "${kit_sources[@]}"; do
     else
         cxx "${kitflags[@]}" -w -c "$src" -o "$o" &
     fi
-    (( $(jobs -r | wc -l) >= $(nproc) )) && wait -n
+    # Retain each PID: bare wait can hide an already-finished compiler failure.
+    kit_pending+=("$!")
+    if (( ${#kit_pending[@]} >= jobs_limit )); then
+        wait "${kit_pending[0]}"
+        kit_pending=("${kit_pending[@]:1}")
+    fi
 done
-wait
+for pid in "${kit_pending[@]}"; do wait "$pid"; done
 rm -f "$obj/libps5lm_kit.a"
 "$sdk/bin/llvm-ar" rcs "$obj/libps5lm_kit.a" "${kit_objects[@]}"
 for src in display dashboard stats; do
@@ -182,7 +195,7 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \

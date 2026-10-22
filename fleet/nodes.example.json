@@ -1,0 +1,8 @@
+{
+  "host_memory_mib": 8192,
+  "host_reserve_mib": 2048,
+  "nodes": [
+    {"id": "ps5-a", "endpoint": "192.168.50.21:50052", "memory_mib": 10240, "reserve_mib": 2048},
+    {"id": "ps5-b", "endpoint": "192.168.50.22:50052", "memory_mib": 10240, "reserve_mib": 2048}
+  ]
+}

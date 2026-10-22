@@ -1,0 +1,58 @@
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 0d53438..31b8450 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -545,8 +545,15 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+     size_t bytes_sent = 0;
+     while (bytes_sent < size) {
+         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
+-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+-        if (n < 0) {
++        // PS5LM: a disconnected controller must not kill the title with
++        // SIGPIPE. BSDs without MSG_NOSIGNAL use SO_NOSIGPIPE below.
++#ifdef MSG_NOSIGNAL
++        const int flags = MSG_NOSIGNAL;
++#else
++        const int flags = 0;
++#endif
++        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, flags);
++        if (n <= 0) {
+             LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
+                            bytes_sent, size_to_send);
+             return false;
+@@ -698,5 +705,10 @@ static bool is_valid_fd(sockfd_t sockfd) {
+ static bool set_no_delay(sockfd_t sockfd) {
+     int flag = 1;
++#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
++    if (setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) != 0) {
++        return false;
++    }
++#endif
+     // set TCP_NODELAY to disable Nagle's algorithm
+     int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+     return ret == 0;
+@@ -734,7 +746,11 @@ socket_ptr socket_t::create_server(const char * host, int port) {
+         LOG_ERROR("Invalid host address: %s\n", host);
+         return nullptr;
+     }
+-    struct sockaddr_in serv_addr;
++    struct sockaddr_in serv_addr = {};
++#if defined(__FreeBSD__) || defined(__APPLE__)
++    // The PS5's BSD socket ABI includes this byte before sin_family.
++    serv_addr.sin_len = sizeof(serv_addr);
++#endif
+     serv_addr.sin_family = AF_INET;
+     serv_addr.sin_addr.s_addr = inet_addr(host);
+     serv_addr.sin_port = htons(port);
+@@ -758,7 +774,10 @@ socket_ptr socket_t::connect(const char * host, int port) {
+         LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
+-    struct sockaddr_in addr;
++    struct sockaddr_in addr = {};
++#if defined(__FreeBSD__) || defined(__APPLE__)
++    addr.sin_len = sizeof(addr);
++#endif
+     addr.sin_family = AF_INET;
+     addr.sin_port = htons(port);
+     struct hostent * server = gethostbyname(host);

@@ -41,6 +41,7 @@
 
 #include "dashboard.hpp"
 #include "fetch.hpp"
+#include "fleet_worker.hpp"
 #include "market.hpp"
 #include "display.hpp"
 #include "ggml-backend.h"
@@ -107,6 +108,7 @@ constexpr const char * kEnv         = "/data/PS5LM/env.txt";  // driver and ggml
 constexpr const char * kTextOnly    = "/data/PS5LM/text-only";  // the last load's projector failed: load without it once
 constexpr const char * kQuit        = "/data/PS5LM/quit";
 constexpr const char * kSettings    = "/data/PS5LM/settings.json";
+constexpr const char * kFleetWorker = "/data/PS5LM/fleet-worker.txt";
 constexpr const char * kScratch     = "/data/PS5LM/scratch";
 // The file tools only: a title cannot start processes (no shell command).
 constexpr const char * kTools       = "read_file,write_file,edit_file,file_glob_search,grep_search,get_info";
@@ -694,6 +696,70 @@ int main(int, char **) {
         display.swap();
     }
     sceSystemServiceHideSplashScreen();
+
+    // Fleet is a mutually exclusive startup mode, not another local model.
+    // In particular, do not start StatsCollector (its HTTP probes), model
+    // auto-load, downloads, or controller/file commands that could restart or
+    // allocate memory behind the remote controller's back. Malformed config
+    // stays here, with no listener and no fallback into normal model mode.
+    const FleetWorkerConfig fleet = read_fleet_worker_config(kFleetWorker);
+    if (fleet.state != FleetWorkerConfig::disabled) {
+        std::atomic<bool> stopped{ false };
+        std::string worker_error = fleet.error;
+        std::function<void()> worker = [&] {
+            worker_error = run_fleet_worker(fleet);
+            std::fprintf(stderr, "ps5lm-fleet: %s\n", worker_error.c_str());
+            stopped.store(true, std::memory_order_release);
+        };
+        if (fleet.state == FleetWorkerConfig::enabled) {
+            pthread_attr_t attr;
+            int rc = pthread_attr_init(&attr);
+            if (rc == 0) {
+                rc = pthread_attr_setstacksize(&attr, 16u << 20);
+                pthread_t thread{};
+                if (rc == 0) {
+                    rc = pthread_create(&thread, &attr, [](void * p) -> void * {
+                        (*static_cast<std::function<void()> *>(p))();
+                        return nullptr;
+                    }, &worker);
+                    if (rc == 0) {
+                        pthread_detach(thread);  // Lifetime is the title, not a model load.
+                    }
+                }
+                pthread_attr_destroy(&attr);
+            }
+            if (rc != 0) {
+                worker_error = std::string("Cannot start RPC thread: ") + std::strerror(rc);
+                stopped = true;
+            }
+            notify("PS5LM fleet: experimental unauthenticated RPC. Trusted isolated LAN only.");
+        } else {
+            std::fprintf(stderr, "ps5lm-fleet: %s\n", worker_error.c_str());
+            stopped = true;
+        }
+        hui::ui::Feedback quiet;
+        // Upstream's blocking API has no readiness callback: do not label this
+        // as Ready. The host's successful RPC handshake verifies availability.
+        for (uint64_t n = 0;; ++n) {
+            const bool failed = stopped.load(std::memory_order_acquire);
+            dash.set_busy(failed ? "Fleet worker stopped" : "Experimental fleet RPC worker",
+                failed ? worker_error : fleet.endpoint + " - no authentication; isolated LAN only");
+            quiet.clear();
+            dash.update(hui::InputFrame{}, 1.0f / 60.0f, quiet);
+            if (ui_ok) {
+                render();
+                if (n % 60 == 45 && !take_request_file("/data/PS5LM/screenshot").empty()) {
+                    save_screen("/data/PS5LM/screen.bmp", display.width(), display.height());
+                }
+                display.swap();
+            } else {
+                sceKernelUsleep(16667);
+            }
+            if (n % 60 == 0) {
+                quit_if_asked();  // Existing safe title-close path; not cancellation in a GPU call.
+            }
+        }
+    }
 
     StatsCollector stats;
     stats.start(kPort);
