@@ -95,7 +95,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Pinned llama.cpp and UI sources
-        run: git submodule update --init --depth 1
+        run: |
+          # Container root differs from the runner owner. Trust only this checkout,
+          # in the disposable job container; never use safe.directory='*'.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1
       - name: Build patched RADV and title, inspect ELF and FSELF
         run: scripts/test-fleet-title.sh
       - name: State the full-build validation boundary
