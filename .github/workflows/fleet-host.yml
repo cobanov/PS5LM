@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++
-          python -m pip install --disable-pip-version-check numpy==2.2.6
+          python -m pip install --disable-pip-version-check -r tests/requirements-fleet.txt
       - name: Safety tests, RPC regressions and deterministic fleet inference
         run: scripts/test-fleet.sh --rpc
       - name: State the validation boundary

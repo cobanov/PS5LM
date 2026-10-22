@@ -16,6 +16,10 @@ build/fleet-tests/worker-runtime
 build/fleet-tests/existing-model-plan
 bash -n scripts/build-fleet-host.sh scripts/build-app.sh scripts/test-fleet.sh
 if [[ ${1:-} == --rpc ]]; then
+    # Fail fast on a clean runner, before the C++ build, if fixture imports
+    # are missing. This uses the pinned submodule, never a separately installed gguf.
+    PYTHONPATH="$root/third_party/llama.cpp/gguf-py${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -c 'import numpy, yaml, gguf'
     scripts/build-fleet-host.sh
     out="${PS5LM_FLEET_BUILD:-$root/build/fleet-host}"
     "${CMAKE:-cmake}" -E env CTEST_OUTPUT_ON_FAILURE=1 \

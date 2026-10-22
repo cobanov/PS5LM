@@ -202,7 +202,7 @@ backend behaviour and memory must be checked on real consoles.
 
 ```sh
 scripts/test-fleet.sh              # offline Python, C++ config/runtime, existing planner
-python3 -m pip install numpy==2.2.6 # test fixture only, preferably in a venv
+python3 -m pip install -r tests/requirements-fleet.txt # fixture only; use a venv
 scripts/test-fleet.sh --rpc        # build + real localhost RPC regression/inference
 ```
 
@@ -216,7 +216,7 @@ loopback only and clean up their child processes.
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
 on `main` or `fleet/**`, using an ordinary Ubuntu hosted runner, two parallel compiler processes,
 a 25-minute timeout, read-only repository permissions and per-ref cancellation.
-Actions are pinned to commits; the NumPy fixture dependency is version-pinned.
+Actions are pinned to commits; fixture dependencies are version-pinned.
 The workflow checks out the pinned llama.cpp submodule and installs build
 prerequisites, but downloads no trained model, PS5 SDK or driver. No secrets,
 `pull_request_target`, private runners or console are required.

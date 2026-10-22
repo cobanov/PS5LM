@@ -34,7 +34,7 @@ scripts/test-fleet.sh --rpc
 
 Public CMake 4.4.4 and Ninja 1.13.2 wheels were installed under `.deps/host-tools`
 because those host tools were absent. On a normal configured system the command
-is simply `scripts/test-fleet.sh --rpc`. NumPy supplies fixture generation only.
+is simply `scripts/test-fleet.sh --rpc`. NumPy and PyYAML supply fixture generation only.
 
 | Check | Outcome / scope |
 |---|---|
@@ -92,8 +92,18 @@ GitHub Actions workflow: the same 52 Python, 43 configuration and 19 runtime
 checks passed, as did both RPC regressions and the actual fleet CLI inference
 comparison (maximum log-probability error 0.0). The workflow passed actionlint
 v1.7.7 and YAML permission/event checks. Actions use verified commit pins;
-the fixture dependency is NumPy 2.2.6. This is local pre-publication evidence;
+the fixture dependencies are pinned in `tests/requirements-fleet.txt`. This is local pre-publication evidence;
 refer to the PR checks for the hosted run.
+
+### Hosted dependency correction — 2026-10-22
+
+The first fork run built all C++ targets and passed the safety/RPC regression
+checks, but fixture generation exposed a missing transitive `gguf` import:
+PyYAML. The workflow now installs a pinned fixture requirements file, and the
+test script checks imports before compiling. The complete suite was re-run
+successfully in a fresh Python virtual environment containing only those
+requirements; both inference comparisons again had maximum error 0.0. See the
+PR/fork Actions run for the hosted result on the current commit.
 
 ## PS5 build: attempted, then blocked before compilation
 
