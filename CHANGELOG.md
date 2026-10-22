@@ -46,6 +46,12 @@ v0.1.x are the upstream payload releases by cobanov.
   blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
 
 ### Changed
+- llama.cpp moves to b11827 (970b51ce7, 2026-10-22), 219 commits on, among them ggml-vulkan's
+  fixes for GPU-visible host memory (#30468) and concurrent first device init (#29766), its strided
+  f16 KV copy on AMD (#27703), and upstream's own `tojson` floats as Python writes them (#30362,
+  #30483), so `patches/0006-jinja-tojson-floats-as-python.patch` is gone; `patches/0005` is
+  re-based on the new `server-http.cpp`. It builds and links for the console as before. Not yet
+  run on a console.
 - The planner counts the compute buffers' growth with the prompt batch (`-ub`, about 38 bytes a
   token per unit of feed-forward width, measured with ggml-vulkan on the console's shader paths),
   and the batch for language models is one constant, `kPromptUbatch`, still 64 until
