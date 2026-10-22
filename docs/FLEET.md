@@ -90,8 +90,8 @@ Git revision or source attestation; the operator must deploy matching builds.
 
 ### Host (CPU + RPC)
 
-Python 3.10+, a C++17 compiler, CMake, Ninja and Git are required. NumPy is needed
-only to generate the tiny inference test fixture, not for the controller.
+Python 3.10+, a C++17 compiler, CMake, Ninja and Git are required. NumPy and
+PyYAML are needed only to generate the tiny test fixture, not for the controller.
 
 ```sh
 git submodule update --init --depth 1 third_party/llama.cpp
@@ -105,7 +105,7 @@ GPU backends and RDMA, and builds the RPC tools plus the upstream multi-server
 regression. It does not fetch model weights or start a listener. Set `CMAKE`,
 `NINJA` or `CMAKE_BUILD_PARALLEL_LEVEL` for local tool locations/resources.
 
-### PS5 worker title — source integration, uncompiled here
+### PS5 worker title — target objects compiled, full title still unvalidated
 
 Follow [BUILDING.md](BUILDING.md) to prepare PS5_Vulkan, its pinned PS5_Mesa and
 PS5_PayloadSDK forks, patched RADV, native packaging tool, `libc.prx` and the
@@ -125,6 +125,34 @@ repository already documents the archive mirror and checksum check in
 [BUILDING.md](BUILDING.md); see [FLEET-VALIDATION.md](FLEET-VALIDATION.md) for the
 actual build attempt and missing prerequisite evidence. Host CI cannot recreate
 Sony's runtime, direct-memory pool, RADV driver or console networking.
+
+### PS5-target compile and runtime check (no console)
+
+```sh
+# Ubuntu 24.04 host prerequisites; no proprietary firmware or model needed.
+sudo apt-get install clang-18 llvm-18 lld-18 make g++ wget unzip
+PATH="/usr/lib/llvm-18/bin:$PATH" LLVM_CONFIG=llvm-config-18 scripts/test-fleet-native.sh
+```
+
+This separate check fetches exact public PS5_Vulkan/PS5_PayloadSDK commits and
+uses their checksum-verified homebrew SDK/zlib bootstrap. It compiles
+`fleet_worker.cpp`, `ggml-rpc.cpp` and `transport.cpp` through the same
+`x86_64-sie-ps5` wrapper used by the title, checks target macros and ELF object
+structure, and reproduces clean-room `libc.prx` twice against upstream hashes.
+Results are recorded in `build/fleet-native/result.json`. Dependency sources
+live under `.deps/fleet-native-src` (override with `PS5LM_NATIVE_SOURCES`).
+
+**This is not a full title link or runtime test.** It does not compile the UI,
+build/link RADV, validate imports, execute PS5 instructions in a console runtime,
+or test Vulkan/memory/network behavior. The full title still follows the build
+instructions above.
+
+QEMU is not used: its documented [x86 system models](https://www.qemu.org/docs/master/system/target-i386.html)
+and [Linux/BSD user modes](https://www.qemu.org/docs/master/user/main.html) do not
+provide a PS5-specific loader/AGC environment. A Linux/FreeBSD VM can exercise
+its own socket/CPU code, not the console's GPU or direct-memory behavior. Passing a VM test would not validate multi-console inference. Use
+native-target compilation plus real-console hardware gates, rather than call a
+Linux guest a PS5 emulator.
 
 ## Configure workers (only after building and validating the title)
 
@@ -214,14 +242,18 @@ quality, PS5 GPU operation, large-model scaling or network speed. Tests use
 loopback only and clean up their child processes.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
-on `main` or `fleet/**`, using an ordinary Ubuntu hosted runner, two parallel compiler processes,
-a 25-minute timeout, read-only repository permissions and per-ref cancellation.
+on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only
+repository permissions and per-ref cancellation. The host job has two parallel
+compiler processes and a 25-minute timeout; the separate native-object/runtime
+job has a 15-minute timeout.
 Actions are pinned to commits; fixture dependencies are version-pinned.
-The workflow checks out the pinned llama.cpp submodule and installs build
-prerequisites, but downloads no trained model, PS5 SDK or driver. No secrets,
+Both jobs check out the pinned llama.cpp submodule and install build tools.
+The host job downloads no trained model, PS5 SDK or driver. The native job does
+fetch the pinned public homebrew SDK and source dependencies, but no proprietary
+firmware, trained model, OpenGL SDK or RADV driver. No secrets,
 `pull_request_target`, private runners or console are required.
 
 The inspected upstream revision had no checked-in workflow to reuse. This new
-job deliberately gives host confidence only; the PS5 title still requires the
-separate build and hardware gate. See the validation report for local evidence
-and the PR checks for the current hosted result.
+workflow separates host inference from native-object compilation; the PS5 title
+still requires the full build and hardware gate. See the validation report for
+local evidence and the PR checks for the current hosted result.

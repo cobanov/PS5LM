@@ -1,4 +1,4 @@
-name: Fleet host tests (not PS5 hardware)
+name: Fleet validation (not PS5 hardware)
 on:
   pull_request:
   push:
@@ -37,3 +37,30 @@ jobs:
           echo '## Fleet host validation' >> "$GITHUB_STEP_SUMMARY"
           echo 'Tests use a generated, untrained GGUF and loopback CPU workers; no console or trained model download is required.' >> "$GITHUB_STEP_SUMMARY"
           echo 'This job does not cross-compile the PS5 title or validate PS5 Vulkan, hardware memory, or multi-console performance.' >> "$GITHUB_STEP_SUMMARY"
+
+  ps5-objects:
+    name: PS5 target objects and clean-room runtime (not full title)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BUILD_JOBS: '2'
+      LLVM_CONFIG: llvm-config-18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pinned llama.cpp headers and RPC source
+        run: git submodule update --init --depth 1 third_party/llama.cpp
+      - name: Public native-build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18 make g++ wget unzip
+          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
+      - name: Compile PS5 objects and reproduce clean-room libc
+        run: scripts/test-fleet-native.sh
+      - name: State the native validation boundary
+        if: always()
+        run: |
+          echo '## PS5-target compile validation' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Compiles the fleet worker and patched RPC sources with the public pinned homebrew SDK; reproduces clean-room libc from source.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This is not a full RADV/title link, console execution, QEMU emulation, or multi-console inference test.' >> "$GITHUB_STEP_SUMMARY"

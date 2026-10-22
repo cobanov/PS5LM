@@ -4,7 +4,8 @@
 
 A working host-side increment: **one model split over two real CPU RPC processes**,
 including the actual `python3 -m fleet serve` path. Experimental PS5 worker source
-is integrated, but **no PS5 cross-compile or console inference has been completed**.
+is integrated, and the worker/RPC objects now cross-compile for the PS5 target.
+**No complete PS5 title link or console inference has been validated.**
 At the time of the initial local validation below, no public listener or console
 deployment was performed. Hosted CI results are reported separately in the PR
 checks. This is not an installable, hardware-validated PS5 release.
@@ -105,13 +106,14 @@ successfully in a fresh Python virtual environment containing only those
 requirements; both inference comparisons again had maximum error 0.0. See the
 PR/fork Actions run for the hosted result on the current commit.
 
-## PS5 build: attempted, then blocked before compilation
+## Initial full PS5 title build attempt — 2026-10-21
 
 The upstream tree had no checked-in CI workflow. Its documented route is a Linux
 cross-build using PS5_Vulkan, its pinned forks, RADV and homebrew SDK tooling.
-A new **host-only** workflow automates the host checks (not this cross-build);
-its current status
-is visible in the PR checks. The evidence below is the local PS5 build attempt.
+The workflow now separates host inference and native-object compilation. Neither
+job proves a complete title build. The evidence below records the initial local
+full-title build attempt; the SDK/runtime gaps were subsequently resolved for
+the native-object gate below.
 
 1. Ran `bash scripts/build-app.sh`: stopped because UI submodule was uninitialized.
 2. Initialized its pinned commit and read its `AGENTS.md`; reran the official build.
@@ -128,9 +130,11 @@ is visible in the PR checks. The evidence below is the local PS5 build attempt.
 7. Reran official `scripts/build-app.sh`: **exit 2**, exact next blocker:
    `.deps/src/PS5_Vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a` missing.
 
-Also absent under `.deps/src/PS5_Vulkan`: `build/host/ps5-native-tool`,
+At that initial attempt, also absent under `.deps/src/PS5_Vulkan`:
+`build/host/ps5-native-tool`,
 `runtime/libc.prx`, `.deps/native/ps5-payload-sdk/bin/prospero-lld` and its C++
-headers. The compiler never ran. Downloading the standalone legacy payload SDK
+headers. The compiler did not run in that initial full-title attempt. Downloading
+the standalone legacy payload SDK
 would not replace the native Vulkan title dependencies. No unverified PS5 binary
 is included.
 
@@ -142,6 +146,37 @@ resolves the removed archive, not the remaining RADV setup.
 
 Build evidence: `build/fleet-ps5-build-attempt*.log`,
 `build/fleet-opengl-mirror-download.log`, `build/fleet-opengl-mirror-verify.log`.
+
+## Native-target follow-up — 2026-10-22
+
+Using the public documented bootstrap (not a proprietary SDK or firmware dump):
+
+| Component | Pinned input |
+|---|---|
+| PS5_Vulkan | `f410e67a0241b3e8edcdbcd2a9b285dfc4a412ed` |
+| PS5_PayloadSDK fork | `b83202be73e930050e00de0f1b4d9ec46c0391bf` |
+| Base homebrew SDK v0.42 archive SHA-256 | `8cfbc7cd5811e719eb4f0c47eea668d3dc7b40bc8ab11c4a5031d40c23ec02da` |
+| zlib 1.3.2 archive SHA-256 | `bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16` |
+
+`fleet_worker.cpp`, patched `ggml-rpc.cpp`, and patched `transport.cpp` compile
+successfully through PS5LM's actual `ps5cxx` wrapper. Target macros include
+`__PROSPERO__`, `__SCE__` and `__FreeBSD__=9`; outputs are x86-64 relocatable ELF
+objects, not executable PS5 titles. The worker's compile uses `-Werror`.
+
+The clean-room runtime reproducer builds two copies and verifies upstream's
+recorded hashes, including signed `libc.prx`:
+`e6ff45d16adf687855cc3b33b0c8a4132b6504360b221e0a34c7e99fb3ba0036`.
+No Sony implementation or console dump is downloaded. Local Clang 19 validation
+passed; the repeatable `scripts/test-fleet-native.sh` also passed from a fresh
+dependency cache using Clang 18.1.8, which is the CI compiler family.
+The separate native job's status is in the fork Actions checks.
+
+A full linked title still needs the patched RADV archive, OpenGL/UI build and
+final ELF/FSELF inspection. This compile-only check must not be described as
+that full build, a console boot, Vulkan validation or PS5 emulation. [QEMU's
+documented system/user modes](FLEET.md#ps5-target-compile-and-runtime-check-no-console)
+do not provide the PS5-specific AGC/loader/direct-memory environment, so a generic
+Linux/FreeBSD VM is not an equivalent hardware gate.
 
 ## Review fixes and remaining boundaries
 
