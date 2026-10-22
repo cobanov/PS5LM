@@ -12,6 +12,14 @@ v0.1.x are the upstream payload releases by cobanov.
   `ps5lm-app-fleet` zip any more: every PS5LM can be a fleet worker, and stays the normal app
   unless `/data/PS5LM/fleet-worker.txt` asks for one, as before. `PS5LM_FLEET` is gone from
   `scripts/build-app.sh`, and CI builds one title again.
+- More memory for models, expected about 0.56 GiB: `sce_sys/param.json` no longer declares the
+  `amm` block and the 256 MiB CPU and GPU page tables it carried over from ps5-homebrew-ui's
+  template. With them the system gave the app 11.44 GiB of direct memory (the 12,280,922,112 bytes
+  in #23's log); titles that leave them out, PS5_Vulkan's and PS5_RetroArch's, get 12 GiB, and
+  neither the GL stack nor RADV uses what the blocks configure. The planner reads the memory free,
+  so every model's plan grows with it. Not yet measured on a console: `app.log` now records the pool
+  and the flexible memory at start (`memory at start`) and once the model serves (`memory when
+  ready`).
 
 ### Added
 - **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)

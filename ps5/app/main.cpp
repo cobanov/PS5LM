@@ -343,19 +343,24 @@ std::string take_request_file(const char * path) {
     return line.empty() ? std::string("-") : line;
 }
 
-// Where the memory is: the pool's free part, the CPU heap, and what ggml
-// says about each device (its GPU figure wraps once the unified heap is
-// over-committed; the raw numbers still show a change).
-void log_memory(const char * when) {
+// Where the memory is: the title's direct-memory pool and its free part,
+// the flexible pool libc and the system libraries use, the CPU heap, and
+// what ggml says about each device (its GPU figure wraps once the unified
+// heap is over-committed; the raw numbers still show a change). `devices`
+// false before the GPU opens: asking ggml would open it.
+void log_memory(const char * when, bool devices = true) {
     int64_t at = 0;
-    size_t  avail = 0;
+    size_t  avail = 0, flex = 0, flex_free = 0;
     const int64_t pool = sceKernelGetDirectMemorySize();
     sceKernelAvailableDirectMemorySize(0, pool, 2 * 1024 * 1024, &at, &avail);
+    sceKernelConfiguredFlexibleMemorySize(&flex);
+    sceKernelAvailableFlexibleMemorySize(&flex_free);
     struct ps5_heap_stats heap = {};
     ps5_heap_stats(&heap);
-    std::printf("ps5lm-app: memory %s: pool free %.2f GiB, cpu heap %.2f GiB (peak %.2f)", when, avail / 1073741824.0,
+    std::printf("ps5lm-app: memory %s: pool %.4f GiB, pool free %.2f GiB, flexible %zu MiB (%zu free), cpu heap %.2f GiB "
+                "(peak %.2f)", when, pool / 1073741824.0, avail / 1073741824.0, flex >> 20, flex_free >> 20,
                 heap.mapped_bytes / 1073741824.0, heap.peak_bytes / 1073741824.0);
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+    for (size_t i = 0; devices && i < ggml_backend_dev_count(); i++) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(ggml_backend_dev_get(i), &free, &total);
         std::printf(", %s free %zu total %zu", ggml_backend_dev_name(ggml_backend_dev_get(i)), free, total);
@@ -666,6 +671,9 @@ int main(int, char **) {
     }
     mkdir(kModels, 0777);
     std::printf("ps5lm-app: start\n");
+    // What the system gave the title, before the screen and the GPU take any
+    // of it: the pool size follows sce_sys/param.json.
+    log_memory("at start", false);
 
     // The screen first: it takes from the same memory as the model.
     Display display;
@@ -954,6 +962,7 @@ int main(int, char **) {
         const bool serving = live.state == ServerState::ready || live.state == ServerState::generating;
         if (serving && !was_serving) {
             notify(live.decision.empty() ? "PS5LM: ready, chat in a browser on this network" : "PS5LM: ready for decisions at /v1/systemone");
+            log_memory("when ready");  // the weights, the cache and the compute buffers are all allocated by now
         }
         was_serving = serving;
         if (n % 30 == 0) {

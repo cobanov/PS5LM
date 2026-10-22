@@ -12,8 +12,8 @@ works too.
   `libc.prx` and registered through ShadowMountPlus. Titles may not `exit()`, some libc imports
   resolve to nothing, and `getaddrinfo`, `accept4`, `HOME` and `localeconv` need replacing
   (`ps5/app/compat_app.c`); each was found by a crash.
-- **The GPU.** ggml-vulkan on RADV with no Vulkan loader, and RADV's unified heap for 11.44 GiB in one
-  heap. A GPU submission is costly here (its words copied, a cache flush, a state reset); measured,
+- **The GPU.** ggml-vulkan on RADV with no Vulkan loader, and RADV's unified heap for the whole direct-memory
+  pool in one heap. A GPU submission is costly here (its words copied, a cache flush, a state reset); measured,
   fewer of them did not make generation faster.
 - **The screen.** ps5-homebrew-ui through ps5-opengl, in the same process as RADV. The two Mesa builds
   share 4,399 symbol names, so the GL stack is linked with only its API visible.

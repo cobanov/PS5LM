@@ -113,11 +113,13 @@ PS5LM's app (`ps5/app`, PPSA99575) is a title, not a payload: it gets the consol
 
 | What | Value |
 |---|---|
-| Direct memory for the title | 12 GiB; RADV reports one 11.44 GiB device heap with `radv_enable_unified_heap_on_apu` (8 GiB without) |
+| Direct memory for the title | 11.4375 GiB up to v0.9.1, 12 GiB expected after; RADV reports it all as one device heap with `radv_enable_unified_heap_on_apu` (2/3 of it without) |
 | Device | PlayStation 5 GPU (RADV NAVI21), Vulkan 1.4 |
 | Qwen3.8-27B UD-IQ2_XXS, `-ngl 999 -lm none -c 4096 -ub 64` | loads in 82 s |
 | Prompt | 35 to 50 tok/s |
 | Generation | 21 tok/s on a short prompt, 9 tok/s after the web UI's 371-token prompt |
+
+The pool is what `sceKernelGetDirectMemorySize()` returns, and `sce_sys/param.json` sets it. Up to v0.9.1 the app's file carried the `amm` block (`pagetableMemorySizeInMib` 256, 512 GiB address ranges) and the `kernel` block (256 MiB CPU and 256 MiB GPU page tables) of ps5-homebrew-ui's template, and the pool was 11.4375 GiB (12,280,922,112 bytes, from a user's log in #23). PS5_Vulkan's and PS5_RetroArch's titles declare no `amm` block and no page-table sizes and get 12 GiB (PS5_Vulkan measured on system software 6.02 to 12.70, PS5_RetroArch's probe on 12.09); that probe mapped an 11.875 GiB block from it and touched every word, so the default page tables hold a pool-sized mapping. Neither the GL stack nor RADV calls an AMM function (only `sceKernelAllocateDirectMemory` and `sceKernelMapDirectMemory`). The blocks are gone since; the app logs the pool and the flexible memory at start (`memory at start` in `app.log`). Not yet measured on 13.60. The flexible pool (448 MiB, the system's default) is the other part of the title's budget: ProsperoEden declares 320 MiB in `kernel.flexibleMemorySize` and its direct pool grows by the 128 MiB; PS5LM keeps the default until `app.log` shows how much of it the app leaves free.
 
 What a title has to do differently from a payload, each found by a crash:
 
