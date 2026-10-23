@@ -77,6 +77,7 @@ class Market {
     // (the check is skipped). False, with the reason in the view's note, when
     // it does not fit or is queued already.
     bool enqueue(const MarketJob & job, double free_gib);
+    bool enqueue(const std::vector<MarketJob> & jobs, double free_gib);  // all on one drive, all or none
     void pause(int index);    // stops it, keeping the partial file
     void resume(int index);   // a paused or failed one goes back in the queue
     void remove(int index);   // cancels it and deletes the partial file; a finished one only leaves the list

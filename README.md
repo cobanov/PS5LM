@@ -44,8 +44,8 @@ no PC while it runs, no cloud and no account.
 - **It runs on the GPU.** llama.cpp's Vulkan backend on the console's RDNA 2 GPU, with 11.4 GB of the
   shared memory for the model and its context. Every architecture and quantization llama.cpp knows
   comes along.
-- **It answers your network.** OpenAI's `/v1/chat/completions`, Anthropic's `/v1/messages` (Claude Code
-  works against it) and a chat page in any browser. Point a client at `http://<console>:8081` and use
+- **It answers your network.** OpenAI's `/v1/chat/completions` and `/v1/responses` (Codex works against
+  it), Anthropic's `/v1/messages` (Claude Code too) and a chat page in any browser. Point a client at `http://<console>:8081` and use
   any model name: the loaded one answers.
 - **It decides, too.** Load a decision model and the console answers TypeSafe's `/v1/systemone`:
   choice, score and yes-or-no questions about text and images, the API Ollaya serves on a PC.
@@ -66,6 +66,17 @@ no PC while it runs, no cloud and no account.
 | Qwen 3.5 9B, Q4_K_M | 5.3 GB | 55 tokens a second |
 | Qwen 3.8 27B, UD-Q2_K_XL | 9.2 GB | about 20 tokens a second, 64k context |
 | d1 Omni 600M, a decision model | 1.1 GB | 3 questions in 0.3 s; a 720p image and 7 questions in 2.9 s |
+
+### Ternary Bonsai 2
+
+PrismML's Bonsai 2 27B is Qwen 3.8 27B in ternary weights, 7.1 GB as `Q2_0`, which leaves a 64k context
+plenty of room. Its `Q2_0` file is in **Models > Suggested**, and the app's llama.cpp applies the
+model's Hadamard rotation itself. PrismML's main repository ships `PQ2_0` instead, a type only their
+fork reads; convert it on a PC, losslessly (the result is byte for byte PrismML's own `Q2_0`):
+
+```sh
+python3 scripts/bonsai-pq2-to-q2.py Ternary-Bonsai-2-27B-PQ2_0.gguf   # writes Ternary-Bonsai-2-27B-Q2_0.gguf
+```
 
 ## Decision models, powered by Ollaya
 
@@ -110,9 +121,19 @@ You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded
 To update, copy the new folder over the old one. Settings, models and downloads stay in
 `/data/PS5LM`.
 
-If PS5LM cannot write to `/data/PS5LM` ("Cannot write to /data/PS5LM/models"), the HEN has not
-opened the console's storage to it. On OnionHEN, add `PPSA99575` to `exact_title_ids` in the
-`[app_jailbreak]` section of `/data/OnionHEN/config.ini`, then start PS5LM again. Using it from coding tools (opencode, Codex, Claude Code) is in
+If the HEN has not opened the console's storage (`/data`) to PS5LM, the app says so on its first
+start and offers its own storage instead: up to 16 GB in `/download0/PS5LM`, for its settings, logs
+and models (a download that does not fit is refused before it starts). To open full storage on
+OnionHEN, add `PPSA99575` to `exact_title_ids` in the `[app_jailbreak]` section of
+`/data/OnionHEN/config.ini`, then start PS5LM again; models saved in the app's storage stay in the
+library. **Settings > Sound and storage** shows which one is in use.
+
+When something goes wrong, **Settings > Debug report** writes `/data/PS5LM/debug-report.txt` (and a copy
+to a USB drive, when one is in): the app's version, the system software, storage, models, settings, the
+end of both logs and which payload ports answer, with API keys and tokens taken out. Attach it to your
+[issue](https://github.com/cobanov/PS5LM/issues). The kernel log goes in only if you switch it on there.
+
+Using it from coding tools (opencode, Codex, Claude Code) is in
 [docs/CLI.md](docs/CLI.md).
 
 | Where | Button | Does |
@@ -126,6 +147,7 @@ opened the console's storage to it. On OnionHEN, add `PPSA99575` to `exact_title
 | Console | L2 / R2 | the last two minutes / the last hour |
 | Settings | D-pad, Cross | choose a category and a row; flip it, or pick from its list |
 | Settings, Diagnostics | Square, Triangle | app or server log; errors only |
+| Settings, Debug report | Cross | write one file to attach to an issue |
 
 ## Want to tinker?
 

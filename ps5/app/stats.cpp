@@ -82,14 +82,15 @@ std::vector<Drive> drives_from_metrics(const std::string & text) {
             out.push_back({ drive_name(mount), mount + "/PS5LM/models", free, total });
         }
     }
+    // Without full storage the app's own storage stands in for internal storage.
+    if (app_storage()) {
+        out[0] = { "App storage", std::string(kAppRoot) + "/models", app_storage_free_gib(), app_storage_size() / kGiB };
+    }
     return out;
 }
 
 std::vector<Drive> mounted_drives() { return drives_from_metrics(http_get(9100, "/metrics", 2)); }
 
-std::string drive_name(const std::string & path) {
-    return path.rfind("/mnt/ext", 0) == 0 ? "M.2 drive" : path.rfind("/mnt/usb", 0) == 0 ? "USB drive" : "Internal storage";
-}
 
 namespace {
 

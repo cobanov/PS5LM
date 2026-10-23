@@ -19,7 +19,7 @@ cc=${HOST_CC:-clang}
 # host platform functions, and the app's dashboard.
 mapfile -t sources < <(find "$kit/src/gfx" "$kit/src/ui" "$kit/src/core" "$kit/src/audio" "$kit/src/third_party" \
     -type f \( -name '*.cpp' -o -name '*.c' \) | sort)
-sources+=("$kit/host/platform_host.cpp" "$root/ps5/app/dashboard.cpp" "$root/ps5/app/stats.cpp"
+sources+=("$kit/host/platform_host.cpp" "$root/ps5/app/dashboard.cpp" "$root/ps5/app/stats.cpp" "$root/ps5/app/storage.cpp"
     "$root/ps5/app/preview_main.cpp")
 
 compile() {

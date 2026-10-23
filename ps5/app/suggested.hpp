@@ -32,6 +32,16 @@ inline constexpr Suggestion kSuggestions[] = {
     { "Qwen 3.8 27B", false, "The strongest model that fits, with a 64k context", 20, "unsloth/Qwen3.8-27B-GGUF",
       { "Qwen3.8-27B-UD-Q2_K_XL.gguf", 9828981664ull, "fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0", nullptr },
       {} },
+    // Bonsai 2 27B, PrismML's ternary Qwen 3.8, as upstream's Q2_0: the app's
+    // llama.cpp applies its Hadamard rotation (prism.hadamard.*). PrismML keeps
+    // this file in its -dev repo under a "prism-fork-required" name from before
+    // upstream had the rotation; it is byte for byte what scripts/bonsai-pq2-to-q2.py
+    // makes from the main repo's PQ2_0, and it answers correctly with
+    // ggml-vulkan on a PC. Not yet run on the console.
+    { "Bonsai 2 27B", false, "Qwen 3.8 27B in ternary weights, with a 64k context", 0, "prism-ml/Ternary-Bonsai-2-27B-gguf-dev",
+      { "Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf", 7626008928ull,
+        "4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e", "Ternary-Bonsai-2-27B-Q2_0.gguf" },
+      {} },
     { "Qwen 3.5 9B", false, "Fast all-rounder that leaves room for long chats", 55, "unsloth/Qwen3.5-9B-GGUF",
       { "Qwen3.5-9B-Q4_K_M.gguf", 5680522464ull, "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8", nullptr },
       {} },

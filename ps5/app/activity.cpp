@@ -57,7 +57,8 @@ std::string text_of(const json & content) {
     if (content.is_array()) {
         for (const auto & part : content) {
             const std::string type = part.value("type", "");
-            if (type == "text" && part.contains("text") && part["text"].is_string()) {
+            if ((type == "text" || type == "input_text" || type == "output_text") && part.contains("text") &&
+                part["text"].is_string()) {
                 out += (out.empty() ? "" : " ") + part["text"].get<std::string>();
             } else if (type == "image_url" || type == "image" || type == "input_image") {
                 out += (out.empty() ? "" : " ") + std::string("[image]");
@@ -67,7 +68,9 @@ std::string text_of(const json & content) {
     return out;
 }
 
-// What was asked: the last user message, a decision request's state, or the prompt.
+// What was asked: the last user message, a decision request's state, or the
+// prompt. Chat and Anthropic requests carry "messages", Responses "input"
+// (a string, or items with a role).
 std::string asked_from(const std::string & path, const json & j) {
     if (!j.is_object()) {
         return {};
@@ -83,12 +86,17 @@ std::string asked_from(const std::string & path, const json & j) {
         }
         return head + (state.empty() || state == "null" ? "" : ": " + state);
     }
-    if (j.contains("messages") && j["messages"].is_array()) {
-        for (auto it = j["messages"].rbegin(); it != j["messages"].rend(); ++it) {
-            if (it->is_object() && it->value("role", "") == "user" && it->contains("content")) {
-                return text_of((*it)["content"]);
+    for (const char * key : { "messages", "input" }) {
+        if (j.contains(key) && j[key].is_array()) {
+            for (auto it = j[key].rbegin(); it != j[key].rend(); ++it) {
+                if (it->is_object() && it->value("role", "") == "user" && it->contains("content")) {
+                    return text_of((*it)["content"]);
+                }
             }
         }
+    }
+    if (j.contains("input") && j["input"].is_string()) {
+        return j["input"].get<std::string>();
     }
     if (j.contains("prompt")) {
         return j["prompt"].is_string() ? j["prompt"].get<std::string>() : j["prompt"].dump();
@@ -154,6 +162,20 @@ std::string answer_from(const json & j) {
             return c["text"].get<std::string>();
         }
         return {};
+    }
+    // OpenAI Responses: a text delta, or a whole response's message text. The
+    // stream's closing events repeat the text and are left out.
+    if (j.value("type", "") == "response.output_text.delta") {
+        return j.contains("delta") && j["delta"].is_string() ? j["delta"].get<std::string>() : "";
+    }
+    if (j.value("object", "") == "response" && j.contains("output") && j["output"].is_array()) {
+        std::string out;
+        for (const auto & item : j["output"]) {
+            if (item.is_object() && item.value("type", "") == "message" && item.contains("content")) {
+                out += text_of(item["content"]);
+            }
+        }
+        return out;
     }
     // Anthropic: a text delta, or a whole message's text blocks.
     if (j.value("type", "") == "content_block_delta" && j.contains("delta") && j["delta"].is_object()) {

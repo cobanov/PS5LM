@@ -62,6 +62,36 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan cp = ps5lm::plan_model(c, budget);
     assert(cp.fits && cp.ctx > 4096 && has_args(cp, "-ub", "64"));
 
+    // A larger prompt batch costs compute buffer, counted by the feed-forward width.
+    Gguf wide_ff = chat;
+    wide_ff.kv("qwen35.feed_forward_length", 12288u);
+    const ps5lm::ModelInfo w = ps5lm::read_model_header("Qwen3.5-9B-Q4_K_M.gguf", wide_ff.bytes(), 5ull << 30);
+    const ps5lm::Plan w64 = ps5lm::plan_model(w, budget), w512 = ps5lm::plan_model(w, budget, 65536, nullptr, 512);
+    assert(w.n_ff == 12288 && has_args(w64, "-ub", "64") && has_args(w512, "-ub", "512") && has_args(w512, "-b", "512"));
+    assert(w512.reserve_gib - w64.reserve_gib > 0.18 && w512.reserve_gib - w64.reserve_gib < 0.21);
+
+    // Bonsai 2: upstream's Q2_0 loads with its preset (64k at most, PrismML's
+    // sampling); PrismML's own PQ2_0 and PTQ1_0 say what to do instead.
+    const auto bonsai = [](uint32_t ftype) {
+        Gguf g;
+        g.kv("general.architecture", "qwen35").kv("general.name", "Ternary-Bonsai-2-27B")
+            .kv("qwen35.block_count", 64u).kv("qwen35.attention.head_count", 24u)
+            .kv("qwen35.attention.head_count_kv", 4u).kv("qwen35.embedding_length", 5120u)
+            .kv("qwen35.attention.key_length", 256u).kv("qwen35.attention.value_length", 256u)
+            .kv("qwen35.full_attention_interval", 4u).kv("qwen35.context_length", 262144u)
+            .kv("prism.hadamard.version", 1u).kv("general.file_type", ftype);
+        return g.bytes();
+    };
+    const ps5lm::ModelInfo b = ps5lm::read_model_header("Ternary-Bonsai-2-27B-Q2_0.gguf", bonsai(41), 7626008928ull);
+    const ps5lm::Preset * bp = ps5lm::find_preset(b);
+    assert(b.ok && bp && std::string(bp->label) == "Bonsai 2");
+    const ps5lm::Plan bpl = ps5lm::plan_model(b, 12.0, 131072);
+    assert(bpl.fits && bpl.ctx == 65536 && has_args(bpl, "--min-p", "0.05"));
+    const ps5lm::ModelInfo pq = ps5lm::read_model_header("Ternary-Bonsai-2-27B-PQ2_0.gguf", bonsai(141), 7206168928ull);
+    assert(!pq.ok && pq.error.find("bonsai-pq2-to-q2.py") != std::string::npos);
+    const ps5lm::ModelInfo pt = ps5lm::read_model_header("Ternary-Bonsai-2-27B-PTQ1_0.gguf", bonsai(143), 5946648928ull);
+    assert(!pt.ok && pt.error.find("PTQ1_0") != std::string::npos);
+
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
         return 0;

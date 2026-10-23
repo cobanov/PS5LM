@@ -19,6 +19,8 @@ struct Settings {
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     uint32_t    scratch_limit_gib = 2;  // warn when the scratch folder grows past this
     std::string download_dir = "/data/PS5LM/models";  // where the market saves models
+    bool        report_kernel_log = false;  // the debug report includes the kernel log
+    bool        report_explained  = false;  // what a debug report holds was shown before the first
 
     bool operator==(const Settings &) const = default;
 };

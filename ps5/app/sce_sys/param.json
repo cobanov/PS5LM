@@ -2,11 +2,6 @@
   "ageLevel": {
     "default": 0
   },
-  "amm": {
-    "multimapVaRangeInGib": 512,
-    "pagetableMemorySizeInMib": 256,
-    "vaRangeInGib": 512
-  },
   "applicationCategoryType": 0,
   "applicationDrmType": "free",
   "attribute": 0,
@@ -16,17 +11,13 @@
   "contentBadgeType": 1,
   "contentId": "UP9000-PPSA99575_00-PS5LMVULKAN00001",
   "contentVersion": "01.009.001",
-  "downloadDataSize": 256,
+  "downloadDataSize": 16384,
   "gameIntent": {
     "permittedIntents": [
       {
         "intentType": "launchActivity"
       }
     ]
-  },
-  "kernel": {
-    "cpuPageTableSize": 268435456,
-    "gpuPageTableSize": 268435456
   },
   "localizedParameters": {
     "defaultLanguage": "en-US",

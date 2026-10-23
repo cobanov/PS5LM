@@ -82,11 +82,13 @@ PS5LM's app (`ps5/app`, PPSA99575) is a title, not a payload: it gets the consol
 
 | What | Value |
 |---|---|
-| Direct memory for the title | 12 GiB; RADV reports one 11.44 GiB device heap with `radv_enable_unified_heap_on_apu` (8 GiB without) |
+| Direct memory for the title | 11.4375 GiB up to v0.9.1, 12 GiB expected after; RADV reports it all as one device heap with `radv_enable_unified_heap_on_apu` (2/3 of it without) |
 | Device | PlayStation 5 GPU (RADV NAVI21), Vulkan 1.4 |
 | Qwen3.8-27B UD-IQ2_XXS, `-ngl 999 -lm none -c 4096 -ub 64` | loads in 82 s |
 | Prompt | 35 to 50 tok/s |
 | Generation | 21 tok/s on a short prompt, 9 tok/s after the web UI's 371-token prompt |
+
+The pool is what `sceKernelGetDirectMemorySize()` returns, and `sce_sys/param.json` sets it. Up to v0.9.1 the app's file carried the `amm` block (`pagetableMemorySizeInMib` 256, 512 GiB address ranges) and the `kernel` block (256 MiB CPU and 256 MiB GPU page tables) of ps5-homebrew-ui's template, and the pool was 11.4375 GiB (12,280,922,112 bytes, from a user's log in #23). PS5_Vulkan's and PS5_RetroArch's titles declare no `amm` block and no page-table sizes and get 12 GiB (PS5_Vulkan measured on system software 6.02 to 12.70, PS5_RetroArch's probe on 12.09); that probe mapped an 11.875 GiB block from it and touched every word, so the default page tables hold a pool-sized mapping. Neither the GL stack nor RADV calls an AMM function (only `sceKernelAllocateDirectMemory` and `sceKernelMapDirectMemory`). The blocks are gone since; the app logs the pool and the flexible memory at start (`memory at start` in `app.log`). Not yet measured on 13.60. The flexible pool (448 MiB, the system's default) is the other part of the title's budget: ProsperoEden declares 320 MiB in `kernel.flexibleMemorySize` and its direct pool grows by the 128 MiB; PS5LM keeps the default until `app.log` shows how much of it the app leaves free.
 
 What a title has to do differently from a payload, each found by a crash:
 
@@ -95,6 +97,44 @@ What a title has to do differently from a payload, each found by a crash:
 - **The SDK fork's `getaddrinfo` always fails**, and cpp-httplib resolves even the address it binds; `compat_app.c` has a numeric one. Its `accept4` is the title's own too, and logs `errno` when `accept` fails: with the payload's version the listener stopped 20 s into the first run.
 - **No `HOME`**: llama.cpp throws looking for its cache directory without one.
 - C++ exceptions and RTTI are off by default for the PS5 target and must be turned on for llama.cpp.
+
+### Prompt batch
+
+llama-server's `-ub` is how many prompt tokens go through the GPU at once. The planner gives language
+models 64 (`kPromptUbatch` in `ps5/app/model_plan.hpp`), what the console has run since the first
+release; decision models and image encoders get 2048. A larger batch needs larger compute buffers.
+Measured on a PC (RTX 3090, ggml-vulkan with cooperative matrices, integer dot products and bf16 off,
+so it takes the console's shader paths): Qwen3.8-27B UD-Q2_K_XL at 64k with a q4_0 cache, flash
+attention on, a 2,048-token prompt and 128 tokens generated, the faster of two runs.
+
+| `-ub` | Device compute buffer | Host compute buffer | Prompt, PC | Generation, PC |
+|---|---|---|---|---|
+| 64 | 27 MiB | 13 MiB | 270 tok/s | 35.1 tok/s |
+| 128 | 54 MiB | 26 MiB | 307 tok/s | 34.9 tok/s |
+| 256 | 108 MiB | 52 MiB | 332 tok/s | 34.4 tok/s |
+| 512 | 216 MiB | 104 MiB | 355 tok/s | 34.2 tok/s |
+
+The speeds are the PC's, not the console's. The buffers carry over: on the console both come from the
+pool, about 38 bytes a token for each unit of feed-forward width, which the planner now counts. With
+the 11.04 GiB a v0.9.1 console had free before a model (#23), the 27B gets 32k at any of these sizes;
+with the 12 GiB pool it keeps 64k at 64 to 256 (11.4 of 11.6 GiB expected) and only just fits at 512.
+`scripts/bench-ubatch.py` measures speed and memory on the console, size by size.
+
+### Probes
+
+Measurements the app makes only when the PC asks, each on a thread of its own, with the results in
+`app.log` (`ps5/app/probes.cpp`). They are for decisions not taken yet, such as reading MoE experts
+from a drive instead of holding them in memory (Qwen3.8-Flash-Next on the roadmap).
+
+| `scripts/ps5lm-app.sh` | Logs |
+|---|---|
+| `bench-read <model file>` | Sequential reads (8 MiB, up to 2 GiB), then three seconds each of random reads of 64 KiB, 256 KiB, 1 MiB and 4 MiB with one and four threads, through the cache and with `O_DIRECT`: MB/s, reads a second, median and p99 latency |
+| `bench-memory` | The direct pool and what the system keeps of a nominal 12 GiB, its largest free block, the flexible pool; with no model loaded, also the largest block that allocates and maps, given back at once |
+| `bench-write` | Write speed by method to the data folder and a USB drive |
+| `memory` | One `memory asked` line: pools, CPU heap and ggml's devices |
+
+Point `bench-read` at a model of several GiB on the drive in question (internal storage, the M.2
+drive or USB), so the cache holds little of it; the `O_DIRECT` lines are the drive itself.
 
 ### Switching models
 

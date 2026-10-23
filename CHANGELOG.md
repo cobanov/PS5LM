@@ -5,6 +5,73 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **Settings > Debug report**: one file to attach to a GitHub issue, `/data/PS5LM/debug-report.txt`
+  and a copy on a USB drive when one is in. It holds the app's version, the system software, where
+  the app keeps its files and the room on each drive, the models and their plans, the downloads,
+  the settings, `env.txt` and `app-args.txt`, the last 256 KiB of `app.log` and `llama.log`, and
+  which payload ports answer (ELF loader, FTP, kernel log, shell, ps5-exporter, ...). API keys,
+  tokens and passwords are taken out of everything in it. The kernel log goes in only when
+  **Include the kernel log** is on (off by default), at most its last 1 MiB, read from klogsrv
+  or etaHEN's. Before the first report a dialog says what it holds.
+- **Ternary Bonsai 2**: a **Bonsai 2** preset (PrismML's sampling, 64k context at most) and
+  **Bonsai 2 27B** in Suggested, upstream's `Q2_0` (7.1 GiB). The app's llama.cpp already reads the
+  `prism.hadamard.*` rotation those files carry: checked on a PC with the 2B and the 27B, on the CPU
+  and on ggml-vulkan with the console's shader paths. Not yet run on the console.
+- `scripts/bonsai-pq2-to-q2.py`: PrismML's `PQ2_0` files, which upstream llama.cpp (b11827 too)
+  refuses, to `Q2_0`, with no loss: each 128-weight block becomes two 64-weight blocks with the same
+  scale and codes. Python only, about 80 s for the 27B; the 2B and the 27B come out byte for byte
+  as the `Q2_0` files PrismML publishes. The library says what to do with a `PQ2_0` file (and that a
+  `PTQ1_0` one does not load) instead of failing at load.
+- `scripts/bench-ubatch.py`: prompt and generation speed and memory of one model at several prompt
+  batch sizes on the console (2,048-token prompt, each size a restart with the planner's arguments),
+  as a table; and `scripts/ps5lm-app.sh memory`, which logs the memory pools on request.
+- **The app's own storage** when the HEN keeps `/data` closed (#16, #23, #24). The app used to
+  stop there: no log, no settings, every download failing. It now keeps its files in
+  `/download0/PS5LM` instead, and on the first such start asks, over the screen: use the app's
+  storage, or how to open full storage (OnionHEN's `exact_title_ids`, etaHEN, other HENs) and start
+  again, which asks the HEN once more. **Settings > Sound and storage > Where PS5LM keeps its
+  files** shows which one is in use and how full it is. Models saved there stay in the library
+  once full storage opens.
+
+- Two probes for later decisions, out of the app's way (`ps5/app/probes.cpp`, run from the PC):
+  `scripts/ps5lm-app.sh bench-read <model file>` measures a drive's sequential and random read
+  speed at the sizes MoE experts come in (64 KiB to 4 MiB, one and four threads, cached and
+  `O_DIRECT`), and `bench-memory` logs what the system keeps of the title's memory and the
+  largest block that really allocates. The download and write probes moved there from `main.cpp`.
+- The TV's request feed shows OpenAI Responses requests (`/v1/responses`, what codex sends): the
+  question from `input`, the answer from the response or its `output_text` deltas. They showed
+  blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
+
+### Changed
+- The planner counts the compute buffers' growth with the prompt batch (`-ub`, about 38 bytes a
+  token per unit of feed-forward width, measured with ggml-vulkan on the console's shader paths),
+  and the batch for language models is one constant, `kPromptUbatch`, still 64 until
+  `scripts/bench-ubatch.py` has measured the others on a console. See docs/CONSOLE.md.
+- `downloadDataSize` in `sce_sys/param.json` is 16 GiB (16384 MiB, was 256 MiB): the size of
+  the app's own storage. The app counts what it holds itself, as a title's `statvfs` is a stub.
+  Whether the system sets the whole 16 GiB aside on internal storage at the first start, or
+  only what is written, is not known yet; lowering it later frees nothing.
+- A download is refused before it starts, with the reason on the TV, when the drive has no room
+  for it, the downloads already queued to that drive, and 1 GiB to spare. A model and its image
+  projector are queued together or not at all.
+- More memory for models, expected about 0.56 GiB: `sce_sys/param.json` no longer declares the
+  `amm` block and the 256 MiB CPU and GPU page tables it carried over from ps5-homebrew-ui's
+  template. With them the system gave the app 11.44 GiB of direct memory (the 12,280,922,112 bytes
+  in #23's log); titles that leave them out, PS5_Vulkan's and PS5_RetroArch's, get 12 GiB, and
+  neither the GL stack nor RADV uses what the blocks configure. The planner reads the memory free,
+  so every model's plan grows with it: with the dashboard up, v0.9.1 had 11.04 GiB free before a
+  model and gave Qwen 3.8 27B UD-Q2_K_XL a 32k context, not the 64k it was suggested with; with
+  the 12 GiB pool it plans 64k again. Not yet measured on a console: `app.log` now records the pool
+  and the flexible memory at start (`memory at start`) and once the model serves (`memory when
+  ready`).
+
+### Fixed
+- A download that meets a full drive anyway stops at once, "Failed: App storage is full", instead
+  of retrying twenty times.
+
 ## [0.9.1] - 2026-10-20
 
 ### Fixed
