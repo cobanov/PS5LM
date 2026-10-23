@@ -3,6 +3,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ftp_writer.hpp"
+#include "log.hpp"
 
 #include "stats.hpp"
 
@@ -352,10 +353,10 @@ bool user_ftpsrv_works(FtpWriter & ftp, std::string & error) {
         works = ftp.write_at(kFtpCheckFile, 0, "x", 1, check_error) ? 1 : 0;
         ::unlink(kFtpCheckFile);
         if (works) {
-            std::printf("ps5lm-app: ftpsrv: the one on %d works\n", kFtpsrvPort);
+            ps5lm::log_line("ftpsrv: the one on %d works\n", kFtpsrvPort);
         } else {
             error = check_error;
-            std::printf("ps5lm-app: ftpsrv: the one on %d cannot write for PS5LM (%s); using PS5LM's own copy on %d\n",
+            ps5lm::log_line("ftpsrv: the one on %d cannot write for PS5LM (%s); using PS5LM's own copy on %d\n",
                         kFtpsrvPort, check_error.c_str(), kOwnFtpsrvPort);
         }
     }
@@ -399,20 +400,20 @@ bool connect_ftp_writer(FtpWriter & ftp, std::string & error) {
     sent = true;
     // The ELF loader runs what it read once the connection ends.
     if (!send_payload(kOwnFtpsrvElf, kElfLoaderPort)) {
-        std::printf("ps5lm-app: ftpsrv: could not send %s to elfldr on %d\n", kOwnFtpsrvElf, kElfLoaderPort);
+        ps5lm::log_line("ftpsrv: could not send %s to elfldr on %d\n", kOwnFtpsrvElf, kElfLoaderPort);
         return none(error_2123 + "; not started: no elfldr on " + std::to_string(kElfLoaderPort) + " took it");
     }
-    std::printf("ps5lm-app: ftpsrv: sent %s to the ELF loader on %d\n", kOwnFtpsrvElf, kElfLoaderPort);
+    ps5lm::log_line("ftpsrv: sent %s to the ELF loader on %d\n", kOwnFtpsrvElf, kElfLoaderPort);
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 25; i++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         if (ftp.connect(error_2123)) {
-            std::printf("ps5lm-app: ftpsrv: PS5LM's own copy answers on %d after %.1f s\n", kOwnFtpsrvPort,
+            ps5lm::log_line("ftpsrv: PS5LM's own copy answers on %d after %.1f s\n", kOwnFtpsrvPort,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             return true;
         }
     }
-    std::printf("ps5lm-app: ftpsrv: PS5LM's own copy does not answer on %d: %s\n", kOwnFtpsrvPort, error_2123.c_str());
+    ps5lm::log_line("ftpsrv: PS5LM's own copy does not answer on %d: %s\n", kOwnFtpsrvPort, error_2123.c_str());
     return none(error_2123 + "; sent to the ELF loader, but it did not start within 5 s");
 }
 

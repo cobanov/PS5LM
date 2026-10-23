@@ -100,7 +100,7 @@ def wait_ready(started_after, timeout=1200):
 
 
 def planner_args(run):
-    args = [l.split("ps5lm-app: arg ", 1)[1] for l in run.splitlines() if l.startswith("ps5lm-app: arg ")]
+    args = [l.split("ps5lm-app: arg ", 1)[1] for l in run.splitlines() if "ps5lm-app: arg " in l]  # lines start with the time (#40)
     out, skip = [], False
     for a in args:  # what the app adds itself
         if skip:
