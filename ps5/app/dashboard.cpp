@@ -367,7 +367,8 @@ std::string download_line(const Download & d) {
     }
     std::snprintf(t, sizeof(t), "%.1f of %.1f GB", done, all);
     if (d.state == DownloadState::running) {
-        return std::string(t) + ", starting";
+        // No speed: starting, or every piece is in and the note says the SHA-256 check's progress (#30).
+        return std::string(t) + ", " + (d.note.empty() ? "starting" : d.note);
     }
     if (d.state == DownloadState::done) {
         return d.note;

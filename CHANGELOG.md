@@ -67,10 +67,16 @@ v0.1.x are the upstream payload releases by cobanov.
   the 12 GiB pool it plans 64k again. Not yet measured on a console: `app.log` now records the pool
   and the flexible memory at start (`memory at start`) and once the model serves (`memory when
   ready`).
+- Every line the app writes to `app.log` starts with the console's local time, as
+  `22:56:01 ps5lm-app: start` (#40). Lines from the graphics stack keep their own form.
 
 ### Fixed
 - A download that meets a full drive anyway stops at once, "Failed: App storage is full", instead
   of retrying twenty times.
+- At the end of a download, Models > Downloads said "starting" for the minutes the SHA-256 check
+  takes, so it looked hung (#30). It now says "Checking the SHA-256, 45%". The queue is saved
+  before the check, so a restart during it checks the file again but no longer fetches the last
+  piece first.
 
 ## [0.9.1] - 2026-10-20
 

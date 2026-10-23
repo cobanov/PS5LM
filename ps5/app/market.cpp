@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "market.hpp"
+#include "log.hpp"
 
 #include "fetch.hpp"
 #include "model_plan.hpp"
@@ -337,7 +338,7 @@ bool Market::enqueue(const std::vector<MarketJob> & jobs, double free) {
                       jobs[0].file.c_str(), jobs.size() > 1 ? " and its image projector" : "", need, drive_name(dir).c_str(),
                       std::max(0.0, free - queued), queued > 0 ? " after the downloads queued there" : "");
         view_.note = text;
-        std::printf("ps5lm-app: download %s/%s: %s\n", jobs[0].repo.c_str(), jobs[0].file.c_str(), text);
+        ps5lm::log_line("download %s/%s: %s\n", jobs[0].repo.c_str(), jobs[0].file.c_str(), text);
         return false;
     }
     for (const auto & job : jobs) {
@@ -540,8 +541,8 @@ bool Market::fetch(Download & d) {
                           r.status > 0 && !r.error.empty() ? ", " : "", r.error.c_str());
             last_error = text;
             const int f = ++failures;
-            std::printf("ps5lm-app: download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
-                        (unsigned long long) off, (unsigned long long) got, text);
+            ps5lm::log_line("download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
+                            (unsigned long long) off, (unsigned long long) got, text);
             const int werr = write_errno;
             if (werr == ENOSPC || werr == EDQUOT || werr == EFBIG) {
                 last_error = drive_name(d.dir) + " is full";
@@ -619,15 +620,26 @@ bool Market::fetch(Download & d) {
         publish(true);
         return false;
     }
-    // Whole: check it.
+    // Whole: check it. The queue is saved first, with `resume` at the file's
+    // size, so a restart during the check repeats only the check, not the last
+    // piece; and the row says how far the check has read (#30).
     d.note = "Checking the SHA-256";
-    publish(false);
+    publish(true);
     sha256_t h;
     sha256_init(&h);
     if (FILE * in = std::fopen(part.c_str(), "rb")) {
         std::vector<unsigned char> buf(8u << 20);
+        uint64_t read = 0;
+        auto shown = std::chrono::steady_clock::now();
         for (size_t n; (n = std::fread(buf.data(), 1, buf.size(), in)) > 0;) {
             sha256_update(&h, buf.data(), n);
+            read += n;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - shown >= std::chrono::seconds(1)) {
+                shown = now;
+                d.note = "Checking the SHA-256, " + std::to_string((int) (100.0 * (double) read / (double) d.bytes)) + "%";
+                publish(false);
+            }
         }
         std::fclose(in);
     }
@@ -649,7 +661,7 @@ bool Market::fetch(Download & d) {
         d.state = DownloadState::done;
         d.note = "Saved to " + to;
     }
-    std::printf("ps5lm-app: download %s/%s: %s\n", d.repo.c_str(), d.file.c_str(), d.note.c_str());
+    ps5lm::log_line("download %s/%s: %s\n", d.repo.c_str(), d.file.c_str(), d.note.c_str());
     publish(true);
     return d.state == DownloadState::done;
 }

@@ -32,6 +32,9 @@ int main() {
     expect("-m model.gguf --api-key=abc --port 8081", "-m model.gguf --api-key=[removed] --port 8081");
     expect("ps5lm-app: arg --api-key\nps5lm-app: arg hunter2\nps5lm-app: arg --port",
            "ps5lm-app: arg --api-key\nps5lm-app: arg [removed]\nps5lm-app: arg --port");
+    // The same with the time app.log puts in front of every line (#40).
+    expect("22:56:01 ps5lm-app: arg --api-key\n22:56:01 ps5lm-app: arg hunter2\n22:56:01 ps5lm-app: arg --port",
+           "22:56:01 ps5lm-app: arg --api-key\n22:56:01 ps5lm-app: arg [removed]\n22:56:01 ps5lm-app: arg --port");
     expect("--hf-token\nhf_abcdefghijklmnopqrstuvwxyz0123456789\n-m\nx.gguf", "--hf-token\n[removed]\n-m\nx.gguf");
     expect("--api-key-file /data/PS5LM/key.txt", "--api-key-file [removed]");
 

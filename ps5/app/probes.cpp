@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "probes.hpp"
+#include "log.hpp"
 
 #include "fetch.hpp"
 #include "storage.hpp"
@@ -34,9 +35,9 @@ void probe_fetch(std::string url) {
     if (out) {
         std::fclose(out);
     }
-    std::printf("ps5lm-app: fetch %s: status %d, length %lld, %llu bytes in %.1f s (%.2f MB/s)%s%s\n", url.c_str(),
-                r.status, (long long) r.length, (unsigned long long) r.bytes, r.seconds,
-                r.seconds > 0 ? r.bytes / 1e6 / r.seconds : 0.0, r.error.empty() ? "" : ", ", r.error.c_str());
+    ps5lm::log_line("fetch %s: status %d, length %lld, %llu bytes in %.1f s (%.2f MB/s)%s%s\n", url.c_str(),
+                    r.status, (long long) r.length, (unsigned long long) r.bytes, r.seconds,
+                    r.seconds > 0 ? r.bytes / 1e6 / r.seconds : 0.0, r.error.empty() ? "" : ", ", r.error.c_str());
 }
 
 // Probe: how fast the app can write, by method and place, fsync included
@@ -84,12 +85,12 @@ void probe_write() {
                 }
             }
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("ps5lm-app: write-bench %s %s: %s, %.1f MB/s\n", dir.c_str(), m.name, ok ? "ok" : strerror(errno),
-                        ok ? total / 1e6 / s : 0.0);
+            ps5lm::log_line("write-bench %s %s: %s, %.1f MB/s\n", dir.c_str(), m.name, ok ? "ok" : strerror(errno),
+                            ok ? total / 1e6 / s : 0.0);
             unlink(path.c_str());
         }
     }
-    std::printf("ps5lm-app: write-bench done\n");
+    ps5lm::log_line("write-bench done\n");
 }
 
 // The read probe's pieces, on one thread or several: random offsets in the
@@ -149,12 +150,12 @@ ReadResult read_random(int fd, uint64_t size, size_t piece, int threads, double 
 void probe_read(std::string path) {
     struct stat st = {};
     if (stat(path.c_str(), &st) != 0 || st.st_size < (256ll << 20)) {
-        std::printf("ps5lm-app: read-bench %s: %s\n", path.c_str(),
-                    st.st_size ? "under 256 MiB; give it a model of several GiB" : strerror(errno));
+        ps5lm::log_line("read-bench %s: %s\n", path.c_str(),
+                        st.st_size ? "under 256 MiB; give it a model of several GiB" : strerror(errno));
         return;
     }
     const uint64_t size = (uint64_t) st.st_size;
-    std::printf("ps5lm-app: read-bench %s, %.2f GiB (%s)\n", path.c_str(), size / 1073741824.0, drive_name(path).c_str());
+    ps5lm::log_line("read-bench %s, %.2f GiB (%s)\n", path.c_str(), size / 1073741824.0, drive_name(path).c_str());
     // Sequentially, 8 MiB at a time, up to 2 GiB from the start.
     {
         const int fd = open(path.c_str(), O_RDONLY);
@@ -170,8 +171,8 @@ void probe_read(std::string path) {
             done += (uint64_t) got;
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("ps5lm-app: read-bench sequential 8 MiB: %.2f GiB in %.1f s, %.0f MB/s\n", done / 1073741824.0, s,
-                    s > 0 ? done / 1e6 / s : 0.0);
+        ps5lm::log_line("read-bench sequential 8 MiB: %.2f GiB in %.1f s, %.0f MB/s\n", done / 1073741824.0, s,
+                        s > 0 ? done / 1e6 / s : 0.0);
         if (fd >= 0) {
             close(fd);
         }
@@ -181,22 +182,22 @@ void probe_read(std::string path) {
     for (const bool direct : { false, true }) {
         const int fd = open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
         if (fd < 0) {
-            std::printf("ps5lm-app: read-bench %s: cannot open (%s)\n", direct ? "O_DIRECT" : "cached", strerror(errno));
+            ps5lm::log_line("read-bench %s: cannot open (%s)\n", direct ? "O_DIRECT" : "cached", strerror(errno));
             continue;
         }
         for (const size_t piece : { (size_t) 64 << 10, (size_t) 256 << 10, (size_t) 1 << 20, (size_t) 4 << 20 }) {
             for (const int threads : { 1, 4 }) {
                 const ReadResult r = read_random(fd, size, piece, threads, 3.0);
                 const size_t n = r.ms.size();
-                std::printf("ps5lm-app: read-bench random %s %4zu KiB x%d: %.0f MB/s, %.0f reads/s, %.2f ms median, %.2f ms p99%s%s\n",
-                            direct ? "O_DIRECT" : "cached  ", piece >> 10, threads, r.seconds > 0 ? r.bytes / 1e6 / r.seconds : 0.0,
-                            r.seconds > 0 ? n / r.seconds : 0.0, n ? r.ms[n / 2] : 0.0, n ? r.ms[std::min(n - 1, n * 99 / 100)] : 0.0,
-                            r.err ? ", stopped: " : "", r.err ? strerror(r.err) : "");
+                ps5lm::log_line("read-bench random %s %4zu KiB x%d: %.0f MB/s, %.0f reads/s, %.2f ms median, %.2f ms p99%s%s\n",
+                                direct ? "O_DIRECT" : "cached  ", piece >> 10, threads, r.seconds > 0 ? r.bytes / 1e6 / r.seconds : 0.0,
+                                r.seconds > 0 ? n / r.seconds : 0.0, n ? r.ms[n / 2] : 0.0, n ? r.ms[std::min(n - 1, n * 99 / 100)] : 0.0,
+                                r.err ? ", stopped: " : "", r.err ? strerror(r.err) : "");
             }
         }
         close(fd);
     }
-    std::printf("ps5lm-app: read-bench done\n");
+    ps5lm::log_line("read-bench done\n");
 }
 
 void probe_memory(bool model_loaded) {
@@ -207,12 +208,12 @@ void probe_memory(bool model_loaded) {
     sceKernelAvailableDirectMemorySize(0, pool, 2u << 20, &start, &largest);
     sceKernelConfiguredFlexibleMemorySize(&flex);
     sceKernelAvailableFlexibleMemorySize(&flex_free);
-    std::printf("ps5lm-app: memory-probe: direct pool %.4f GiB (the system keeps %.4f GiB of a nominal 12), largest free "
-                "block %.2f GiB at 0x%llx; flexible %zu MiB, %zu MiB free\n",
-                pool / 1073741824.0, 12.0 - pool / 1073741824.0, largest / 1073741824.0, (unsigned long long) start,
-                flex >> 20, flex_free >> 20);
+    ps5lm::log_line("memory-probe: direct pool %.4f GiB (the system keeps %.4f GiB of a nominal 12), largest free "
+                    "block %.2f GiB at 0x%llx; flexible %zu MiB, %zu MiB free\n",
+                    pool / 1073741824.0, 12.0 - pool / 1073741824.0, largest / 1073741824.0, (unsigned long long) start,
+                    flex >> 20, flex_free >> 20);
     if (model_loaded) {
-        std::printf("ps5lm-app: memory-probe: a model is loaded; not allocating (unload it to measure the usable block)\n");
+        ps5lm::log_line("memory-probe: a model is loaded; not allocating (unload it to measure the usable block)\n");
         return;
     }
     // The largest block that really allocates and maps, in 64 MiB steps down
@@ -232,11 +233,11 @@ void probe_memory(bool model_loaded) {
             sceKernelMunmap(addr, len);
         }
         sceKernelReleaseDirectMemory(phys, len);
-        std::printf("ps5lm-app: memory-probe: allocated %.2f GiB in one block%s\n", len / 1073741824.0,
-                    mapped == 0 ? ", mapped and touched" : ", but mapping it failed");
+        ps5lm::log_line("memory-probe: allocated %.2f GiB in one block%s\n", len / 1073741824.0,
+                        mapped == 0 ? ", mapped and touched" : ", but mapping it failed");
         return;
     }
-    std::printf("ps5lm-app: memory-probe: no 64 MiB block allocates\n");
+    ps5lm::log_line("memory-probe: no 64 MiB block allocates\n");
 #else
     (void) model_loaded;
 #endif

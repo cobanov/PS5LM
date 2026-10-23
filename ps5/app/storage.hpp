@@ -20,6 +20,16 @@ namespace ps5lm {
 constexpr const char * kFullRoot = "/data/PS5LM";
 constexpr const char * kAppRoot  = "/download0/PS5LM";
 
+// The title's own folders as this process sees them. In the sandbox they are
+// /app0 (the app as installed) and /download0. OnionHEN answers the request
+// for /data with a full app jailbreak that also moves the process to the real
+// root (kernel_set_proc_rootdir in its daemon_jailbreak.cpp), where they are
+// /mnt/sandbox/<title id>_<slot>/app0 and .../download0. Before this the
+// fonts did not load there and the screen stayed black (#23, #32).
+std::string title_id();                               // from sce_sys/param.json: read it in the sandbox
+void        find_sandbox(const std::string & title);  // once /data is open, before any thread starts
+std::string sandbox_path(const std::string & path);   // "/app0/assets", in the sandbox or out of it
+
 // The folder in use, chosen once at start (main.cpp) before any thread reads it.
 void                set_data_root(const std::string & root);
 const std::string & data_root();

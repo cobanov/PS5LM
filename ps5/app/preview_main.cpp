@@ -263,10 +263,10 @@ int main(int argc, char ** argv) {
     std::vector<std::string> app_log, llama_log;
     for (int i = 0; i < 60; ++i) {
         app_log.push_back("[ps5-present-perf] calls=2500 failures=0 warmup_frames=30 idle_ms=0.000898 flip_ms=0.000889");
-        app_log.push_back("ps5lm-app: model Qwen3.8-27B-UD-IQ2_XXS.gguf (qwen35): 64k context, q8_0 cache: 9.9 of 11.0 GiB");
+        app_log.push_back("22:56:01 ps5lm-app: model Qwen3.8-27B-UD-IQ2_XXS.gguf (qwen35): 64k context, q8_0 cache: 9.9 of 11.0 GiB");
         llama_log.push_back("7.15.902.312 I slot print_timing: id  0 | task 646 | n_gen =    162, tg =  20.44 t/s");
     }
-    app_log.push_back("ps5lm-app: accept failed, errno 53");
+    app_log.push_back("22:58:14 ps5lm-app: accept failed, errno 53");
     app_log.push_back("W srv          stop: cancel task, id_task = 22182");
     dash.set_logs(app_log, llama_log);
     ps5lm::MarketView mv;
