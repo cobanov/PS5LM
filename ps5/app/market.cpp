@@ -649,15 +649,26 @@ bool Market::fetch(Download & d) {
         publish(true);
         return false;
     }
-    // Whole: check it.
+    // Whole: check it. The queue is saved first, with `resume` at the file's
+    // size, so a restart during the check repeats only the check, not the last
+    // piece; and the row says how far the check has read (#30).
     d.note = "Checking the SHA-256";
-    publish(false);
+    publish(true);
     sha256_t h;
     sha256_init(&h);
     if (FILE * in = std::fopen(part.c_str(), "rb")) {
         std::vector<unsigned char> buf(8u << 20);
+        uint64_t read = 0;
+        auto shown = std::chrono::steady_clock::now();
         for (size_t n; (n = std::fread(buf.data(), 1, buf.size(), in)) > 0;) {
             sha256_update(&h, buf.data(), n);
+            read += n;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - shown >= std::chrono::seconds(1)) {
+                shown = now;
+                d.note = "Checking the SHA-256, " + std::to_string((int) (100.0 * (double) read / (double) d.bytes)) + "%";
+                publish(false);
+            }
         }
         std::fclose(in);
     }
