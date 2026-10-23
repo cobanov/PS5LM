@@ -130,8 +130,10 @@ constexpr const char * kAssets      = "/app0/assets";
 constexpr int          kPort        = 8081;
 // Both homes' models are listed: a model saved to the app's storage still
 // loads once full storage opens.
-const std::vector<std::string> kModelDirs = { "/data/PS5LM/models", "/download0/PS5LM/models", "/mnt/ext0/PS5LM/models",
-                                              "/mnt/usb0/PS5LM/models", "/mnt/usb1/PS5LM/models", "/mnt/usb0", "/mnt/usb1" };
+std::vector<std::string> model_dirs() {
+    return { "/data/PS5LM/models", sandbox_path("/download0/PS5LM/models"), "/mnt/ext0/PS5LM/models",
+             "/mnt/usb0/PS5LM/models", "/mnt/usb1/PS5LM/models", "/mnt/usb0", "/mnt/usb1" };
+}
 
 // The last lines of a log, up to about 64 KiB of it, oldest first.
 std::vector<std::string> tail_lines(const std::string & path) {
@@ -190,10 +192,11 @@ bool data_open() {
 
 // How /data ended up, for the log. A refusal is remembered in /download0:
 // the next starts (one per model change) still ask, but wait 2 s, not 10.
-std::string open_data() {
+std::string open_data(const std::string & title) {
     constexpr const char * kRefused = "/download0/PS5LM/data-closed";
     if (data_open()) {
-        unlink(kRefused);
+        find_sandbox(title);
+        unlink(sandbox_path(kRefused).c_str());
         return "open";
     }
     const int err = errno;
@@ -203,7 +206,8 @@ std::string open_data() {
     for (int i = 1; i <= (again ? 8 : 40); i++) {  // OnionHEN answered in about 3 s
         sceKernelUsleep(250000);
         if (data_open()) {
-            unlink(kRefused);
+            find_sandbox(title);  // OnionHEN's answer also leaves the sandbox
+            unlink(sandbox_path(kRefused).c_str());
             return "opened by the HEN after " + std::to_string(i / 4.0).substr(0, 4) + " s";
         }
     }
@@ -641,7 +645,7 @@ struct Models {
         const char * kv = settings.kv_type == "auto" ? nullptr : settings.kv_type.c_str();
         // Also every folder the downloads can go to: the M.2 slot or a USB drive is
         // not always ext0, usb0 or usb1 (#43).
-        std::vector<std::string> dirs = kModelDirs;
+        std::vector<std::string> dirs = model_dirs();
         std::vector<std::string> saves = { settings.download_dir };
         for (const auto & d : mounted_drives()) {
             saves.push_back(d.models);
@@ -774,7 +778,7 @@ pthread_t start_thread(std::function<void()> & fn) {
 
 bool load_font(hui::gfx::Renderer & renderer, const char * name, hui::gfx::Font * font, hui::ui::FontRef * ref) {
     std::string data;
-    const std::string path = std::string(kAssets) + "/fonts/" + name;
+    const std::string path = sandbox_path(kAssets) + "/fonts/" + name;
     if (!hui::save::read_file(path, &data) || !font->load(data)) {
         ps5lm::log_line("font %s failed\n", name);
         return false;
@@ -789,7 +793,8 @@ bool load_font(hui::gfx::Renderer & renderer, const char * name, hui::gfx::Font 
 int main(int, char **) {
     // /data first: the log, the settings and the models live there when the
     // HEN opens it, else in the app's own storage, /download0/PS5LM.
-    const std::string data = open_data();
+    const std::string title = title_id();
+    const std::string data = open_data(title);
     const bool full = data.rfind("closed", 0) != 0;
     set_data_root(full ? kFullRoot : kAppRoot);
     g_files = Files(data_root());
@@ -804,6 +809,11 @@ int main(int, char **) {
     ps5lm::log_line("version " PS5LM_VERSION "\n");
     ps5lm::log_line("/data %s\n", data.c_str());
     ps5lm::log_line("files in %s\n", storage_line(data).c_str());
+    if (!sandbox_path("").empty()) {
+        ps5lm::log_line("the HEN moved the app out of its sandbox; /app0 is %s\n", sandbox_path("/app0").c_str());
+    } else if (access("/app0/eboot.bin", F_OK) != 0) {
+        ps5lm::log_line("/app0 is not visible, and no /mnt/sandbox/%s_* holds the app\n", title.c_str());
+    }
     // The first start without full storage asks on the screen what to do;
     // the notification is for a screen that does not come up.
     if (!full && storage_choice().empty()) {
@@ -1077,7 +1087,7 @@ int main(int, char **) {
     hui::ps5::AudioOut audio_out;
     audio_out.start(mixer);
     hui::audio::SoundBank sounds;
-    sounds.load(std::string(kAssets) + "/audio/sfx");
+    sounds.load(sandbox_path(kAssets) + "/audio/sfx");
 
     dash.set_busy("");
     Market    market;
