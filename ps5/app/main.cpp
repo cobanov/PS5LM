@@ -480,7 +480,19 @@ struct Models {
     static std::vector<ModelRow> plan_rows(const Settings & settings, double budget_gib, const std::string & running) {
         std::vector<ModelRow> rows;
         const char * kv = settings.kv_type == "auto" ? nullptr : settings.kv_type.c_str();
-        for (const auto & path : find_models(kModelDirs)) {
+        // Also every folder the downloads can go to: the M.2 slot or a USB drive is
+        // not always ext0, usb0 or usb1 (#43).
+        std::vector<std::string> dirs = kModelDirs;
+        std::vector<std::string> saves = { settings.download_dir };
+        for (const auto & d : mounted_drives()) {
+            saves.push_back(d.models);
+        }
+        for (const auto & d : saves) {
+            if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) {
+                dirs.push_back(d);
+            }
+        }
+        for (const auto & path : find_models(dirs)) {
             const ModelInfo m = read_model_info(path);
             ModelRow row;
             row.file = path;

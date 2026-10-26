@@ -21,6 +21,12 @@ v0.1.x are the upstream payload releases by cobanov.
   compute graph with the eval callback that llama.cpp already has, so no work is repeated and no
   request pays for it unless it asks.
 
+### Fixed
+- Models saved to an M.2 or USB drive show up in the library wherever that drive is mounted. The
+  library looked only in `/mnt/ext0`, `/mnt/usb0` and `/mnt/usb1`, while downloads can go to any
+  drive the exporter reports; it now also reads the download folder and every mounted drive's
+  `PS5LM/models` (#43).
+
 ## [0.9.1] - 2026-10-20
 
 ### Fixed
