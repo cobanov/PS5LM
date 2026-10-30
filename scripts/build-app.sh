@@ -20,6 +20,7 @@ radv="$vk/.deps/native/radv-release"
 archive="$radv/lib/libvulkan_radeon.ps5.a"
 tool="$vk/build/host/ps5-native-tool"
 llama="$root/third_party/llama.cpp"
+ftpsrv="$root/third_party/ftpsrv"
 out="$root/build/app-ps5"
 headers="$root/.deps/ps5-vk-headers"
 # ps5-opengl comes pinned and sha256-checked through the submodule's own script.
@@ -62,6 +63,17 @@ for p in "$root"/patches/*.patch; do
     git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
 done
 
+# ftpsrv (drakmor's 1.16-ng-stable), PS5LM's copy: a payload the app sends to
+# elfldr when no ftpsrv answers (connect_ftp_writer in ps5/app/ftp_writer.hpp).
+# Payloads write to /data at full speed, the title does not after 2.2 GB.
+# patches/ftpsrv puts it on 127.0.0.1:2123 only, as ps5lm-ftpsrv.
+for p in "$root"/patches/ftpsrv/*.patch; do
+    git -C "$ftpsrv" apply --reverse --check "$p" 2>/dev/null || git -C "$ftpsrv" apply "$p"
+done
+mkdir -p "$out/ftpsrv"
+make -C "$ftpsrv" -f Makefile.ps5 PS5_PAYLOAD_SDK="$sdk" ELF="$out/ftpsrv/ps5lm-ftpsrv.elf" > "$out/ftpsrv.build.log" 2>&1 ||
+    { tail -30 "$out/ftpsrv.build.log" >&2; exit 1; }
+
 flags="-DSUBPROCESS_HAVE_CWD=0 -I$headers/include"
 # llama.cpp throws, catches and uses dynamic_cast; the PS5 target turns
 # exceptions and RTTI off by default.
@@ -95,6 +107,7 @@ cxx -fexceptions -fcxx-exceptions -c "$root/ps5/app/model_plan.cpp" -o "$obj/mod
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/settings.cpp" -o "$obj/settings.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/fetch.cpp" -o "$obj/fetch.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/market.cpp" -o "$obj/market.o"
+cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/ftp_writer.cpp" -o "$obj/ftp_writer.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -I "$root/ps5/app" -I "$root/third_party/ps5-homebrew-ui/src" -c "$root/ps5/app/activity.cpp" -o "$obj/activity.o"
 "$root/ps5/app/ps5cc" -O2 -I "$llama/vendor/hash" -c "$llama/vendor/hash/sha256/sha256.c" -o "$obj/sha256.o"
 "$root/ps5/app/ps5cc" -O2 -c "$root/ps5/app/compat_app.c" -o "$obj/compat_app.o"
@@ -194,7 +207,7 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \
@@ -246,5 +259,12 @@ mkdir -p "$app/payloads"
 cp "$exporter" "$app/payloads/ps5-exporter.elf"
 printf '%s\n' "ps5-exporter v0.2.0 by Marice, GPL-3.0-or-later: https://github.com/Marice/ps5-exporter" \
     "Source: https://github.com/Marice/ps5-exporter/tree/v0.2.0" > "$app/payloads/ps5-exporter-NOTICE.txt"
+# ftpsrv (GPL-3.0-or-later), built above, with its licence and where its source is.
+cp "$out/ftpsrv/ps5lm-ftpsrv.elf" "$app/payloads/ps5lm-ftpsrv.elf"
+cp "$ftpsrv/LICENSE" "$app/payloads/ps5lm-ftpsrv-LICENSE.txt"
+printf '%s\n' "ftpsrv by John Törnblom and drakmor, GPL-3.0-or-later: https://github.com/drakmor/ftpsrv" \
+    "Source: https://github.com/drakmor/ftpsrv/tree/$(git -C "$ftpsrv" rev-parse HEAD) (1.16-ng-stable)," \
+    "with PS5LM's patches/ftpsrv/0001-loopback-only-for-ps5lm.patch: 127.0.0.1:2123 only, as ps5lm-ftpsrv." \
+    > "$app/payloads/ps5lm-ftpsrv-NOTICE.txt"
 "$tool" self --inspect --file "$app/eboot.bin" > /dev/null
 echo "build-app: $app ($(stat -c %s "$app/eboot.bin") bytes)"

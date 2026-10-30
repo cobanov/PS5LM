@@ -96,8 +96,8 @@ You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded
 | [kstuff-lite](https://github.com/EchoStretch/kstuff-lite) | the kernel patches homebrew runs on | required |
 | [etaHEN](https://github.com/etaHEN/etaHEN) | homebrew support | required |
 | [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus) | puts PS5LM on the home screen from `/data/homebrew` | required |
-| [elfldr](https://github.com/ps5-payload-dev/elfldr) (port 9021) | temperature, power and real free space, through ps5-exporter | recommended |
-| [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) (port 2121) | installing the app, copying models from a PC | recommended |
+| [elfldr](https://github.com/ps5-payload-dev/elfldr) (port 9021) | temperature, power and real free space, through ps5-exporter; full-speed downloads, through the app's own ftpsrv | recommended |
+| [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) (port 2121) | installing the app, copying models from a PC; downloads write through it when it runs | recommended |
 
 1. Download `ps5lm-app-vX.Y.Z.zip` from the [latest release](https://github.com/cobanov/PS5LM/releases/latest) and unzip it.
 2. Copy the `PPSA99575` folder to `/data/homebrew` over FTP. ShadowMountPlus adds **PS5LM** to the

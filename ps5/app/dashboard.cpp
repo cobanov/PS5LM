@@ -361,7 +361,7 @@ std::string download_line(const Download & d) {
         } else {
             std::snprintf(t, sizeof(t), "%.1f of %.1f GB, %.1f MB/s, %.0f min left", done, all, d.mbps, std::ceil(left_s / 60));
         }
-        return t;
+        return d.note.empty() ? std::string(t) : std::string(t) + ", " + d.note;  // the note: written without ftpsrv
     }
     std::snprintf(t, sizeof(t), "%.1f of %.1f GB", done, all);
     if (d.state == DownloadState::running) {

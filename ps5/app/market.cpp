@@ -2,6 +2,7 @@
 #include "market.hpp"
 
 #include "fetch.hpp"
+#include "ftp_writer.hpp"
 #include "model_plan.hpp"
 
 #include <nlohmann/json.hpp>
@@ -13,6 +14,7 @@ extern "C" {
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -420,6 +422,12 @@ void Market::worker() {
 // the line's speed. What is done from the start of the file (`resume`) is
 // saved with the queue, so a dropped connection, a pause or a restart costs
 // at most the pieces in flight. The SHA-256 is checked once it is whole.
+//
+// The pieces go through ftpsrv when one answers (ftp_writer.hpp): the
+// title's own writes slow to about 1.2 MB/s after 2.2 GB, a payload's do not
+// (#41). Each piece is then held in memory until the ones before it are
+// written, and is written with REST/STOR at its place, so the file only
+// grows at its end; the first STOR, at `resume`, cuts off what lies past it.
 bool Market::fetch(Download & d) {
     constexpr uint64_t kPiece = 32ull << 20;
     const std::string part = part_path(d);
@@ -452,6 +460,14 @@ bool Market::fetch(Download & d) {
     if (d.resume > d.bytes || d.resume > file_size(part)) {
         d.resume = 0;  // not this file, or the partial file is gone
     }
+    FtpWriter ftp;
+    std::string ftp_error;
+    const bool via_ftp = connect_ftp_writer(ftp, ftp_error);
+    const std::string direct_note = via_ftp ? "" : "written without ftpsrv, slower after about 2 GB";
+    if (!via_ftp) {
+        std::printf("ps5lm-app: download %s: the app writes the file itself, which gets slow after about 2.2 GB (%s)\n",
+                    d.file.c_str(), ftp_error.c_str());
+    }
     const int fd = open(part.c_str(), O_WRONLY | O_CREAT, 0666);
     if (fd < 0) {
         d.state = DownloadState::failed;
@@ -463,12 +479,41 @@ bool Market::fetch(Download & d) {
     const size_t   pieces = (size_t) ((d.bytes - base + kPiece - 1) / kPiece);
     std::vector<uint8_t> state(pieces, 0);  // 0 to fetch, 1 in flight, 2 written
     std::mutex   m;
+    std::mutex   write_mutex;              // one STOR at a time
+    std::condition_variable written;       // a piece became 2
     std::atomic<uint64_t> received{ base };
     std::atomic<int>      failures{ 0 };   // in a row, across connections
     std::atomic<int>      waiting{ 0 };    // connections waiting to try again
     std::atomic<bool>     fatal{ false };
     std::string           last_error;
+    // Through ftpsrv: once the pieces before k are written, k at its place. A
+    // piece counts once ftpsrv confirmed it (226); a failed one is cut off by
+    // the next STOR at its start. One more try on a new connection (ftpsrv
+    // may have dropped an idle one), unless the disk is full.
+    const auto write_piece = [&](size_t k, uint64_t off, const std::vector<char> & buf, std::string & error) {
+        {
+            std::unique_lock<std::mutex> lock(m);
+            while (!std::all_of(state.begin(), state.begin() + (long) k, [](uint8_t s) { return s == 2; })) {
+                if (stop_ != 0 || fatal) {
+                    return false;
+                }
+                written.wait_for(lock, std::chrono::milliseconds(250));
+            }
+        }
+        std::lock_guard<std::mutex> lock(write_mutex);
+        if (ftp.write_at(part, off, buf.data(), buf.size(), error)) {
+            return true;
+        }
+        if (ftp_disk_full(error)) {
+            return false;
+        }
+        std::printf("ps5lm-app: download %s: piece at %llu: %s, writing it again\n", d.file.c_str(),
+                    (unsigned long long) off, error.c_str());
+        error.clear();
+        return ftp.write_at(part, off, buf.data(), buf.size(), error);
+    };
     const auto worker = [&](int id) {
+        std::vector<char> buf;  // the piece, until ftpsrv has it
         for (;;) {
             size_t k = pieces;
             {
@@ -488,34 +533,52 @@ bool Market::fetch(Download & d) {
             char range[64];
             std::snprintf(range, sizeof(range), "bytes=%llu-%llu", (unsigned long long) off, (unsigned long long) (off + len - 1));
             uint64_t got = 0;
+            buf.clear();
+            if (via_ftp) {
+                buf.reserve(len);
+            }
             const FetchResult r = kGet(id, url, range, [&](const char * p, size_t n) {
-                if (stop_ != 0 || got + n > len || pwrite(fd, p, n, (off_t) (off + got)) != (ssize_t) n) {
+                if (stop_ != 0 || got + n > len) {
+                    return false;
+                }
+                if (via_ftp) {
+                    buf.insert(buf.end(), p, p + n);
+                } else if (pwrite(fd, p, n, (off_t) (off + got)) != (ssize_t) n) {
                     return false;
                 }
                 got += n;
                 received += n;
                 return true;
             });
+            std::string write_error;
+            const bool fetched = got == len && r.status == 206;
+            const bool wrote = fetched && (!via_ftp || write_piece(k, off, buf, write_error));
             std::lock_guard<std::mutex> lock(m);
-            if (got == len && r.status == 206) {
+            if (wrote) {
                 state[k] = 2;
                 failures = 0;
+                written.notify_all();
                 continue;
             }
             state[k] = 0;  // again, from its start
             received -= got;
-            if (stop_ != 0) {
+            if (stop_ != 0 || fatal) {
                 return;
             }
             char text[200];
-            std::snprintf(text, sizeof(text), "%s%s%s", r.status > 0 ? ("HTTP " + std::to_string(r.status)).c_str() : "",
-                          r.status > 0 && !r.error.empty() ? ", " : "", r.error.c_str());
+            if (fetched) {
+                std::snprintf(text, sizeof(text), "%s", write_error.c_str());
+            } else {
+                std::snprintf(text, sizeof(text), "%s%s%s", r.status > 0 ? ("HTTP " + std::to_string(r.status)).c_str() : "",
+                              r.status > 0 && !r.error.empty() ? ", " : "", r.error.c_str());
+            }
             last_error = text;
             const int f = ++failures;
             std::printf("ps5lm-app: download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
                         (unsigned long long) off, (unsigned long long) got, text);
             // A 4xx other than 408/429 will not get better by asking again.
-            if ((r.status >= 400 && r.status < 500 && r.status != 408 && r.status != 429) || r.status == 200 || f > 20) {
+            if ((r.status >= 400 && r.status < 500 && r.status != 408 && r.status != 429) || r.status == 200 || f > 20 ||
+                (fetched && ftp_disk_full(write_error))) {
                 fatal = true;
                 return;
             }
@@ -556,7 +619,7 @@ bool Market::fetch(Download & d) {
                 d.note = "Connection lost (" + last_error + "); trying again, attempt " + std::to_string((int) failures);
             } else {
                 d.state = DownloadState::running;
-                d.note.clear();
+                d.note = direct_note;
             }
         }
         const auto now = std::chrono::steady_clock::now();
@@ -577,6 +640,7 @@ bool Market::fetch(Download & d) {
     }
     fsync(fd);
     close(fd);
+    ftp.close();
     d.mbps = 0;
     if (stop_ != 0 || fatal) {
         d.state = stop_ == 1 ? DownloadState::paused : DownloadState::failed;

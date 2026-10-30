@@ -19,6 +19,9 @@ export LLVM_CONFIG="$llvm_config"
 for tool in git clang clang++ make wget unzip sha256sum timeout python3 cmake ninja meson rsync glslangValidator glslc pkg-config curl ffmpeg; do
     command -v "$tool" >/dev/null || { echo "title-check: missing $tool" >&2; exit 2; }
 done
+# Host check, no console or server: FtpWriter refuses a path with a line break.
+clang++ -std=c++17 -O1 ps5/app/ftp_writer_test.cpp ps5/app/ftp_writer.cpp -o "$output/tools/ftp_writer_test"
+"$output/tools/ftp_writer_test"
 ui="$root/third_party/ps5-homebrew-ui"
 ui_revision=$(git ls-tree HEAD third_party/ps5-homebrew-ui | awk '{print $3}')
 [[ -f "$ui/tools/fetch-opengl-sdk.sh" && $(git -C "$ui" rev-parse HEAD) == "$ui_revision" ]] || {
@@ -28,6 +31,10 @@ llama="$root/third_party/llama.cpp"
 llama_revision=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
 [[ -f "$llama/CMakeLists.txt" && $(git -C "$llama" rev-parse HEAD) == "$llama_revision" ]] || {
     echo 'title-check: initialize the pinned llama.cpp submodule first' >&2; exit 2;
+}
+ftpsrv_revision=$(git ls-tree HEAD third_party/ftpsrv | awk '{print $3}')
+[[ -f "$root/third_party/ftpsrv/Makefile.ps5" && $(git -C "$root/third_party/ftpsrv" rev-parse HEAD) == "$ftpsrv_revision" ]] || {
+    echo 'title-check: initialize the pinned ftpsrv submodule first' >&2; exit 2;
 }
 vk="$PS5LM_NATIVE_SOURCES/PS5_Vulkan"
 sdk_fork="$PS5LM_NATIVE_SOURCES/PS5_PayloadSDK"
@@ -132,7 +139,7 @@ from pathlib import Path
 import sys
 
 output, app = map(Path, sys.argv[1:3])
-files = ('eboot.bin', 'sce_module/libc.prx', 'sce_sys/param.json', 'sce_sys/icon0.png', 'sce_sys/pic0.dds', 'sce_sys/pic1.dds')
+files = ('eboot.bin', 'payloads/ps5lm-ftpsrv.elf', 'sce_module/libc.prx', 'sce_sys/param.json', 'sce_sys/icon0.png', 'sce_sys/pic0.dds', 'sce_sys/pic1.dds')
 result = {
     'status': 'passed',
     'scope': 'Complete native title cross-build and static ELF/FSELF validation; NOT console/Vulkan execution',

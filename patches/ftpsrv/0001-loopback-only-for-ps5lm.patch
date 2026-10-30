@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps5lm <ps5lm@localhost>
+Date: Wed, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] PS5LM's copy: 127.0.0.1:2123 only, a process name of its own
+
+The title starts this copy (ps5/app/ftp_writer.cpp, connect_ftp_writer) when no
+ftpsrv answers on 2121, to write model downloads at payload speed. It listens on
+loopback only, for control and passive data connections, so it opens nothing
+on the LAN. Port 2123 and the name ps5lm-ftpsrv keep it apart from a user's
+own ftpsrv on 2121 and PS5SD's ps5sd-ftpsrv on 2122: none fails to bind, and
+none kills another at start.
+
+Ported from PS5SD's patches/ftpsrv/0001-loopback-only-for-ps5sd.patch.
+
+---
+ cmd.c           |  2 +-
+ main-prospero.c |  8 +++++---
+ srv.c           | 11 ++++++-----
+ 3 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/cmd.c b/cmd.c
+index ca95db9..a282169 100644
+--- a/cmd.c
++++ b/cmd.c
+@@ -543,7 +543,7 @@ ftp_listen_passive(ftp_env_t *env, uint16_t *port_out) {
+ 
+   memset(&sockaddr, 0, sockaddr_len);
+   sockaddr.sin_family = AF_INET;
+-  sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
++  sockaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   sockaddr.sin_port = htons(0);
+ 
+   if(bind(env->passive_fd, (struct sockaddr *)&sockaddr, sockaddr_len) != 0) {
+diff --git a/main-prospero.c b/main-prospero.c
+index ff4da9d..68dd2ce 100644
+--- a/main-prospero.c
++++ b/main-prospero.c
+@@ -78,13 +78,15 @@ find_pid(const char* name) {
+  **/
+ int
+ main(int argc, char* argv[]) {
+-  uint16_t port = 2121;
++  uint16_t port = 2123;
+   int notify_user = 1;
+   int rc;
+   pid_t pid;
+   int c;
+ 
+-  syscall(SYS_thr_set_name, -1, "ftpsrv.elf");
++  // PS5LM: a name of its own, so this copy and a user's ftpsrv.elf on
++  // 2121 never kill each other at start (find_pid below).
++  syscall(SYS_thr_set_name, -1, "ps5lm-ftpsrv");
+ 
+   while((c=getopt(argc, argv, "p:h")) != -1) {
+     switch(c) {
+@@ -105,7 +107,7 @@ main(int argc, char* argv[]) {
+     }
+   }
+ 
+-  while((pid=find_pid("ftpsrv.elf")) > 0) {
++  while((pid=find_pid("ps5lm-ftpsrv")) > 0) {
+     if(kill(pid, SIGKILL)) {
+       FTP_LOG_PERROR("kill");
+       return EXIT_FAILURE;
+diff --git a/srv.c b/srv.c
+index 9753016..e0c0e27 100644
+--- a/srv.c
++++ b/srv.c
+@@ -481,10 +481,6 @@ ftp_serve(uint16_t port, int notify_user) {
+       continue;
+     }
+ 
+-    if(notify_user) {
+-      notify("Serving FTP on %s:%d (%s)", ip, port, ifa->ifa_name);
+-    }
+-
+     ifaddr_wait = 0;
+   }
+ 
+@@ -494,6 +490,11 @@ ftp_serve(uint16_t port, int notify_user) {
+     return 0;
+   }
+ 
++  // PS5LM: for the title's own writes only, so on loopback.
++  if(notify_user) {
++    notify("PS5LM: writing through ftpsrv on 127.0.0.1:%d", port);
++  }
++
+   if((srvfd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+     FTP_LOG_PERROR("socket");
+     return -1;
+@@ -507,7 +508,7 @@ ftp_serve(uint16_t port, int notify_user) {
+ 
+   memset(&server_addr, 0, sizeof(server_addr));
+   server_addr.sin_family = AF_INET;
+-  server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++  server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   server_addr.sin_port = htons(port);
+ 
+   if(bind(srvfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {

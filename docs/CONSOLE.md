@@ -67,6 +67,37 @@ Locking the weights (`-lm mlock`) fixes it: Qwen3.5 2B went from 0.9 to **8.5 to
 - The kernel caps `SO_RCVBUF` at 64 KB, whatever is asked for. With the Hugging Face CDN ~150 ms away, one connection tops out at 0.9 MB/s.
 - 16 connections fetching 8 MiB pieces in parallel: **about 12.5 MB/s** (Qwen3.5 4B, 2.6 GB, in 217 s).
 
+### The title's writes slow down after about 2 GB (#41)
+
+The app (a title) wrote downloads at 15 to 18 MB/s, then at about 1.2 MB/s after the first ~2.2 GB.
+The limit is on the title's process, not the disk: in PS5SD's measurements, while the title's writes
+were down to 1 to 2 MB/s, ftpsrv (a payload) wrote to `/data` at 78 to 89 MB/s in the same minute.
+
+So `Market::fetch` has ftpsrv write the file (`ps5/app/ftp_writer.cpp`, ported from
+[PS5SD](https://github.com/Darkatek7/PS5SD)). Each 32 MiB piece is held in memory until the ones
+before it are written, then sent at its place with `REST <offset>` and `STOR <part path>` over one
+loopback FTP connection. ftpsrv's `REST n` + `STOR` cuts the file at n and writes from there; a
+`REST` past the end is refused (`551 Restart point beyond EOF`). A piece counts as done once ftpsrv
+answers `226`, so `resume` only ever covers bytes in the file, and the first `STOR` of a resumed
+download, at `resume`, cuts off whatever lies past it. For an ftpsrv without `EPSV` (up to 0.15, which
+answers `502`) the data connection falls back to `PASV`. The SHA-256 check and the rename stay the
+title's own; it can read, rename and unlink the files ftpsrv makes (uid 0, mode 0666).
+
+Which ftpsrv:
+
+- **2121**, the user's, once one test write of a byte to `/data/PS5LM/.ps5lm-ftp-check` through it
+  worked (once per run of the app).
+- Else **2123**, PS5LM's own copy (`/app0/payloads/ps5lm-ftpsrv.elf`, from `third_party/ftpsrv` at
+  1.16-ng-stable with `patches/ftpsrv`). It listens on `127.0.0.1` only, for control and passive data
+  connections, and runs as `ps5lm-ftpsrv`. Stock ftpsrv kills every process with its own name when it
+  starts; with a name of its own this copy leaves the user's `ftpsrv.elf` on 2121 and PS5SD's
+  `ps5sd-ftpsrv` on 2122 alone. When nothing listens on 2123, the app sends the ELF to elfldr on 9021,
+  at most once per run, and waits up to 5 s for it. It shows "PS5LM: writing through ftpsrv on
+  127.0.0.1:2123" and stays up until the console restarts. Something that listens on 2123 but does not
+  answer is taken as busy and not started again.
+- Else the app writes the file itself, as before, and the download line says "written without
+  ftpsrv".
+
 At exit, Sony's libc prints `[SceLibc] A heap error is detected` (SceLibcInternalHeap) after all work is done. After `main`, the SDK's start code unloads the modules the payload loaded and calls Sony's `exit()`, which runs the C++ static destructors while other threads may still run; the tools now leave through `_Exit` instead (`ps5/compat/exit.cpp`). Not yet checked on the console (#3).
 
 ## shsrv quirks

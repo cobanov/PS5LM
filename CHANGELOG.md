@@ -22,6 +22,14 @@ v0.1.x are the upstream payload releases by cobanov.
   request pays for it unless it asks.
 
 ### Fixed
+- **Downloads keep their speed past 2 GB.** The console slows a title's own writes to about
+  1.2 MB/s after the first ~2.2 GB, while a payload's keep going, so the app now writes each piece
+  through a loopback ftpsrv: in file order, with `REST`/`STOR` at its place, done once ftpsrv answers
+  `226`. It uses the user's ftpsrv on 2121 when a test write through it works, else its own copy,
+  `ps5lm-ftpsrv` on `127.0.0.1:2123`, which it sends to elfldr when needed and which leaves other
+  ftpsrv copies on 2121 and 2122 running. With an ftpsrv that has no `EPSV` it uses `PASV`. When
+  no ftpsrv answers, the app writes the file itself as before. Ported from
+  [PS5SD](https://github.com/Darkatek7/PS5SD) (#41).
 - Models saved to an M.2 or USB drive show up in the library wherever that drive is mounted. The
   library looked only in `/mnt/ext0`, `/mnt/usb0` and `/mnt/usb1`, while downloads can go to any
   drive the exporter reports; it now also reads the download folder and every mounted drive's
