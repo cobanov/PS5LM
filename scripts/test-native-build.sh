@@ -96,17 +96,19 @@ timeout 1800 bash "$vk/tools/build-radv.sh" release
 # make libc already built this exact host tool, without the unrelated demo title.
 mkdir -p "$vk/build/host"
 cp "$vk/build/runtime-shim/ps5-native-tool" "$vk/build/host/ps5-native-tool"
-# The original OpenGL release was removed. Use the mirror documented in BUILDING.md,
-# with the original archive hash; the pinned UI fetcher also verifies every SDK file.
+# The original OpenGL release and its mirror were removed. PS5LM's deps-ps5-opengl-1.0.0
+# release holds the extracted SDK, repacked (see BUILDING.md); the pinned UI fetcher
+# below checks the SDK manifest's hash and every file against it.
 glcache="$ui/.deps/ps5-opengl"
-glarchive="$glcache/ps5-opengl-sdk-1.0.0.tar.gz"
+glarchive="$glcache/ps5-opengl-sdk-1.0.0-extracted.tar.gz"
 if [[ ! -f "$glcache/ps5-opengl-sdk-1.0.0/sdk/manifest.sha256" ]]; then
     mkdir -p "$glcache"
     curl -fL --retry 2 --max-time 300 \
-        https://github.com/MyLuxy/overdrive-deps/releases/download/ps5-opengl-v1.0.0/ps5-opengl-sdk-1.0.0.tar.gz \
+        https://github.com/cobanov/PS5LM/releases/download/deps-ps5-opengl-1.0.0/ps5-opengl-sdk-1.0.0.tar.gz \
         -o "$glarchive.part"
-    echo "f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5  $glarchive.part" | sha256sum --check --status
-    mv "$glarchive.part" "$glarchive"
+    echo "a3ce70a1d3278a2367c3135f034d4925dc85cc4bda30916f44aa474d37241053  $glarchive.part" | sha256sum --check --status
+    tar -xzf "$glarchive.part" -C "$glcache"
+    rm -f "$glarchive.part"
 fi
 glsdk=$(bash "$ui/tools/fetch-opengl-sdk.sh")
 export PS5_OPENGL_SDK="$glsdk"
