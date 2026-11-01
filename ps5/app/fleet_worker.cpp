@@ -16,26 +16,24 @@
 namespace ps5lm {
 
 FleetWorkerConfig read_fleet_worker_config(const char * path) {
-    struct stat info = {};
-    if (lstat(path, &info) != 0) {
-        if (errno == ENOENT) {
-            return {};  // Ordinary PS5LM until explicitly opted in.
-        }
-        return { FleetWorkerConfig::invalid, "", std::string("Cannot read fleet-worker.txt: ") + std::strerror(errno) };
-    }
-    if (!S_ISREG(info.st_mode)) {
-        return { FleetWorkerConfig::invalid, "", "fleet-worker.txt must be a regular file, not a link or device" };
-    }
-    // Nonblocking open prevents a replaced FIFO from hanging the title before
-    // the status/quit loop starts. Check the opened file, not just its pathname.
+    // No lstat: a PS5 title gets EPERM from it (seen on a console). Opening with
+    // O_NOFOLLOW refuses a link (ELOOP), O_NONBLOCK keeps a FIFO from hanging the
+    // title before the status/quit loop starts, and fstat checks the opened file.
     int flags = O_RDONLY | O_NONBLOCK;
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
 #endif
     const int fd = open(path, flags);
     if (fd < 0) {
+        if (errno == ENOENT) {
+            return {};  // Ordinary PS5LM until explicitly opted in.
+        }
+        if (errno == ELOOP) {
+            return { FleetWorkerConfig::invalid, "", "fleet-worker.txt must be a regular file, not a link or device" };
+        }
         return { FleetWorkerConfig::invalid, "", std::string("Cannot open fleet-worker.txt: ") + std::strerror(errno) };
     }
+    struct stat info = {};
     if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
         close(fd);
         return { FleetWorkerConfig::invalid, "", "fleet-worker.txt changed or is not a regular file" };
