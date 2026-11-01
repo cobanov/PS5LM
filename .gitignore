@@ -16,3 +16,7 @@ models/
 
 # the app's home screen backgrounds, made from ps5/app/sce_sys/source by scripts/build-app.sh
 ps5/app/sce_sys/*.dds
+
+# Python bytecode from the fleet controller and its tests
+__pycache__/
+*.pyc

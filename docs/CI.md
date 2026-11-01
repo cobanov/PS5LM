@@ -9,10 +9,16 @@ are cancelled. There are two independent jobs:
   GGUF `model_plan_test.cpp`, and regressions for dashboard compiler job limits
   and propagation of failed background compilers. No submodule or model download
   is needed for these checks.
-- **Full PS5 title cross-build** (45-minute limit, two compiler jobs): bootstrap
-  the public SDK, reproduce clean-room `libc.prx`, build patched RADV and the
-  existing llama-server/native dashboard, package the title folder, and inspect
-  its ELF/FSELF structure and integrity. It does not execute the resulting title.
+- **Full PS5 title cross-build** (45-minute limit, two compiler jobs), once for
+  each build variant: `default`, and `fleet` with `PS5LM_FLEET=1` (the RPC worker
+  build, [FLEET.md](FLEET.md)). Each bootstraps the public SDK, reproduces
+  clean-room `libc.prx`, builds patched RADV and llama-server/native dashboard,
+  packages the title folder, and inspects its ELF/FSELF structure and integrity.
+  It does not execute the resulting title.
+
+[`fleet-host.yml`](../.github/workflows/fleet-host.yml) runs the fleet's host tests
+and a real two-worker CPU RPC inference (`scripts/test-fleet.sh --rpc`), only when
+the fleet's own files or the llama.cpp patches change.
 
 The second job downloads build tools, source dependencies and checksum-verified
 public SDK archives. It does **not** download a trained model or proprietary
