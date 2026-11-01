@@ -261,8 +261,8 @@
               <tr><th scope="row"><a href="https://github.com/EchoStretch/kstuff-lite">kstuff-lite</a></th><td>The kernel patches homebrew runs on</td><td><span class="q">Required</span></td></tr>
               <tr><th scope="row"><a href="https://github.com/etaHEN/etaHEN">etaHEN</a></th><td>Homebrew support</td><td><span class="q">Required</span></td></tr>
               <tr><th scope="row"><a href="https://github.com/drakmor/ShadowMountPlus">ShadowMountPlus</a></th><td>Puts PS5LM on the home screen from <code>/data/homebrew</code></td><td><span class="q">Required</span></td></tr>
-              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/elfldr">elfldr</a></th><td>Temperature, power and real free space</td><td><span class="q">Recommended</span></td></tr>
-              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/ftpsrv">ftpsrv</a></th><td>Installing the app, copying models from a PC</td><td><span class="q">Recommended</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/elfldr">elfldr</a></th><td>Temperature, power and real free space; full-speed downloads, through the app's own ftpsrv</td><td><span class="q">Recommended</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/ftpsrv">ftpsrv</a></th><td>Installing the app, copying models from a PC; downloads write through it when it runs</td><td><span class="q">Recommended</span></td></tr>
             </tbody>
           </table>
         </div>
@@ -286,6 +286,8 @@
         <li><b>Can it break my console?</b><span>It writes only to its own folders, never to system files. Under a long load it runs warm and the fan spins up, as in a game; the Console page shows both.</span></li>
         <li><b>Is it the same as PS5LM Plus?</b><span>PS5LM grew from PS5LM Plus, the native GPU app by abhi245y, and now lives under its own title ID, PPSA99575, so the two install side by side.</span></li>
         <li><b>Which model for coding agents?</b><span>A smaller model with a long context: prompts are read several times faster. <a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">docs/CLI.md</a> has the trade-offs.</span></li>
+        <li><b>Can several consoles run one model?</b><span>Experimentally, with the fleet build, a separate zip. A PC runs the controller and each PS5 holds a run of one dense llama or qwen2 model's layers on its GPU. So far one PS5 has served a model together with a PC. RPC has no authentication, so keep it on an isolated network: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">docs/FLEET.md</a>.</span></li>
+        <li><b>Can I see inside the model?</b><span>If you turn it on. <code>POST /v1/introspect</code> returns the logits where you ask, the top candidates and one layer's activations, and can zero, scale or add to a channel. It is off by default, under Settings &gt; Developer: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/INTROSPECTION.md">docs/INTROSPECTION.md</a>.</span></li>
       </ul>
     </section>
 
@@ -319,6 +321,7 @@
             <li><a href="https://github.com/cobanov/PS5LM#readme">Install</a></li>
             <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">Coding tools</a></li>
             <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/MODELS.md">Models</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">Fleet</a></li>
             <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/BUILDING.md">Building</a></li>
           </ul>
         </div>
