@@ -127,24 +127,32 @@ def background(path, w, h, parts):
   <rect width="{w}" height="{h}" fill="url(#glow)"/>
 ''' + '\n'.join(body) + '\n</svg>\n')
 
-def card(path, w, h, lines=(('Run LLMs and decision models', INK_DARK), ('on your PS5', ACCENT)),
-         sub="llama.cpp on the console's GPU, for every device on your network"):
-    """Link previews: the logo top left, a two-line headline as on the site's hero (the second line in the
-    accent), one muted line under it, over the same grid and glow as the banner. Sizes follow the height."""
-    k, x = h / 630, 80 * h / 630
-    items = []
-    def put(paths, colour, scale, left, base, extra=''):
-        u = union(paths) if isinstance(paths, list) else paths
-        items.append((colour, extra, u, scale, left - u.bounds[0] * scale, base - CAP * scale))
-    a, b, c = horizontal(760)
-    ls, lx = 40 * k / CAP, x - bounds([a, b, c])[0] * 40 * k / CAP
-    for colour, p in ((INK_DARK, a), (ACCENT, b), (INK_DARK, c)):
-        items.append((colour, '', p, ls, lx, 84 * k))
-    em, base = 64 * k, 334 * k
-    for text, colour in lines:
-        put(glyphs(text, 760, 0, CAP, track=-45), colour, em / 1000, x, base)
-        base += 1.2 * em
-    put(glyphs(sub, 400, 0, CAP, track=0), '#ebebf5', 25 * k / 1000, x, base - 1.2 * em + 72 * k, ' fill-opacity="0.6"')
+def card(path, w, h, lines=(('Run LLMs and', INK_DARK), ('decision models', INK_DARK), ('on your PS5', ACCENT)),
+         sub="llama.cpp on the console's GPU"):
+    """Link previews, read as thumbnails: the stacked logo large on the left (60% of the height), the headline
+    in three lines on the right, centred on the logo, the last line in the accent as on the site's hero."""
+    k = h / 630
+    a, b, c = stacked(760)
+    lx0, ly0, lx1, ly1 = bounds([a, b, c])
+    ls = 0.6 * h / (ly1 - ly0)
+    em, lead, sub_em = 64 * k, 1.2 * 64 * k, 28 * k
+    heads = [(union(glyphs(t, 760, 0, CAP, track=-45)), col) for t, col in lines]
+    sub_p = union(glyphs(sub, 400, 0, CAP, track=0))
+    text_w = max(max(p.bounds[2] - p.bounds[0] for p, _ in heads) * em / 1000, (sub_p.bounds[2] - sub_p.bounds[0]) * sub_em / 1000)
+    gap = 88 * k
+    left = (w - ((lx1 - lx0) * ls + gap + text_w)) / 2           # the whole group centred across the width
+    top = (h - (ly1 - ly0) * ls) / 2
+    items = [(col, '', p, ls, left - lx0 * ls, top - ly0 * ls) for col, p in ((INK_DARK, a), (ACCENT, b), (INK_DARK, c))]
+    tx = left + (lx1 - lx0) * ls + gap
+    cap = 0.7 * em
+    block = cap + (len(lines) - 1) * lead + 64 * k              # cap of line 1 to the baseline of the sub line
+    base = h / 2 - block / 2 + cap
+    for p, col in heads:
+        sc = em / 1000
+        items.append((col, '', p, sc, tx - p.bounds[0] * sc, base - CAP * sc))
+        base += lead
+    sc = sub_em / 1000
+    items.append(('#ebebf5', ' fill-opacity="0.6"', sub_p, sc, tx - sub_p.bounds[0] * sc, base - lead + 64 * k - CAP * sc))
     background(path, w, h, items)
 
 # On dark grounds the light letters glow and look heavier, so the reversed versions are set a step lighter.

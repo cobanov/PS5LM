@@ -25,9 +25,9 @@ Each logo comes in four colourings:
 - `-light`: for light grounds. PS5 and the cursor in ground black, LM in periwinkle (weight 800).
 - `-black` and `-white`: one colour, for print, engraving, and grounds the two colours can't sit on.
 
-Wide formats, over the site's grid and periwinkle glow. The link previews put the logo top left over a
-two-line headline ("Run LLMs and decision models / on your PS5"); the home screen background has the logo low
-on the right. The text is set in `card()` and `banner()` in `build.py`:
+Wide formats, over the site's grid and periwinkle glow. The link previews are read as thumbnails, so the
+stacked logo is large on the left (60% of the height) with a three-line headline beside it ("Run LLMs and /
+decision models / on your PS5"); the home screen background has the logo low on the right. The text is set in `card()` and `banner()` in `build.py`:
 
 | File | Size | Where it goes |
 |---|---|---|
