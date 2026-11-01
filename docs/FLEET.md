@@ -177,6 +177,12 @@ with blocks 0–22 on the PS5 and block 23 plus the output on the PC, and
 answered a chat request correctly. This run found the 40000 port limit below;
 the worker writes its own and ggml's messages to `/data/PS5LM/app.log`.
 
+The same day, with the worker in the normal app (this build) and a Mac's GPU:
+`ggml-rpc-server -d MTL0` from a `PS5LM_FLEET_GPU=metal` host build on an Apple
+M-series Mac, the controller on the Linux PC. Blocks 0–22 on the PS5, block 23
+and the output on the Mac's GPU; it answered correctly at 13 tokens/s (7.4 with
+the PC's CPU in that place). One small model, so not a performance figure.
+
 ## Configure workers (only after building and validating the title)
 
 On each console, explicitly create `/data/PS5LM/fleet-worker.txt` containing
