@@ -799,8 +799,13 @@ int main(int, char **) {
     set_data_root(full ? kFullRoot : kAppRoot);
     g_files = Files(data_root());
     mkdir(data_root().c_str(), 0777);
-    // stdout and stderr to a file the PC can fetch over FTP.
-    if (std::freopen(g_files.log.c_str(), "w", stdout) != nullptr) {
+    // stdout and stderr to a file the PC can fetch over FTP. Both append: with
+    // stdout at its own offset ("w"), each of its lines overwrote the stderr
+    // lines appended before it, so nothing from stderr survived in app.log.
+    if (std::FILE * f = std::fopen(g_files.log.c_str(), "w")) {
+        std::fclose(f);
+    }
+    if (std::freopen(g_files.log.c_str(), "a", stdout) != nullptr) {
         setvbuf(stdout, nullptr, _IOLBF, 0);
     }
     if (std::freopen(g_files.log.c_str(), "a", stderr) != nullptr) {
