@@ -173,7 +173,8 @@ ggml-vulkan on [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)'s RADV, bui
 
 [Fleet](docs/FLEET.md) splits one dense `llama`/`qwen2` GGUF across several
 consoles over llama.cpp's RPC, controlled by one PC: one model across their
-memory, not a copy on each. It is a separate build of the app, released as
+memory, not a copy on each, so a model too large for one PS5 can run on two or
+more. The PC can add its CPU as another worker. It is a separate build of the app, released as
 `ps5lm-app-fleet-vX.Y.Z.zip` next to the normal zip; the normal app has no RPC
 code. Two-worker CPU inference is tested in CI, the fleet title cross-builds
 there, and a PS5 worker has served a model together with a PC, but it is

@@ -8,6 +8,37 @@ maintainers.** This is not a performance claim. The default
 PS5LM title has no RPC code; releases ship the fleet build as its own zip,
 `ps5lm-app-fleet-vX.Y.Z.zip`.
 
+What it is for: a model that does not fit in one console's memory runs across
+several, each holding a run of its layers. Every token passes through every
+worker over the network, so it is not faster than one console; it makes larger
+models possible. Workers are PS5s; a PC can also join with its CPU (the host
+build has no GPU backend, so a PC's GPU cannot be a worker yet).
+
+## Quick start
+
+1. **On each PS5:** install `ps5lm-app-fleet-vX.Y.Z.zip` from the
+   [releases](https://github.com/cobanov/PS5LM/releases) like the normal app,
+   then put `/data/PS5LM/fleet-worker.txt` on it over FTP: the console's own IP
+   and a port below 40000, then the acknowledgement line
+   ([Configure workers](#configure-workers-only-after-building-and-validating-the-title)).
+   Start PS5LM: it shows the worker screen instead of the dashboard.
+2. **On a Linux or macOS PC on the same network:** `git submodule update --init
+   --depth 1 third_party/llama.cpp`, then `scripts/build-fleet-host.sh`
+   ([Host](#host-cpu--rpc)).
+3. **Nodes:** copy `fleet/nodes.example.json` and list each console's
+   `IP:port` with its memory budget.
+4. **Plan, then serve:** `python3 -m fleet plan --model model.gguf --nodes
+   nodes.json` shows which layers go where; `python3 -m fleet serve ...
+   --ack-insecure-rpc` starts one llama-server on `127.0.0.1:8081` of the PC
+   ([Plan and serve](#plan-and-serve-from-the-controller)).
+5. **Back to normal:** delete `fleet-worker.txt` and restart PS5LM, or install
+   the normal zip again.
+
+Dense `llama` and `qwen2` GGUFs only; Qwen 3.5/3.8 (`qwen35`) is refused. RPC
+has no authentication: keep workers on a network you trust. On macOS, the app
+that runs the controller (Terminal, iTerm, a multiplexer) needs Local Network
+permission, or connections to the consoles fail with "No route to host".
+
 ## Architecture
 
 ```
