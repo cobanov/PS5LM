@@ -5,6 +5,36 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **An opt-in endpoint for the model's own numbers**: `POST /v1/introspect` answers with the whole
+  logit row at the positions you name, the top candidates with their probabilities, the entropy, and
+  one row of a named graph tensor (`l_out`, `ffn_swiglu`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`,
+  `result_norm`, `result_output`) for a named layer. A request can also change one channel in place,
+  with zero, scale or add, at one position or at all of them. `messages` applies the chat template
+  first. It is off by default: Settings > Developer > "Logits and activations API" (a change
+  restarts the app with the loaded model), or `LLAMA_INTROSPECT=1`. `docs/INTROSPECTION.md` is the
+  reference, `scripts/ps5lm-introspect.py` is a client, and `examples/interpret/neuron_ablation.py`
+  zeroes the FFN neurons (`ffn_swiglu`) of one layer one at a time.
+- The patch reads the logits from the context's own output buffer and copies the tensors out of the
+  compute graph with the eval callback that llama.cpp already has, so no work is repeated and no
+  request pays for it unless it asks.
+
+### Fixed
+- **Downloads keep their speed past 2 GB.** The console slows a title's own writes to about
+  1.2 MB/s after the first ~2.2 GB, while a payload's keep going, so the app now writes each piece
+  through a loopback ftpsrv: in file order, with `REST`/`STOR` at its place, done once ftpsrv answers
+  `226`. It uses the user's ftpsrv on 2121 when a test write through it works, else its own copy,
+  `ps5lm-ftpsrv` on `127.0.0.1:2123`, which it sends to elfldr when needed and which leaves other
+  ftpsrv copies on 2121 and 2122 running. With an ftpsrv that has no `EPSV` it uses `PASV`. When
+  no ftpsrv answers, the app writes the file itself as before. Ported from
+  [PS5SD](https://github.com/Darkatek7/PS5SD) (#41).
+- Models saved to an M.2 or USB drive show up in the library wherever that drive is mounted. The
+  library looked only in `/mnt/ext0`, `/mnt/usb0` and `/mnt/usb1`, while downloads can go to any
+  drive the exporter reports; it now also reads the download folder and every mounted drive's
+  `PS5LM/models` (#43).
+
 ## [0.9.1] - 2026-10-20
 
 ### Fixed

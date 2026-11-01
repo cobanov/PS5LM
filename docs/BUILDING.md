@@ -24,8 +24,17 @@ works too.
 - **HTTPS.** Downloads use the system's libSceHttp2 and libSceSsl, so the app carries no TLS library.
 - **What a title cannot do.** Read sensors, see real free space, or start processes. ps5-exporter, a
   payload the app sends to elfldr, covers the first two.
+- **Downloads write through ftpsrv.** A title's writes slow to about 1.2 MB/s after 2.2 GB, a
+  payload's do not, so `Market::fetch` sends each piece to a loopback ftpsrv with `REST`/`STOR`
+  (`ps5/app/ftp_writer.cpp`): the user's on 2121, else the app's own copy on 2123, which
+  `build-app.sh` builds from `third_party/ftpsrv` with `patches/ftpsrv` and bundles as
+  `payloads/ps5lm-ftpsrv.elf` ([CONSOLE.md](CONSOLE.md#the-titles-writes-slow-down-after-about-2-gb-41)).
 
 ## Build
+
+For the automated, pinned-source Debian build and its validation limits, see
+[CI validation](CI.md). `scripts/test-native-build.sh` builds and statically checks
+the existing app without a console, model download, or proprietary firmware.
 
 On Arch, the host packages (or run them in an `archlinux` container with the repository mounted):
 
@@ -54,11 +63,20 @@ scripts/release-app.sh      # build/release/ps5lm-app-vX.Y.Z.zip and its .sha256
 
 BlackBearReloaded's repositories, ps5-homebrew-ui and ps5-opengl, are no longer on GitHub. The
 submodule comes from a mirror at the same commit. `build-app.sh` gets the ps5-opengl SDK through
-ps5-homebrew-ui's `tools/fetch-opengl-sdk.sh`, whose download now fails: put
-`ps5-opengl-sdk-1.0.0.tar.gz` from a mirror (one is
-[here](https://github.com/MyLuxy/overdrive-deps/releases/tag/ps5-opengl-v1.0.0)) in
-`third_party/ps5-homebrew-ui/.deps/ps5-opengl/`, and the script checks it against its pinned
-sha256 before using it.
+ps5-homebrew-ui's `tools/fetch-opengl-sdk.sh`, whose download now fails, and so does the mirror
+this page used to name. The
+[deps-ps5-opengl-1.0.0](https://github.com/cobanov/PS5LM/releases/tag/deps-ps5-opengl-1.0.0)
+release holds the SDK as that script extracts it; unpack it into
+`third_party/ps5-homebrew-ui/.deps/ps5-opengl/`:
+
+```sh
+mkdir -p third_party/ps5-homebrew-ui/.deps/ps5-opengl
+curl -fL https://github.com/cobanov/PS5LM/releases/download/deps-ps5-opengl-1.0.0/ps5-opengl-sdk-1.0.0.tar.gz \
+  | tar -xz -C third_party/ps5-homebrew-ui/.deps/ps5-opengl
+```
+
+The archive is a repack, so its own hash is not the original's; the script still checks the SDK
+manifest against its pinned sha256 and every file against the manifest.
 
 `make app` builds PS5_Vulkan's host tool and `libc.prx`, which `build-app.sh` uses; its own demo title
 may fail to link at PS5_Vulkan's HEAD, which does not matter here.
@@ -85,7 +103,8 @@ PS5_HOST=<console IP> scripts/ps5lm-app.sh screenshot out.bmp
 | `ps5/app` | the app: dashboard, planner, suggestions, downloads, the request feed, llama-server on the GPU |
 | `third_party/llama.cpp` | upstream llama.cpp, pinned as a submodule |
 | `third_party/ps5-homebrew-ui` | the UI toolkit |
+| `third_party/ftpsrv` | drakmor's ftpsrv at 1.16-ng-stable, the app's loopback copy for downloads |
 | `third_party/fonts` | Manrope (OFL) |
-| `patches/` | PS5 changes to llama.cpp, kept small; `patches/mesa` the driver's |
+| `patches/` | PS5 changes to llama.cpp, kept small; `patches/mesa` the driver's, `patches/ftpsrv` ftpsrv's |
 | `ps5/compat`, `probes/` | the payload build's libc additions and memory probes ([PAYLOAD.md](PAYLOAD.md)) |
 | `scripts/` | build, release, artwork, deploy and console tools |

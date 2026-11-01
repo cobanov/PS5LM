@@ -18,7 +18,7 @@ checks. This is not a hardware-validated PS5 release.
 | llama.cpp | `04f7226a2c12c7f382c545a6db5a034266aa53cb` |
 | ps5-homebrew-ui | `bf44d80384d5b8f8f4f213cf98d748887211328d` |
 
-All existing llama.cpp patches 0001–0008 and new patches 0009–0011 were applied.
+All existing llama.cpp patches 0001–0009 and new patches 0010–0012 were applied.
 `fleet-build.json` records the exact patch hashes and local host binary checksum.
 The wire protocol remains upstream RPC 8.0.0; a handshake is not revision
 attestation. Both ends must be built from the same sources.

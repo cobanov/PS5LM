@@ -482,7 +482,19 @@ struct Models {
     static std::vector<ModelRow> plan_rows(const Settings & settings, double budget_gib, const std::string & running) {
         std::vector<ModelRow> rows;
         const char * kv = settings.kv_type == "auto" ? nullptr : settings.kv_type.c_str();
-        for (const auto & path : find_models(kModelDirs)) {
+        // Also every folder the downloads can go to: the M.2 slot or a USB drive is
+        // not always ext0, usb0 or usb1 (#43).
+        std::vector<std::string> dirs = kModelDirs;
+        std::vector<std::string> saves = { settings.download_dir };
+        for (const auto & d : mounted_drives()) {
+            saves.push_back(d.models);
+        }
+        for (const auto & d : saves) {
+            if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) {
+                dirs.push_back(d);
+            }
+        }
+        for (const auto & path : find_models(dirs)) {
             const ModelInfo m = read_model_info(path);
             ModelRow row;
             row.file = path;
@@ -847,6 +859,10 @@ int main(int, char **) {
         }
         log_memory("before loading");
         if (!args.empty()) {
+            // The introspection API is off unless the setting asks for it. The
+            // server reads LLAMA_INTROSPECT when its thread starts, below. The
+            // setting wins over env.txt, so the row always says what the server does.
+            setenv("LLAMA_INTROSPECT", models.settings.introspect ? "1" : "0", 1);
             models.start(path, args, stats, model_part);
         } else {
             stats.set_state(ServerState::no_model);
@@ -1047,6 +1063,16 @@ int main(int, char **) {
                 models.rescan(stats);
             }
             std::printf("ps5lm-app: settings saved\n");
+            // The server reads LLAMA_INTROSPECT only when it starts: restart with the
+            // same model, so that the switch never says something the server does not do.
+            if (was.introspect != models.settings.introspect && !models.running.empty() && restart_at == 0) {
+                std::ofstream(kChoice) << models.running << "\n";
+                std::printf("ps5lm-app: restarting %s with the introspection API %s\n", models.running.c_str(),
+                            models.settings.introspect ? "on" : "off");
+                dash.set_busy(std::string(models.settings.introspect ? "Opening" : "Closing") + " the logits and activations API",
+                              "The app restarts with " + base_name(models.running));
+                restart_at = n + 3;
+            }
         }
         switch (req.kind) {
             case Dashboard::Request::ask: ask_self(kPort, req.path, !live.decision.empty()); break;

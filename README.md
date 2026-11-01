@@ -96,8 +96,8 @@ You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded
 | [kstuff-lite](https://github.com/EchoStretch/kstuff-lite) | the kernel patches homebrew runs on | required |
 | [etaHEN](https://github.com/etaHEN/etaHEN) | homebrew support | required |
 | [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus) | puts PS5LM on the home screen from `/data/homebrew` | required |
-| [elfldr](https://github.com/ps5-payload-dev/elfldr) (port 9021) | temperature, power and real free space, through ps5-exporter | recommended |
-| [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) (port 2121) | installing the app, copying models from a PC | recommended |
+| [elfldr](https://github.com/ps5-payload-dev/elfldr) (port 9021) | temperature, power and real free space, through ps5-exporter; full-speed downloads, through the app's own ftpsrv | recommended |
+| [ftpsrv](https://github.com/ps5-payload-dev/ftpsrv) (port 2121) | installing the app, copying models from a PC; downloads write through it when it runs | recommended |
 
 1. Download `ps5lm-app-vX.Y.Z.zip` from the [latest release](https://github.com/cobanov/PS5LM/releases/latest) and unzip it.
 2. Copy the `PPSA99575` folder to `/data/homebrew` over FTP. ShadowMountPlus adds **PS5LM** to the
@@ -111,9 +111,17 @@ To update, copy the new folder over the old one. Settings, models and downloads 
 `/data/PS5LM`.
 
 If PS5LM cannot write to `/data/PS5LM` ("Cannot write to /data/PS5LM/models"), the HEN has not
-opened the console's storage to it. On OnionHEN, add `PPSA99575` to `exact_title_ids` in the
-`[app_jailbreak]` section of `/data/OnionHEN/config.ini`, then start PS5LM again. Using it from coding tools (opencode, Codex, Claude Code) is in
-[docs/CLI.md](docs/CLI.md).
+opened the console's storage to it:
+
+- **OnionHEN:** add `PPSA99575` to `exact_title_ids` in the `[app_jailbreak]` section of
+  `/data/OnionHEN/config.ini`, then start PS5LM again. Reported working with OnionHEN 0.9.0 and
+  ShadowMountPlus 1.7beta10; older versions of either failed the same way
+  ([#23](https://github.com/cobanov/PS5LM/issues/23)).
+- **etaHEN:** over FTP, create `/data/PS5LM/models` and give `/data/PS5LM` and everything in it
+  mode 777 (in FileZilla: File permissions, applied to subdirectories). Reported on etaHEN 2.6b,
+  firmware 10.00.
+
+Using it from coding tools (opencode, Codex, Claude Code) is in [docs/CLI.md](docs/CLI.md).
 
 | Where | Button | Does |
 |---|---|---|
@@ -127,6 +135,25 @@ opened the console's storage to it. On OnionHEN, add `PPSA99575` to `exact_title
 | Settings | D-pad, Cross | choose a category and a row; flip it, or pick from its list |
 | Settings, Diagnostics | Square, Triangle | app or server log; errors only |
 
+## Looking inside the model
+
+This fork adds an opt-in endpoint that returns the numbers the model computed.
+`POST /v1/introspect` answers with the whole logit row at the positions you name,
+the probabilities and the entropy, with one row of a named graph tensor for a
+named layer, and it can also change one channel in place before the rest of the
+model reads it.
+
+The endpoint is off by default. Turn it on in **Settings > Developer > Logits and
+activations API**.
+
+```sh
+python3 scripts/ps5lm-introspect.py --host <console> --prompt "Once upon a time" \
+    --positions last --top-k 10 --tensors l_out --layers 12
+```
+
+[Introspection](docs/INTROSPECTION.md) records the request fields, the tensor
+names, and the cost of each option.
+
 ## Want to tinker?
 
 C++ on [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui), llama.cpp with
@@ -136,12 +163,18 @@ ggml-vulkan on [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)'s RADV, bui
 [Research](docs/RESEARCH.md) · [Models that fit](docs/MODELS.md) · [Roadmap](docs/ROADMAP.md) ·
 [Changelog](CHANGELOG.md) · [The original payload](docs/PAYLOAD.md)
 
+## Built around it
+
+- [ps5lm_ha](https://github.com/phoinixgrr/ps5lm_ha) by [phoinixgrr](https://github.com/phoinixgrr):
+  a Home Assistant integration that wakes the console from rest mode, starts PS5LM, waits for the
+  model and puts the console back to sleep when done, with the model and console readings as sensors.
+
 ## Experimental multi-console fleet
 
 A source-only [fleet prototype](docs/FLEET.md) splits one dense `llama`/`qwen2`
 GGUF across RPC workers, controlled by one host—not independent model replicas.
-Real two-worker CPU inference is tested; the PS5 worker title is **not yet
-cross-built or hardware-validated**, and Qwen 3.8's `qwen35` layout is not admitted
+Real two-worker CPU inference is tested; the PS5 worker title cross-builds in CI but is
+**not yet hardware-validated**, and Qwen 3.8's `qwen35` layout is not admitted
 by this first estimator. RPC is unauthenticated and requires an explicitly opted-in,
 isolated trusted network. See [validation and limits](docs/FLEET-VALIDATION.md).
 
