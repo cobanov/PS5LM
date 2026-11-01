@@ -10,6 +10,8 @@
 #
 #   scripts/build-app.sh            configure, build and package
 #   PS5LM_PREBUILT_UI=OFF ...       omit the optional downloaded browser UI
+#   PS5LM_FLEET=1 ...               the fleet build: adds ggml's RPC backend,
+#                                   patches/fleet and the RPC worker (docs/FLEET.md)
 # CMAKE_BUILD_PARALLEL_LEVEL also bounds the native dashboard compilers.
 set -euo pipefail
 
@@ -27,6 +29,8 @@ headers="$root/.deps/ps5-vk-headers"
 glsdk=${PS5_OPENGL_SDK:-$(bash "$root/third_party/ps5-homebrew-ui/tools/fetch-opengl-sdk.sh")}
 sce_sys="$root/ps5/app/sce_sys"
 param="$sce_sys/param.json"
+fleet=${PS5LM_FLEET:-0}
+[[ $fleet == 0 || $fleet == 1 ]] || { echo "build-app: PS5LM_FLEET must be 0 or 1" >&2; exit 2; }
 
 for f in "$archive" "$tool" "$vk/runtime/libc.prx" "$sdk/bin/prospero-lld" "$glsdk/lib/libPS5OpenGL.a"; do
     [ -e "$f" ] || { echo "build-app: missing $f" >&2; exit 2; }
@@ -59,9 +63,23 @@ EOF
 fi
 
 # The PS5 changes to llama.cpp (patches/), as scripts/build-llama.sh applies them.
+# patches/fleet goes on top only for a fleet build; a default build after a fleet
+# one takes it back out first, last patch first.
+fleet_patches=("$root"/patches/fleet/*.patch)
+if [[ $fleet == 0 ]]; then
+    for (( i = ${#fleet_patches[@]} - 1; i >= 0; i-- )); do
+        p=${fleet_patches[i]}
+        if git -C "$llama" apply --reverse --check "$p" 2>/dev/null; then git -C "$llama" apply --reverse "$p"; fi
+    done
+fi
 for p in "$root"/patches/*.patch; do
     git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
 done
+if [[ $fleet == 1 ]]; then
+    for p in "${fleet_patches[@]}"; do
+        git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
+    done
+fi
 
 # ftpsrv (drakmor's 1.16-ng-stable), PS5LM's copy: a payload the app sends to
 # elfldr when no ftpsrv answers (connect_ftp_writer in ps5/app/ftp_writer.hpp).
@@ -86,7 +104,7 @@ cmake -S "$llama" -B "$out/llama" -G Ninja \
     -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$cxxflags" \
     -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF \
     -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF \
-    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF \
+    -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DGGML_VULKAN=ON -DGGML_RPC="$([[ $fleet == 1 ]] && echo ON || echo OFF)" -DGGML_RPC_RDMA=OFF \
     -DVulkan_INCLUDE_DIR="$headers/include" -DVulkan_LIBRARY="$archive" \
     -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DSPIRV-Headers_DIR="$headers/cmake" \
     -DMATH_LIBRARY=SceLibcInternal \
@@ -102,11 +120,15 @@ obj="$out/obj"
 mkdir -p "$obj" "$out/stubs"
 cxx() { "$root/ps5/app/ps5cxx" -std=c++17 -O2 -ffunction-sections -fdata-sections "$@"; }
 cxx -std=c++20 -fexceptions -fcxx-exceptions -frtti -I "$headers/include" -I "$llama/ggml/include" -I "$root/third_party/ps5-homebrew-ui/src" \
-    -I "$glsdk/include" -DGL_GLEXT_PROTOTYPES=1 \
+    -I "$glsdk/include" -DGL_GLEXT_PROTOTYPES=1 -DPS5LM_FLEET="$fleet" \
     -c "$root/ps5/app/main.cpp" -o "$obj/main.o"
 cxx -fexceptions -fcxx-exceptions -c "$root/ps5/app/model_plan.cpp" -o "$obj/model_plan.o"
-cxx -fexceptions -fcxx-exceptions -I "$llama/ggml/include" \
-    -c "$root/ps5/app/fleet_worker.cpp" -o "$obj/fleet_worker.o"
+fleet_objects=()
+if [[ $fleet == 1 ]]; then
+    cxx -fexceptions -fcxx-exceptions -I "$llama/ggml/include" \
+        -c "$root/ps5/app/fleet_worker.cpp" -o "$obj/fleet_worker.o"
+    fleet_objects=("$obj/fleet_worker.o")
+fi
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/settings.cpp" -o "$obj/settings.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/fetch.cpp" -o "$obj/fetch.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/market.cpp" -o "$obj/market.o"
@@ -210,7 +232,7 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "${fleet_objects[@]}" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \
@@ -270,4 +292,6 @@ printf '%s\n' "ftpsrv by John Törnblom and drakmor, GPL-3.0-or-later: https://g
     "with PS5LM's patches/ftpsrv/0001-loopback-only-for-ps5lm.patch: 127.0.0.1:2123 only, as ps5lm-ftpsrv." \
     > "$app/payloads/ps5lm-ftpsrv-NOTICE.txt"
 "$tool" self --inspect --file "$app/eboot.bin" > /dev/null
-echo "build-app: $app ($(stat -c %s "$app/eboot.bin") bytes)"
+# release-app.sh names the zip after the variant this build made.
+if [[ $fleet == 1 ]]; then echo fleet; else echo default; fi > "$out/variant"
+echo "build-app: $app ($(stat -c %s "$app/eboot.bin") bytes, $(cat "$out/variant"))"

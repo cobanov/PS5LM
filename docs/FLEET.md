@@ -1,8 +1,10 @@
 # Experimental fleet: one model, several PS5 workers
 
-**Status: implemented host controller and opt-in PS5 worker source; CPU RPC
-inference tested, PS5 title cross-build and real consoles not validated.** This
-is not a ready-to-install fleet release or a performance claim.
+**Status: host controller and an opt-in PS5 worker in a separate fleet build of
+the title; CPU RPC inference and the fleet title's cross-build are tested in CI,
+real consoles are not validated.** This is not a performance claim. The default
+PS5LM title has no RPC code; releases ship the fleet build as its own zip,
+`ps5lm-app-fleet-vX.Y.Z.zip`.
 
 ## Architecture
 
@@ -68,10 +70,10 @@ memory. IP validation is not authentication.
   No guest/shared LAN, port forwarding, public interface, public proxy or tunnel.
 - The worker requires an explicit numeric private IPv4 bind, high port and a
   written acknowledgement. No wildcard `0.0.0.0` or hostname is accepted.
-- `GGML_RPC_NO_COMM=1` is forced by this integration. Patch 0010 makes the server
+- `GGML_RPC_NO_COMM=1` is forced by this integration. `patches/fleet/0002` makes the server
   reject `COMM_INIT` before opening the extra wildcard peer listener in upstream
   tensor-parallel code. This fleet uses layer splitting, not those collectives.
-- Patch 0009 initializes BSD socket lengths and suppresses SIGPIPE portably.
+- `patches/fleet/0001` initializes BSD socket lengths and suppresses SIGPIPE portably.
   Neither patch makes arbitrary RPC requests safe. Keep the network isolated.
 - Workers have no disk tensor cache; normal PS5LM API, model auto-load and
   downloads are disabled in worker mode. There is one controller per worker.
@@ -100,12 +102,13 @@ scripts/build-fleet-host.sh
 # build/fleet-host/fleet-build.json (revision, patches, binary SHA256)
 ```
 
-The host script applies the repository's numbered llama.cpp patches, disables
+The host script applies the repository's numbered llama.cpp patches and
+`patches/fleet`, disables
 GPU backends and RDMA, and builds the RPC tools plus the upstream multi-server
 regression. It does not fetch model weights or start a listener. Set `CMAKE`,
 `NINJA` or `CMAKE_BUILD_PARALLEL_LEVEL` for local tool locations/resources.
 
-### PS5 worker title — cross-built, not hardware validated
+### PS5 worker title — the fleet build, not hardware validated
 
 Follow [BUILDING.md](BUILDING.md) to prepare PS5_Vulkan, its pinned PS5_Mesa and
 PS5_PayloadSDK forks, patched RADV, native packaging tool, `libc.prx` and the
@@ -113,73 +116,26 @@ checksum-pinned ps5-opengl SDK. Then:
 
 ```sh
 git submodule update --init --depth 1
-scripts/build-app.sh
+PS5LM_FLEET=1 scripts/build-app.sh
 ```
 
-The existing title build now links `GGML_RPC=ON`, `GGML_RPC_RDMA=OFF` and
-`fleet_worker.cpp`. No change to the legacy payload build is implied. A payload
-is not the same memory environment as the native Vulkan title.
+`PS5LM_FLEET=1` is what makes it the fleet build: llama.cpp with `GGML_RPC=ON`
+(`GGML_RPC_RDMA=OFF`) and `patches/fleet` on top of the numbered patches, and
+the title with `fleet_worker.cpp` and the worker's startup mode in `main.cpp`.
+Without it, `scripts/build-app.sh` builds the default title with none of that,
+and takes `patches/fleet` back out of the llama.cpp checkout if a fleet build
+left it there. Both variants have the same title ID, so installing one replaces
+the other; settings and models in `/data/PS5LM` stay. `scripts/release-app.sh`
+names the zip after the variant the last build made.
 
-The ordinary build currently points at a removed ps5-opengl release. The
-repository already documents the archive mirror and checksum check in
-[BUILDING.md](BUILDING.md); see [FLEET-VALIDATION.md](FLEET-VALIDATION.md) for the
-resolved download/prerequisite history and successful full cross-build evidence.
-Host CI cannot execute the console-specific GPU, direct-memory or network stack.
-
-### PS5-target compile and runtime check (no console)
-
-```sh
-# Ubuntu 24.04 host prerequisites; no proprietary firmware or model needed.
-sudo apt-get install clang-18 llvm-18 lld-18 make g++ wget unzip
-PATH="/usr/lib/llvm-18/bin:$PATH" LLVM_CONFIG=llvm-config-18 scripts/test-fleet-native.sh
-```
-
-This separate check fetches exact public PS5_Vulkan/PS5_PayloadSDK commits and
-uses their checksum-verified homebrew SDK/zlib bootstrap. It compiles
-`fleet_worker.cpp`, `ggml-rpc.cpp` and `transport.cpp` through the same
-`x86_64-sie-ps5` wrapper used by the title, checks target macros and ELF object
-structure, and reproduces clean-room `libc.prx` twice against upstream hashes.
-Results are recorded in `build/fleet-native/result.json`. Dependency sources
-live under `.deps/fleet-native-src` (override with `PS5LM_NATIVE_SOURCES`).
-
-**This is not a full title link or runtime test.** It does not compile the UI,
-build/link RADV, validate imports, execute PS5 instructions in a console runtime,
-or test Vulkan/memory/network behavior. The full title still follows the build
-instructions above.
-
-QEMU is not used: its documented [x86 system models](https://www.qemu.org/docs/master/system/target-i386.html)
-and [Linux/BSD user modes](https://www.qemu.org/docs/master/user/main.html) do not
-provide a PS5-specific loader/AGC environment. A Linux/FreeBSD VM can exercise
-its own socket/CPU code, not the console's GPU or direct-memory behavior. Passing a VM test would not validate multi-console inference. Use
-native-target compilation plus real-console hardware gates, rather than call a
-Linux guest a PS5 emulator.
-
-### Full native title cross-build and package check (no console)
-
-On Debian 13, install the public packages listed in the workflow's `ps5-title`
-job, then run:
-
-```sh
-git submodule update --init --depth 1
-PATH="/usr/lib/llvm-19/bin:$PATH" LLVM_CONFIG=/usr/bin/llvm-config-19 scripts/test-fleet-title.sh
-```
-
-This reuses the native bootstrap/check above, applies the three repository Mesa
-patches deterministically, builds the actual PS5 RADV archive, verifies the
-OpenGL SDK from the documented mirror, and runs `scripts/build-app.sh`. It
-packages the native console dashboard and RPC-enabled server, then runs the
-upstream structural ELF/FSELF validators and records hashes in
-`build/fleet-title/result.json`. No target binary is executed or deployed.
-
-The optional embedded **browser** UI is omitted: upstream otherwise falls back
-to a floating Hugging Face asset download. The native console dashboard is still
-built. Ordinary `scripts/build-app.sh` keeps its previous browser-UI default;
-`PS5LM_PREBUILT_UI=OFF` opts out. The test clears only that generated browser-asset
-cache under `build/app-ps5/llama/tools/ui/dist`, and rejects custom source-tree
-browser assets rather than modifying them. Build parallelism defaults to two.
-
-A successful link/structural check does not prove runtime import resolution,
-console boot, Vulkan correctness or real multi-console inference.
+CI builds both variants on every pull request: `native-build.yml` runs
+`scripts/test-native-build.sh` once as is and once with `PS5LM_FLEET=1`, each
+with the structural ELF/FSELF checks ([CI.md](CI.md)). That proves the fleet
+title links, not that it boots, that its Vulkan results are right, or that a
+real multi-console run works. QEMU is not a substitute: its
+[x86 system models](https://www.qemu.org/docs/master/system/target-i386.html)
+and [Linux/BSD user modes](https://www.qemu.org/docs/master/user/main.html)
+provide no PS5 loader, AGC or direct memory.
 
 ## Configure workers (only after building and validating the title)
 

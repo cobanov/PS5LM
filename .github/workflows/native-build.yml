@@ -30,8 +30,13 @@ jobs:
           build/model_plan_test
 
   ps5-title:
-    name: Full PS5 title cross-build and static package checks
+    name: Full PS5 title cross-build and static package checks (${{ matrix.variant }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # fleet: PS5LM_FLEET=1, the RPC worker build released as ps5lm-app-fleet (docs/FLEET.md)
+        variant: [default, fleet]
     timeout-minutes: 45
     container:
       # Official Debian image; trixie supplies compatible LLVM19/SPIRV host tools.
@@ -44,6 +49,7 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       BUILD_JOBS: '2'
       LLVM_CONFIG: /usr/bin/llvm-config-19
+      PS5LM_FLEET: ${{ matrix.variant == 'fleet' && '1' || '0' }}
     steps:
       - name: Public cross-build prerequisites
         run: |
@@ -69,7 +75,7 @@ jobs:
       - name: State the full-build validation boundary
         if: always()
         run: |
-          echo '## Native PS5 title cross-build' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Builds the pinned public SDK/runtime, patched RADV, UI and existing app title; checks ELF/FSELF structure.' >> "$GITHUB_STEP_SUMMARY"
+          echo "## Native PS5 title cross-build (${{ matrix.variant }})" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Builds the pinned public SDK/runtime, patched RADV, UI and app title; checks ELF/FSELF structure.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Build tools and checksum-verified public SDK/driver dependencies download; no model or proprietary firmware is needed.' >> "$GITHUB_STEP_SUMMARY"
           echo 'This is static cross-build validation, not console boot, Vulkan execution, PS5 emulation or model inference.' >> "$GITHUB_STEP_SUMMARY"

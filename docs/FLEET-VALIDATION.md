@@ -1,5 +1,10 @@
 # Fleet validation — 2026-10-21–22
 
+> A record of the original validation. Since then the RPC patches moved to
+> `patches/fleet/` and the worker to the `PS5LM_FLEET=1` build, and
+> `scripts/test-fleet-native.sh` and `test-fleet-title.sh` were folded into
+> `PS5LM_FLEET=1 scripts/test-native-build.sh` ([FLEET.md](FLEET.md)).
+
 ## Result
 
 A working host-side increment: **one model split over two real CPU RPC processes**,

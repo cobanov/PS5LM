@@ -113,7 +113,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args[args.index('--device')+1], 'RPC0,RPC1')
         self.assertEqual(args[args.index('--host')+1], '127.0.0.1')
         self.assertEqual(args[args.index('--fit')+1], 'off')
-        self.assertEqual(args[args.index('--model')+1], '/tmp/a model.gguf')
+        self.assertEqual(args[args.index('--model')+1], str(Path('/tmp/a model.gguf').resolve()))
         self.assertEqual(args[args.index('--parallel')+1], '1')
 
     def test_environment_cannot_override_plan(self):

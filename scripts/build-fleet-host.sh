@@ -19,8 +19,9 @@ if [ "$actual" != "$expected" ]; then
     echo "build-fleet-host: llama.cpp revision $actual differs from pinned $expected" >&2
     exit 2
 fi
-# Keep the same patch set on the controller and PS5, with no protocol fork.
-for patch in "$root"/patches/*.patch; do
+# Keep the same patch set on the controller and the fleet title (PS5LM_FLEET=1
+# scripts/build-app.sh), with no protocol fork.
+for patch in "$root"/patches/*.patch "$root"/patches/fleet/*.patch; do
     git -C "$llama" apply --reverse --check "$patch" 2>/dev/null || git -C "$llama" apply "$patch"
 done
 "$cmake_bin" -S "$llama" -B "$out" -G Ninja \
@@ -48,8 +49,9 @@ out = Path(sys.argv[1]).resolve()
     "server_sha256": hashlib.sha256((out / "bin/llama-server").read_bytes()).hexdigest(),
     "rpc_binary": str(out / "bin/ggml-rpc-server"),
     "backends": ["CPU", "RPC"],
-    "applied_patches": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                        for p in sorted((Path(sys.argv[4]) / "patches").glob("*.patch"))},
+    "applied_patches": {str(p.relative_to(Path(sys.argv[4]) / "patches")): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted((Path(sys.argv[4]) / "patches").glob("*.patch"))
+                        + sorted((Path(sys.argv[4]) / "patches/fleet").glob("*.patch"))},
 }, indent=2) + "\n")
 PY_MANIFEST
 printf 'build-fleet-host: %s (llama.cpp %s)\n' "$out/bin" "$actual"

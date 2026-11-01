@@ -1,8 +1,34 @@
 name: Fleet validation (not PS5 hardware)
 on:
   pull_request:
+    paths:
+      - 'fleet/**'
+      - 'patches/*.patch'
+      - 'patches/fleet/**'
+      - 'ps5/app/fleet_worker*'
+      - 'tests/fleet*'
+      - 'tests/test_fleet_*'
+      - 'tests/make_fleet_fixture.py'
+      - 'tests/requirements-fleet.txt'
+      - 'scripts/build-fleet-host.sh'
+      - 'scripts/test-fleet.sh'
+      - 'third_party/llama.cpp'
+      - '.github/workflows/fleet-host.yml'
   push:
     branches: [main, 'fleet/**']
+    paths:
+      - 'fleet/**'
+      - 'patches/*.patch'
+      - 'patches/fleet/**'
+      - 'ps5/app/fleet_worker*'
+      - 'tests/fleet*'
+      - 'tests/test_fleet_*'
+      - 'tests/make_fleet_fixture.py'
+      - 'tests/requirements-fleet.txt'
+      - 'scripts/build-fleet-host.sh'
+      - 'scripts/test-fleet.sh'
+      - 'third_party/llama.cpp'
+      - '.github/workflows/fleet-host.yml'
 permissions:
   contents: read
 concurrency:
@@ -37,75 +63,3 @@ jobs:
           echo '## Fleet host validation' >> "$GITHUB_STEP_SUMMARY"
           echo 'Tests use a generated, untrained GGUF and loopback CPU workers; no console or trained model download is required.' >> "$GITHUB_STEP_SUMMARY"
           echo 'This job does not cross-compile the PS5 title or validate PS5 Vulkan, hardware memory, or multi-console performance.' >> "$GITHUB_STEP_SUMMARY"
-
-  ps5-objects:
-    name: PS5 target objects and clean-room runtime (not full title)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      BUILD_JOBS: '2'
-      LLVM_CONFIG: llvm-config-18
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - name: Pinned llama.cpp headers and RPC source
-        run: git submodule update --init --depth 1 third_party/llama.cpp
-      - name: Public native-build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18 make g++ wget unzip
-          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
-      - name: Compile PS5 objects and reproduce clean-room libc
-        run: scripts/test-fleet-native.sh
-      - name: State the native validation boundary
-        if: always()
-        run: |
-          echo '## PS5-target compile validation' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Compiles the fleet worker and patched RPC sources with the public pinned homebrew SDK; reproduces clean-room libc from source.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'This is not a full RADV/title link, console execution, QEMU emulation, or multi-console inference test.' >> "$GITHUB_STEP_SUMMARY"
-
-  ps5-title:
-    name: Full PS5 title cross-build and static package checks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    container:
-      # Official Debian image; trixie supplies compatible LLVM19/SPIRV host tools.
-      image: debian:trixie-20261020-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-      options: --cpus 2
-    defaults:
-      run:
-        shell: bash
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      BUILD_JOBS: '2'
-      LLVM_CONFIG: /usr/bin/llvm-config-19
-    steps:
-      - name: Public cross-build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential git ca-certificates wget curl unzip rsync cmake ninja-build \
-            clang-19 llvm-19-dev lld-19 libclang-rt-19-dev libclang-19-dev libclang-cpp19-dev \
-            libllvmspirvlib-19-dev libclc-19-dev spirv-tools spirv-headers glslang-tools \
-            meson pkgconf flex bison python3 python3-mako python3-yaml python3-packaging python3-setuptools \
-            zlib1g-dev libzstd-dev libffi-dev libedit-dev libxml2-dev libvulkan-dev glslc ffmpeg xxd
-          echo /usr/lib/llvm-19/bin >> "$GITHUB_PATH"
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - name: Pinned llama.cpp and UI sources
-        run: |
-          # Container root differs from the runner owner. Trust only this checkout,
-          # in the disposable job container; never use safe.directory='*'.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init --depth 1
-      - name: Build patched RADV and title, inspect ELF and FSELF
-        run: scripts/test-fleet-title.sh
-      - name: State the full-build validation boundary
-        if: always()
-        run: |
-          echo '## Native PS5 title cross-build' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Builds the pinned public SDK/runtime, patched RADV, UI and RPC-enabled title; checks ELF/FSELF structure.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Build tools and checksum-verified public SDK/driver dependencies download; no model or proprietary firmware is needed.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'This is static cross-build validation, not console boot, Vulkan execution, PS5 emulation or multi-console inference.' >> "$GITHUB_STEP_SUMMARY"
