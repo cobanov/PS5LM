@@ -1,38 +1,39 @@
 # Experimental fleet: one model, several PS5 workers
 
-**Status: host controller and an opt-in PS5 worker in a separate fleet build of
-the title; CPU RPC inference and the fleet title's cross-build are tested in CI.
-On hardware, one PS5 worker has served one model together with a Linux CPU
-worker (2026-11-01, below); more consoles at once are not validated by the
-maintainers.** This is not a performance claim. The default
-PS5LM title has no RPC code; releases ship the fleet build as its own zip,
-`ps5lm-app-fleet-vX.Y.Z.zip`.
+**Status: host controller, and a PS5 worker that is part of the app and starts
+only when you opt in; CPU RPC inference and the title's cross-build are tested
+in CI. On hardware, one PS5 worker has served one model together with a Linux
+CPU worker (2026-11-01, below); more consoles at once are not validated by the
+maintainers.** This is not a performance claim. Up to v0.10.0 the worker was a
+separate build, `ps5lm-app-fleet-v0.10.0.zip`; from v0.11.0 every PS5LM has it.
 
 What it is for: a model that does not fit in one console's memory runs across
 several, each holding a run of its layers. Every token passes through every
 worker over the network, so it is not faster than one console; it makes larger
-models possible. Workers are PS5s; a PC can also join with its CPU (the host
-build has no GPU backend, so a PC's GPU cannot be a worker yet).
+models possible. Workers are PS5s; a PC can join too, with its CPU or, with a
+GPU host build (`PS5LM_FLEET_GPU`), its GPU.
 
 ## Quick start
 
-1. **On each PS5:** install `ps5lm-app-fleet-vX.Y.Z.zip` from the
-   [releases](https://github.com/cobanov/PS5LM/releases) like the normal app,
-   then put `/data/PS5LM/fleet-worker.txt` on it over FTP: the console's own IP
+1. **On each PS5:** PS5LM v0.11.0 or later (for v0.10.0, its
+   `ps5lm-app-fleet-v0.10.0.zip` from the
+   [releases](https://github.com/cobanov/PS5LM/releases)), then put `/data/PS5LM/fleet-worker.txt` on it over FTP: the console's own IP
    and a port below 40000, then the acknowledgement line
    ([Configure workers](#configure-workers-only-after-building-and-validating-the-title)).
    Start PS5LM: it shows the worker screen instead of the dashboard.
 2. **On a Linux or macOS PC on the same network:** `git submodule update --init
    --depth 1 third_party/llama.cpp`, then `scripts/build-fleet-host.sh`
-   ([Host](#host-cpu--rpc)).
+   ([Host](#host-cpu--rpc)). To add the PC's GPU as a worker, build with
+   `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`) and start
+   `build/fleet-host/bin/ggml-rpc-server -H <PC IP> -p 30053 -d MTL0`
+   (`CUDA0`, `Vulkan0`), then list it as one more node.
 3. **Nodes:** copy `fleet/nodes.example.json` and list each console's
    `IP:port` with its memory budget.
 4. **Plan, then serve:** `python3 -m fleet plan --model model.gguf --nodes
    nodes.json` shows which layers go where; `python3 -m fleet serve ...
    --ack-insecure-rpc` starts one llama-server on `127.0.0.1:8081` of the PC
    ([Plan and serve](#plan-and-serve-from-the-controller)).
-5. **Back to normal:** delete `fleet-worker.txt` and restart PS5LM, or install
-   the normal zip again.
+5. **Back to normal:** delete `fleet-worker.txt` and restart PS5LM.
 
 Dense `llama` and `qwen2` GGUFs only; Qwen 3.5/3.8 (`qwen35`) is refused. RPC
 has no authentication: keep workers on a network you trust. On macOS, the app
@@ -136,12 +137,14 @@ scripts/build-fleet-host.sh
 ```
 
 The host script applies the repository's numbered llama.cpp patches and
-`patches/fleet`, disables
-GPU backends and RDMA, and builds the RPC tools plus the upstream multi-server
-regression. It does not fetch model weights or start a listener. Set `CMAKE`,
+`patches/fleet`, disables RDMA, and builds the RPC tools plus the upstream
+multi-server regression. It is CPU only unless `PS5LM_FLEET_GPU` is `metal`,
+`cuda` or `vulkan`; then `ggml-rpc-server -d MTL0` (`CUDA0`, `Vulkan0`) serves
+that GPU as a worker. The controller always names its RPC devices explicitly,
+so a GPU in the host build is used only through a worker you start and list. It does not fetch model weights or start a listener. Set `CMAKE`,
 `NINJA` or `CMAKE_BUILD_PARALLEL_LEVEL` for local tool locations/resources.
 
-### PS5 worker title — the fleet build
+### PS5 worker — part of the app
 
 Follow [BUILDING.md](BUILDING.md) to prepare PS5_Vulkan, its pinned PS5_Mesa and
 PS5_PayloadSDK forks, patched RADV, native packaging tool, `libc.prx` and the
@@ -149,22 +152,19 @@ checksum-pinned ps5-opengl SDK. Then:
 
 ```sh
 git submodule update --init --depth 1
-PS5LM_FLEET=1 scripts/build-app.sh
+scripts/build-app.sh
 ```
 
-`PS5LM_FLEET=1` is what makes it the fleet build: llama.cpp with `GGML_RPC=ON`
-(`GGML_RPC_RDMA=OFF`) and `patches/fleet` on top of the numbered patches, and
-the title with `fleet_worker.cpp` and the worker's startup mode in `main.cpp`.
-Without it, `scripts/build-app.sh` builds the default title with none of that,
-and takes `patches/fleet` back out of the llama.cpp checkout if a fleet build
-left it there. Both variants have the same title ID, so installing one replaces
-the other; settings and models in `/data/PS5LM` stay. `scripts/release-app.sh`
-names the zip after the variant the last build made.
+Every build has the worker: llama.cpp with `GGML_RPC=ON` (`GGML_RPC_RDMA=OFF`)
+and `patches/fleet` on top of the numbered patches, and the title with
+`fleet_worker.cpp` and the worker's startup mode in `main.cpp`. It stays idle,
+with no listener, unless `/data/PS5LM/fleet-worker.txt` exists. Up to v0.10.0
+this was a separate `PS5LM_FLEET=1` build and zip.
 
-CI builds both variants on every pull request: `native-build.yml` runs
-`scripts/test-native-build.sh` once as is and once with `PS5LM_FLEET=1`, each
-with the structural ELF/FSELF checks ([CI.md](CI.md)). That proves the fleet
-title links, not that it boots, that its Vulkan results are right, or that a
+CI builds the title on every pull request (`native-build.yml`,
+`scripts/test-native-build.sh`, with the structural ELF/FSELF checks,
+[CI.md](CI.md)). That proves the worker links, not that it boots, that its
+Vulkan results are right, or that a
 real multi-console run works. QEMU is not a substitute: its
 [x86 system models](https://www.qemu.org/docs/master/system/target-i386.html)
 and [Linux/BSD user modes](https://www.qemu.org/docs/master/user/main.html)
@@ -176,6 +176,12 @@ port 8082) and `ggml-rpc-server` on a Linux PC's CPU, with
 with blocks 0–22 on the PS5 and block 23 plus the output on the PC, and
 answered a chat request correctly. This run found the 40000 port limit below;
 the worker writes its own and ggml's messages to `/data/PS5LM/app.log`.
+
+The same day, with the worker in the normal app (this build) and a Mac's GPU:
+`ggml-rpc-server -d MTL0` from a `PS5LM_FLEET_GPU=metal` host build on an Apple
+M-series Mac, the controller on the Linux PC. Blocks 0–22 on the PS5, block 23
+and the output on the Mac's GPU; it answered correctly at 13 tokens/s (7.4 with
+the PC's CPU in that place). One small model, so not a performance figure.
 
 ## Configure workers (only after building and validating the title)
 

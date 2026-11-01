@@ -1,9 +1,10 @@
 # Fleet validation — 2026-10-21–22
 
 > A record of the original validation. Since then the RPC patches moved to
-> `patches/fleet/` and the worker to the `PS5LM_FLEET=1` build, and
+> `patches/fleet/`, the worker became part of every app build (from v0.11.0;
+> v0.10.0 had a separate `PS5LM_FLEET=1` build), and
 > `scripts/test-fleet-native.sh` and `test-fleet-title.sh` were folded into
-> `PS5LM_FLEET=1 scripts/test-native-build.sh` ([FLEET.md](FLEET.md)).
+> `scripts/test-native-build.sh` ([FLEET.md](FLEET.md)).
 
 ## Result
 

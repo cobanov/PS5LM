@@ -91,8 +91,9 @@ PS5_HOST=<console IP> scripts/ps5lm-app.sh screenshot out.bmp
 ```
 
 - The app closes itself on request (`/data/PS5LM/quit`), so nothing is killed while it draws.
-  Launching uses ps5-homebrew-dev-protocol's launch payload, cloned into `.deps/src`. A title started
-  any other way without a user (shsrv's `launch`) is ended by the system after about 20 seconds.
+  Launching sends `build/app-ps5/launch-PPSA99575.elf` (`ps5/app/launch_app.c`, built by
+  `build-app.sh`) to elfldr; it starts the title for the foreground user with `sceLncUtilLaunchApp`.
+  A title started without a user (shsrv's `launch`) is ended by the system after about 20 seconds.
 - `/data/PS5LM/app-args.txt` (one argument a line) overrides the planner. `/data/PS5LM/env.txt` (one
   `NAME=value` a line) sets `RADV_`, `MESA_`, `ACO_`, `GGML_` and `LLAMA_` switches before the GPU opens.
 - The artwork comes from SVG: `scripts/render-artwork.sh` renders the icon and the home screen

@@ -3,7 +3,7 @@
 #
 #   scripts/ps5lm-app.sh close     ask the running app to end itself, and wait
 #   scripts/ps5lm-app.sh deploy    upload build/app-ps5/title/<TITLE_ID>
-#   scripts/ps5lm-app.sh launch    start it (ps5-homebrew-dev-protocol's launch payload)
+#   scripts/ps5lm-app.sh launch    start it (build/app-ps5/launch-<TITLE_ID>.elf, from build-app.sh)
 #   scripts/ps5lm-app.sh cycle     close, deploy, launch
 #   scripts/ps5lm-app.sh screenshot [file]   what the TV shows, as a BMP
 #   scripts/ps5lm-app.sh load <model path>   switch the model, as the library does
@@ -23,7 +23,6 @@ host=${PS5_HOST:?set PS5_HOST to the console IP}
 ftp="ftp://$host:${PS5_FTP_PORT:-2121}"
 title=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["titleId"])' "$root/ps5/app/sce_sys/param.json")
 app="$root/build/app-ps5/title/$title"
-protocol=${PS5_PROTOCOL:-$root/.deps/src/ps5-homebrew-dev-protocol}
 
 close() {
     printf 'quit\n' | curl -sS -T - "$ftp/data/PS5LM/quit"
@@ -50,12 +49,10 @@ deploy() {
 }
 
 launch() {
-    # The protocol's script builds the payload; it is sent with socat, as the
-    # other scripts here do (the script's own sender needs GNU nc's -q).
-    local tmp=${TMPDIR:-/tmp}
-    PS5_PAYLOAD_SDK=${PS5_PAYLOAD_SDK:-$root/.deps/ps5-payload-sdk} PS5_CONTROLLER_COMPILE_ONLY=1 \
-        bash "$protocol/scripts/send-controller.sh" launch "$title" "$host" "${PS5_PORT:-9021}" > /dev/null
-    socat -u "FILE:$tmp/ps5-homebrew-protocol/launch-$title.elf" "TCP:$host:${PS5_PORT:-9021}"
+    # ps5/app/launch_app.c, built next to the app; elfldr runs it, it starts the title.
+    local elf="$root/build/app-ps5/launch-$title.elf"
+    [ -f "$elf" ] || { echo "ps5lm-app: build it first (scripts/build-app.sh makes $elf)" >&2; exit 1; }
+    socat -u "FILE:$elf" "TCP:$host:${PS5_PORT:-9021}"
     echo "ps5lm-app: launch sent"
 }
 
