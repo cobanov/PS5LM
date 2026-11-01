@@ -96,6 +96,10 @@ def banner(path, w, h, tagline='llama.cpp on PlayStation 5'):
     t = union(glyphs(tagline, 400, 0, CAP, track=0))
     ts = 0.035 * h / 1000
     parts.append(('#ebebf5', ' fill-opacity="0.55"', t, ts, x0 - t.bounds[0] * ts, base + 0.074 * h - CAP * ts))
+    background(path, w, h, parts)
+
+def background(path, w, h, parts):
+    g = h / 18
     body = []
     for colour, extra, p, sc, ox, oy in parts:
         pen = SVGPathPen(None, ntos=lambda v: f'{v:.2f}'.rstrip('0').rstrip('.'))
@@ -123,6 +127,26 @@ def banner(path, w, h, tagline='llama.cpp on PlayStation 5'):
   <rect width="{w}" height="{h}" fill="url(#glow)"/>
 ''' + '\n'.join(body) + '\n</svg>\n')
 
+def card(path, w, h, lines=(('Run LLMs and decision models', INK_DARK), ('on your PS5', ACCENT)),
+         sub="llama.cpp on the console's GPU, for every device on your network"):
+    """Link previews: the logo top left, a two-line headline as on the site's hero (the second line in the
+    accent), one muted line under it, over the same grid and glow as the banner. Sizes follow the height."""
+    k, x = h / 630, 80 * h / 630
+    items = []
+    def put(paths, colour, scale, left, base, extra=''):
+        u = union(paths) if isinstance(paths, list) else paths
+        items.append((colour, extra, u, scale, left - u.bounds[0] * scale, base - CAP * scale))
+    a, b, c = horizontal(760)
+    ls, lx = 40 * k / CAP, x - bounds([a, b, c])[0] * 40 * k / CAP
+    for colour, p in ((INK_DARK, a), (ACCENT, b), (INK_DARK, c)):
+        items.append((colour, '', p, ls, lx, 84 * k))
+    em, base = 64 * k, 334 * k
+    for text, colour in lines:
+        put(glyphs(text, 760, 0, CAP, track=-45), colour, em / 1000, x, base)
+        base += 1.2 * em
+    put(glyphs(sub, 400, 0, CAP, track=0), '#ebebf5', 25 * k / 1000, x, base - 1.2 * em + 72 * k, ' fill-opacity="0.6"')
+    background(path, w, h, items)
+
 # On dark grounds the light letters glow and look heavier, so the reversed versions are set a step lighter.
 logo('ps5lm-stacked-dark.svg', stacked, INK_DARK, 760)
 logo('ps5lm-stacked-light.svg', stacked, INK_LIGHT, 800)
@@ -132,8 +156,8 @@ tile('ps5lm-icon.svg', 760)
 # Small cut for 16-48 px: heavier letters, less margin, so the strokes survive the pixel grid.
 tile('ps5lm-icon-small.svg', 900, fill=0.84, lift=0)
 # Wide formats: the link preview (og:image), GitHub's social preview, the PS5 home screen background (pic0/pic1).
-banner('ps5lm-og.svg', 1200, 630)
-banner('ps5lm-social.svg', 1280, 640)
+card('ps5lm-og.svg', 1200, 630)
+card('ps5lm-social.svg', 1280, 640)
 banner('ps5lm-background.svg', 3840, 2160)
 
 # Self-check: the cursor sits exactly under the 5, and the two lines keep their gap.
