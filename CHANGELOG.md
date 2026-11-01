@@ -5,7 +5,7 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-01
 
 ### Added
 - **Fleet, experimental: one model across several consoles.** A PC runs the controller
@@ -43,6 +43,9 @@ v0.1.x are the upstream payload releases by cobanov.
   library looked only in `/mnt/ext0`, `/mnt/usb0` and `/mnt/usb1`, while downloads can go to any
   drive the exporter reports; it now also reads the download folder and every mounted drive's
   `PS5LM/models` (#43).
+- The SHA-256 check at the end of a download shows how far it has read, once a second, instead of
+  a line that did not move for minutes on a large file. The queue is saved when the check starts,
+  so a restart during the check repeats only the check, not the download (#30, #51).
 
 ## [0.9.1] - 2026-10-20
 
