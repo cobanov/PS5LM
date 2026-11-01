@@ -72,6 +72,9 @@ std::string run_fleet_worker(const FleetWorkerConfig & config) {
         if (setenv("GGML_RPC_NO_COMM", "1", 1) != 0) {
             return "Cannot disable extra RPC listeners; refusing to start";
         }
+        // The title's stderr does not reach app.log; ggml's log (RPC and Vulkan
+        // errors included) goes to stdout, which does.
+        ggml_log_set([](ggml_log_level, const char * text, void *) { std::fputs(text, stdout); }, nullptr);
         ggml_backend_load_all();
         ggml_backend_reg_t vulkan = ggml_backend_reg_by_name("Vulkan");
         if (!vulkan) {
@@ -91,7 +94,7 @@ std::string run_fleet_worker(const FleetWorkerConfig & config) {
         if (!device) {
             return "No Vulkan GPU device; refusing CPU fallback";
         }
-        std::fprintf(stderr,
+        std::fprintf(stdout,
             "ps5lm-fleet: WARNING: unauthenticated, unencrypted RPC v%d.%d.%d on %s\n"
             "ps5lm-fleet: trusted isolated LAN ONLY; no public forwarding; one controller at a time\n"
             "ps5lm-fleet: exporting only %s; local model server/downloads are disabled\n",

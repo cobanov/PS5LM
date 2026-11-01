@@ -76,8 +76,9 @@ inline FleetWorkerConfig parse_fleet_worker_config(const std::string & text) {
         (octets[0] == 192 && octets[1] == 168);
     const bool loopback = host == "127.0.0.1";
     if ((!private_ip && !loopback) || octets[3] == 0 || octets[3] == 255 ||
-        !number(endpoint.substr(colon + 1), 65535, port) || port < 1024) {
-        config.error = "Bind only a private console IPv4 (or 127.0.0.1), port 1024..65535; never 0.0.0.0";
+        !number(endpoint.substr(colon + 1), 39999, port) || port < 1024) {
+        // A PS5 title gets EACCES binding port 40000 and up (39999 binds; measured).
+        config.error = "Bind only a private console IPv4 (or 127.0.0.1), port 1024..39999; never 0.0.0.0";
         return config;
     }
     config.state = FleetWorkerConfig::enabled;

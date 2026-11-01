@@ -24,6 +24,7 @@ static std::string last_endpoint;
 
 extern "C" {
 void ggml_backend_load_all() {}
+void ggml_log_set(ggml_log_callback, void *) {}
 ggml_backend_reg_t ggml_backend_reg_by_name(const char * name) {
     return have_vulkan && std::strcmp(name, "Vulkan") == 0 ? &registry : nullptr;
 }
@@ -55,10 +56,10 @@ int main() {
             std::exit(1);
         }
     };
-    const std::string text = "192.168.1.2:50052\nI_UNDERSTAND_RPC_IS_UNAUTHENTICATED\n";
+    const std::string text = "192.168.1.2:30052\nI_UNDERSTAND_RPC_IS_UNAUTHENTICATED\n";
     const auto valid = parse_fleet_worker_config(text);
     check(!run_fleet_worker({}).empty() && rpc_calls == 0, "disabled cannot open listener");
-    check(!run_fleet_worker({FleetWorkerConfig::enabled, "0.0.0.0:50052", ""}).empty() && rpc_calls == 0,
+    check(!run_fleet_worker({FleetWorkerConfig::enabled, "0.0.0.0:30052", ""}).empty() && rpc_calls == 0,
           "forged wildcard config revalidated");
     have_vulkan = false;
     check(run_fleet_worker(valid).find("No Vulkan") != std::string::npos && rpc_calls == 0, "no Vulkan");

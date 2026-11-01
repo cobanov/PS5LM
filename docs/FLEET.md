@@ -1,8 +1,10 @@
 # Experimental fleet: one model, several PS5 workers
 
 **Status: host controller and an opt-in PS5 worker in a separate fleet build of
-the title; CPU RPC inference and the fleet title's cross-build are tested in CI,
-real consoles are not validated.** This is not a performance claim. The default
+the title; CPU RPC inference and the fleet title's cross-build are tested in CI.
+On hardware, one PS5 worker has served one model together with a Linux CPU
+worker (2026-11-01, below); more consoles at once are not validated by the
+maintainers.** This is not a performance claim. The default
 PS5LM title has no RPC code; releases ship the fleet build as its own zip,
 `ps5lm-app-fleet-vX.Y.Z.zip`.
 
@@ -108,7 +110,7 @@ GPU backends and RDMA, and builds the RPC tools plus the upstream multi-server
 regression. It does not fetch model weights or start a listener. Set `CMAKE`,
 `NINJA` or `CMAKE_BUILD_PARALLEL_LEVEL` for local tool locations/resources.
 
-### PS5 worker title — the fleet build, not hardware validated
+### PS5 worker title — the fleet build
 
 Follow [BUILDING.md](BUILDING.md) to prepare PS5_Vulkan, its pinned PS5_Mesa and
 PS5_PayloadSDK forks, patched RADV, native packaging tool, `libc.prx` and the
@@ -137,15 +139,26 @@ real multi-console run works. QEMU is not a substitute: its
 and [Linux/BSD user modes](https://www.qemu.org/docs/master/user/main.html)
 provide no PS5 loader, AGC or direct memory.
 
+On a console (2026-11-01): the fleet build on one PS5 (worker on
+port 8082) and `ggml-rpc-server` on a Linux PC's CPU, with
+`python3 -m fleet serve` on that PC, served `qwen2.5-0.5b-instruct-q4_k_m.gguf`
+with blocks 0–22 on the PS5 and block 23 plus the output on the PC, and
+answered a chat request correctly. This run found the 40000 port limit below;
+the worker writes its own and ggml's messages to `/data/PS5LM/app.log`.
+
 ## Configure workers (only after building and validating the title)
 
 On each console, explicitly create `/data/PS5LM/fleet-worker.txt` containing
-**that console's own private IP**, port 1024–65535, and the exact acknowledgement:
+**that console's own private IP**, port 1024–39999, and the exact acknowledgement:
 
 ```text
-192.168.50.21:50052
+192.168.50.21:30052
 I_UNDERSTAND_RPC_IS_UNAUTHENTICATED
 ```
+
+The port must be below 40000: a PS5 title gets "Permission denied" for 40000
+and up (measured on a console), so upstream's default 50052 cannot work there.
+Workers on a PC or Mac (`ggml-rpc-server`) can keep 50052.
 
 Restart PS5LM. It displays an experimental worker screen, not “Ready”: upstream
 has no ready callback, so the host must successfully handshake. A malformed,

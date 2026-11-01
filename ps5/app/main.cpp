@@ -725,7 +725,7 @@ int main(int, char **) {
         std::string worker_error = fleet.error;
         std::function<void()> worker = [&] {
             worker_error = run_fleet_worker(fleet);
-            std::fprintf(stderr, "ps5lm-fleet: %s\n", worker_error.c_str());
+            std::printf("ps5lm-fleet: %s\n", worker_error.c_str());
             stopped.store(true, std::memory_order_release);
         };
         if (fleet.state == FleetWorkerConfig::enabled) {
@@ -751,7 +751,7 @@ int main(int, char **) {
             }
             notify("PS5LM fleet: experimental unauthenticated RPC. Trusted isolated LAN only.");
         } else {
-            std::fprintf(stderr, "ps5lm-fleet: %s\n", worker_error.c_str());
+            std::printf("ps5lm-fleet: %s\n", worker_error.c_str());
             stopped = true;
         }
         hui::ui::Feedback quiet;

@@ -175,8 +175,9 @@ ggml-vulkan on [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)'s RADV, bui
 consoles over llama.cpp's RPC, controlled by one PC: one model across their
 memory, not a copy on each. It is a separate build of the app, released as
 `ps5lm-app-fleet-vX.Y.Z.zip` next to the normal zip; the normal app has no RPC
-code. Two-worker CPU inference is tested in CI and the fleet title cross-builds
-there, but it is **experimental**: Qwen 3.8's `qwen35` layout is not admitted by
+code. Two-worker CPU inference is tested in CI, the fleet title cross-builds
+there, and a PS5 worker has served a model together with a PC, but it is
+**experimental**: Qwen 3.8's `qwen35` layout is not admitted by
 this first planner yet, and RPC has no authentication, so it belongs on an
 isolated network you trust. See [validation and limits](docs/FLEET-VALIDATION.md).
 

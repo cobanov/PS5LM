@@ -1,0 +1,28 @@
+Subject: [PATCH] rpc: say why the server socket could not be created
+
+Upstream returns nullptr from socket, bind and listen without errno, so a
+worker that cannot listen only prints "Failed to create server socket".
+
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -736,6 +736,7 @@
+ socket_ptr socket_t::create_server(const char * host, int port) {
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+     if (!is_valid_fd(sockfd)) {
++        LOG_ERROR("Failed to open a socket: %s\n", strerror(errno));
+         return nullptr;
+     }
+     if (!set_reuse_addr(sockfd)) {
+@@ -756,9 +757,11 @@
+     serv_addr.sin_port = htons(port);
+ 
+     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
++        LOG_ERROR("Failed to bind %s:%d: %s\n", host, port, strerror(errno));
+         return nullptr;
+     }
+     if (listen(sockfd, 1) < 0) {
++        LOG_ERROR("Failed to listen on %s:%d: %s\n", host, port, strerror(errno));
+         return nullptr;
+     }
+     LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);

@@ -14,7 +14,8 @@ v0.1.x are the upstream payload releases by cobanov.
   GGUFs only for now; Qwen 3.8's `qwen35` layout is refused by the planner. The fleet build is a
   separate zip, `ps5lm-app-fleet-vX.Y.Z.zip` (`PS5LM_FLEET=1 scripts/build-app.sh`); the normal
   app has no RPC code. A worker starts only when `/data/PS5LM/fleet-worker.txt` names the
-  console's own private address and the acknowledgement, because RPC has no authentication:
+  console's own private address, a port below 40000 (the PS5 refuses higher ones) and the
+  acknowledgement, because RPC has no authentication:
   keep it on an isolated network. `docs/FLEET.md` is the guide. By @ntindle in #35.
 - **An opt-in endpoint for the model's own numbers**: `POST /v1/introspect` answers with the whole
   logit row at the positions you name, the top candidates with their probabilities, the entropy, and
