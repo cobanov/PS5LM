@@ -41,9 +41,7 @@
 
 #include "dashboard.hpp"
 #include "fetch.hpp"
-#if PS5LM_FLEET  // the fleet build only: PS5LM_FLEET=1 scripts/build-app.sh
 #include "fleet_worker.hpp"
-#endif
 #include "market.hpp"
 #include "display.hpp"
 #include "ggml-backend.h"
@@ -110,9 +108,7 @@ constexpr const char * kEnv         = "/data/PS5LM/env.txt";  // driver and ggml
 constexpr const char * kTextOnly    = "/data/PS5LM/text-only";  // the last load's projector failed: load without it once
 constexpr const char * kQuit        = "/data/PS5LM/quit";
 constexpr const char * kSettings    = "/data/PS5LM/settings.json";
-#if PS5LM_FLEET
 constexpr const char * kFleetWorker = "/data/PS5LM/fleet-worker.txt";
-#endif
 constexpr const char * kScratch     = "/data/PS5LM/scratch";
 // The file tools only: a title cannot start processes (no shell command).
 constexpr const char * kTools       = "read_file,write_file,edit_file,file_glob_search,grep_search,get_info";
@@ -713,7 +709,6 @@ int main(int, char **) {
     }
     sceSystemServiceHideSplashScreen();
 
-#if PS5LM_FLEET
     // Fleet is a mutually exclusive startup mode, not another local model.
     // In particular, do not start StatsCollector (its HTTP probes), model
     // auto-load, downloads, or controller/file commands that could restart or
@@ -777,7 +772,6 @@ int main(int, char **) {
             }
         }
     }
-#endif
 
     StatsCollector stats;
     stats.start(kPort);

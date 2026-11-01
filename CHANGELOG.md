@@ -5,6 +5,22 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Changed
+- **The fleet worker is part of the app.** There is no separate fleet build or
+  `ps5lm-app-fleet` zip any more: every PS5LM can be a fleet worker, and stays the normal app
+  unless `/data/PS5LM/fleet-worker.txt` asks for one, as before. `PS5LM_FLEET` is gone from
+  `scripts/build-app.sh`, and CI builds one title again.
+
+### Added
+- **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
+  `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
+  GPU next to the consoles. The default host build stays CPU only.
+- `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
+  (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
+  ps5-homebrew-dev-protocol.
+
 ## [0.10.0] - 2026-11-01
 
 ### Added
