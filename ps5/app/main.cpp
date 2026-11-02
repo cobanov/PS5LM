@@ -105,6 +105,7 @@ int sceSystemServiceHideSplashScreen(void);
 int sceKernelSendNotificationRequest(uint32_t device, void * request, size_t size, int blocking);
 int sceKernelUsleep(uint32_t microseconds);
 int sceSystemServiceLoadExec(const char * path, const char * const * args);
+int sceSystemServicePowerTick(void);
 }
 
 namespace {
@@ -304,6 +305,23 @@ void log_memory(const char * when, bool devices = true) {
         std::printf(", %s free %zu total %zu", ggml_backend_dev_name(ggml_backend_dev_get(i)), free, total);
     }
     std::printf("\n");
+}
+
+// Rest mode ends the title, and on a jailbroken console the controllers do not
+// connect again until a restart. Requests from the network are not controller
+// input, so the system put a serving console to rest an hour after the last
+// button press. While the app has work, it tells the system it is in use, as
+// a video player does; idle, the console's own rest-mode setting applies.
+void keep_awake(bool work) {
+    static int64_t last = 0;
+    const int64_t now = hui::sys::monotonic_us();
+    if (work && now - last >= 30'000'000) {
+        const int rc = sceSystemServicePowerTick();
+        if (last == 0) {
+            ps5lm::log_line("keeping the console out of rest mode while there is work (power tick: %d)\n", rc);
+        }
+        last = now;
+    }
 }
 
 std::vector<std::string> read_lines(const std::string & path) {
@@ -952,6 +970,7 @@ int main(int, char **) {
             }
             if (n % 60 == 0) {
                 quit_if_asked();  // Existing safe title-close path; not cancellation in a GPU call.
+                keep_awake(!failed);
             }
         }
     }
@@ -1209,6 +1228,11 @@ int main(int, char **) {
         }
         if (n % 10 == 0) {
             MarketView mv = market.snapshot();
+            keep_awake(!models.running.empty() ||
+                       std::any_of(mv.downloads.begin(), mv.downloads.end(), [](const Download & d) {
+                           return d.state == DownloadState::queued || d.state == DownloadState::running ||
+                                  d.state == DownloadState::retrying;
+                       }));
             // A finished download joins the library.
             if (mv.saved != saved_seen) {
                 saved_seen = mv.saved;

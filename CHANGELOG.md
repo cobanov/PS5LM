@@ -104,6 +104,12 @@ v0.1.x are the upstream payload releases by cobanov.
   counts the window layers at their window, as llama.cpp keeps them. Spark-X2.6 4B (27 of 36 layers
   keep 512 tokens) plans 256k with a q8_0 cache instead of 128k with q4_0. **Longest context** in
   Settings goes to 192k and 256k, and the planner tries both.
+- A console serving a model went into rest mode an hour after the last button press: requests
+  from the network are not controller input. Rest mode ends the app, and on a jailbroken console the
+  controllers do not connect again until a restart. While a model is loaded, a download is queued
+  or running, or the app is a fleet worker, it now tells the system every 30 s that it is in use
+  (`sceSystemServicePowerTick`, as a video player does); with nothing to do, the console's own
+  rest-mode setting applies. `app.log` says when it starts doing so.
 
 ## [0.10.0] - 2026-11-01
 
