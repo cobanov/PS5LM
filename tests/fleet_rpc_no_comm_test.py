@@ -67,7 +67,8 @@ def run(binary):
                     time.sleep(0.05)
             sock.settimeout(1)
             hello = request(sock, 14, bytes(24), 28)
-            assert hello[:3] == bytes([8, 0, 0]), hello[:3]
+            # Only the major version breaks compatibility; upstream bumps the patch per new ggml op.
+            assert hello[0] == 8, hello[:3]
             for rank in (0, 1):
                 body = struct.pack('<IIII64s', 0, rank, 2, comm_port, b'127.0.0.1')
                 assert request(sock, 20, body, 1) == b'\0', f'rank {rank} was not refused'

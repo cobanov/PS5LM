@@ -50,6 +50,12 @@ v0.1.x are the upstream payload releases by cobanov.
   `ps5lm-app-fleet` zip any more: every PS5LM can be a fleet worker, and stays the normal app
   unless `/data/PS5LM/fleet-worker.txt` asks for one, as before. `PS5LM_FLEET` is gone from
   `scripts/build-app.sh`, and CI builds one title again.
+- llama.cpp moves to b11827 (970b51ce7, 2026-10-22), 219 commits on, among them ggml-vulkan's
+  fixes for GPU-visible host memory (#30468) and concurrent first device init (#29766), its strided
+  f16 KV copy on AMD (#27703), and upstream's own `tojson` floats as Python writes them (#30362,
+  #30483), so `patches/0006-jinja-tojson-floats-as-python.patch` is gone; `patches/0005` is
+  re-based on the new `server-http.cpp`, and `patches/0009` (introspection) on the new
+  `server-context.cpp`. It builds and links for the console as before.
 - The planner counts the compute buffers' growth with the prompt batch (`-ub`, about 38 bytes a
   token per unit of feed-forward width, measured with ggml-vulkan on the console's shader paths),
   and the batch for language models is one constant, `kPromptUbatch`, still 64 until

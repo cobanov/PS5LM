@@ -1,5 +1,5 @@
 diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
-index 70b8d7d..7da0f33 100644
+index e0b9d0ec1..7cef7a7ee 100644
 --- a/tools/server/CMakeLists.txt
 +++ b/tools/server/CMakeLists.txt
 @@ -25,6 +25,8 @@ add_library(${TARGET} STATIC
@@ -12,10 +12,10 @@ index 70b8d7d..7da0f33 100644
  
  if (BUILD_SHARED_LIBS)
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 60c5633..c785782 100644
+index a0acf1655..6dba147c4 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -292,6 +292,13 @@ struct server_slot {
+@@ -325,6 +325,13 @@ struct server_slot {
  
      std::vector<completion_token_output> generated_token_probs;
  
@@ -29,7 +29,7 @@ index 60c5633..c785782 100644
      bool has_next_token = true;
      bool has_new_line   = false;
      bool truncated      = false;
-@@ -397,6 +404,13 @@ struct server_slot {
+@@ -435,6 +442,13 @@ struct server_slot {
          generated_token_probs.clear();
          json_schema = json();
  
@@ -43,7 +43,7 @@ index 60c5633..c785782 100644
          task_prev = std::move(task);
          task.reset();
  
-@@ -953,6 +967,9 @@ public:
+@@ -1023,6 +1037,9 @@ public:
  
      server_decision_context decision;
  
@@ -53,7 +53,7 @@ index 60c5633..c785782 100644
      server_queue    queue_tasks;
      server_response queue_results;
  
-@@ -1019,6 +1036,14 @@ private:
+@@ -1089,6 +1106,14 @@ private:
      int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
      int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
  
@@ -68,7 +68,7 @@ index 60c5633..c785782 100644
      int n_empty_consecutive = 0;
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
-@@ -1213,11 +1238,33 @@ private:
+@@ -1284,11 +1309,33 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -103,7 +103,7 @@ index 60c5633..c785782 100644
          if (model_tgt == nullptr) {
              SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
              return false;
-@@ -1230,6 +1277,13 @@ private:
+@@ -1301,6 +1348,13 @@ private:
  
          vocab = llama_model_get_vocab(model_tgt);
  
@@ -117,7 +117,7 @@ index 60c5633..c785782 100644
          try {
              decision.init(model_tgt);
          } catch (const std::exception & e) {
-@@ -2290,6 +2344,27 @@ private:
+@@ -2411,6 +2465,27 @@ private:
  
          res->generation_params = slot.task->params; // copy the parameters
  
@@ -145,7 +145,7 @@ index 60c5633..c785782 100644
          queue_results.send(std::move(res));
      }
  
-@@ -3231,13 +3306,35 @@ private:
+@@ -3513,13 +3588,35 @@ private:
          int32_t off_next = 0;
          int32_t n_batch = llama_n_batch(ctx_tgt);
          for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -183,7 +183,7 @@ index 60c5633..c785782 100644
  #ifdef DEBUG_TIMINGS
                  llama_synchronize(ctx_tgt);
  #endif
-@@ -3978,13 +4075,21 @@ private:
+@@ -4353,13 +4450,21 @@ private:
                              break;
                          }
  
@@ -206,7 +206,7 @@ index 60c5633..c785782 100644
                              /* is_prompt = */ true);
                          if (!slot.task->decision.order.empty()) {
                              batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
-@@ -4286,6 +4391,159 @@ private:
+@@ -4661,6 +4766,159 @@ private:
          return true;
      }
  
@@ -366,7 +366,7 @@ index 60c5633..c785782 100644
      void post_decode(int32_t n_batch_tokens, int32_t off) {
          // for checking if a given batch index is inside the current sub-batch
          auto is_inside_view = [&](int32_t idx) {
-@@ -4842,6 +5100,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5230,6 +5488,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
              task.apply_chat_session(chat_session);
  
@@ -401,7 +401,7 @@ index 60c5633..c785782 100644
              task.id_slot = json_value(data, "id_slot", -1);
              sse_ping_interval = task.params.sse_ping_interval;
  
-@@ -5690,6 +5976,49 @@ void server_routes::init_routes() {
+@@ -6283,6 +6569,49 @@ void server_routes::init_routes() {
          return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
      };
  
@@ -449,15 +449,15 @@ index 60c5633..c785782 100644
 +    };
 +
      this->post_rerank = [this](const server_http_req & req) {
-         auto res = create_response();
-         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+         return handle_rerank_impl(req);
+     };
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index ed23f7d..d2ae01d 100644
+index 4a8e327fc..3d2637a32 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
-@@ -154,6 +154,8 @@ struct server_routes {
-     server_http_context::handler_t post_embeddings_oai;
+@@ -159,6 +159,8 @@ struct server_routes {
      server_http_context::handler_t post_rerank;
+     server_http_context::handler_t post_tts;
      server_http_context::handler_t post_systemone;
 +    // PS5LM fork: raw logits and per-layer activations
 +    server_http_context::handler_t post_introspect;
@@ -466,7 +466,7 @@ index ed23f7d..d2ae01d 100644
  
 diff --git a/tools/server/server-introspect.cpp b/tools/server/server-introspect.cpp
 new file mode 100644
-index 0000000..af9c2ee
+index 000000000..af9c2ee80
 --- /dev/null
 +++ b/tools/server/server-introspect.cpp
 @@ -0,0 +1,624 @@
@@ -1096,7 +1096,7 @@ index 0000000..af9c2ee
 +}
 diff --git a/tools/server/server-introspect.h b/tools/server/server-introspect.h
 new file mode 100644
-index 0000000..a80f7e1
+index 000000000..a80f7e1d7
 --- /dev/null
 +++ b/tools/server/server-introspect.h
 @@ -0,0 +1,205 @@
@@ -1306,7 +1306,7 @@ index 0000000..a80f7e1
 +    }
 +};
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index 54e126a..30efbbb 100644
+index 1e2dce888..a3609b179 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -187,6 +187,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
@@ -1328,7 +1328,7 @@ index 54e126a..30efbbb 100644
          ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
  
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 3f30da2..542d559 100644
+index d7ac2a1dc..180984684 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -351,6 +351,10 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
@@ -1343,18 +1343,18 @@ index 3f30da2..542d559 100644
  }
  
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 50926ec..93b29ec 100644
+index 810cefbfe..97d31fd9c 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -10,6 +10,7 @@
- 
+@@ -11,6 +11,7 @@
  // TODO: prevent including the whole server-common.h as we only use server_tokens
  #include "server-common.h"
+ #include "mtmd-helper.h"
 +#include "server-introspect.h" // PS5LM fork: introspection request/response types
  
  
  enum server_task_type {
-@@ -99,6 +100,12 @@ struct task_params {
+@@ -111,6 +112,12 @@ struct task_params {
      // Embeddings
      int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
  
@@ -1367,7 +1367,7 @@ index 50926ec..93b29ec 100644
      json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
      json to_json(bool only_metrics = false) const;
  };
-@@ -384,6 +391,9 @@ struct server_task_result_cmpl_final : server_task_result {
+@@ -407,6 +414,9 @@ struct server_task_result_cmpl_final : server_task_result {
  
      task_params generation_params;
  
@@ -1378,10 +1378,10 @@ index 50926ec..93b29ec 100644
      bool               verbose  = false;
      task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 871e827..12dd9bd 100644
+index ce44405b8..ba39d0e63 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -241,6 +241,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+@@ -258,6 +258,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
          routes.post_systemone              = models_routes->proxy_post;
          routes.post_tokenize               = models_routes->proxy_post;
          routes.post_detokenize             = models_routes->proxy_post;
@@ -1390,7 +1390,7 @@ index 871e827..12dd9bd 100644
          routes.post_apply_template         = models_routes->proxy_post;
          routes.post_chat_completions_tok   = models_routes->proxy_post;
          routes.post_responses_tok_oai      = models_routes->proxy_post;
-@@ -289,6 +291,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
+@@ -308,6 +310,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
      ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
      ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
      ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));

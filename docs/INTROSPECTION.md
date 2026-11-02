@@ -18,7 +18,7 @@ The field also works on `/completion` itself, so an existing client only has to
 add one key.
 
 Implementation: `patches/0009-introspection-logits-and-activations.patch` over
-llama.cpp `04f7226`. Logits come from the context's own output buffer
+llama.cpp `970b51ce7`. Logits come from the context's own output buffer
 (`llama_get_logits_ith`), so no work is repeated; activations are copied out of
 the compute graph while it runs, through the graph-eval callback llama.cpp
 already exposes (`llama_context_params.cb_eval`). Nothing is captured unless a

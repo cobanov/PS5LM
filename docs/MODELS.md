@@ -1,6 +1,6 @@
 # Models
 
-Models worth running on a PS5, from what is popular on Ollama in October 2026, with the GGUF sizes on Hugging Face. Every architecture below loads in the pinned llama.cpp (`b11327`).
+Models worth running on a PS5, from what is popular on Ollama in October 2026, with the GGUF sizes on Hugging Face. Every architecture below loads in the pinned llama.cpp (`b11827`).
 
 The console has 16 GB shared by everything. How much one PS5LM process can hold is what `probes/memprobe` measures. Until then: ProsperoAI already keeps a 6.37 GiB model resident on this console, so up to about 6 GiB is safe, and anything above 8 GiB waits for the probe.
 
