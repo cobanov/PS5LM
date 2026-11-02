@@ -58,13 +58,21 @@ minutes before anything reaches the console.
 name = "PS5LM"
 base_url = "http://192.168.1.19:8081/v1"
 wire_api = "responses"
+```
 
-[profiles.ps5]
+`~/.codex/ps5.config.toml`, the profile:
+
+```toml
 model_provider = "ps5lm"
 model = "ps5"
 ```
 
-Then `codex -p ps5`.
+Then `codex -p ps5`. Codex 0.166 reads a profile from its own `<name>.config.toml` and refuses to
+start while `config.toml` still has an old `[profiles.ps5]` table.
+
+Codex sends two developer messages after its instructions. Qwen's chat template refuses a system
+message that is not first ("System message must be at the beginning"), so the app's llama-server
+folds them into the first one (`patches/0004`).
 
 ### The Responses API
 
@@ -94,8 +102,8 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536 claude
 Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the context the dashboard shows:
 Claude Code does not know the model and otherwise assumes 200k. It sends some
 system messages in the middle of a conversation, which Qwen's chat template
-refuses ("System message must be at the beginning"); the app's llama-server
-folds them into the first one (`patches/0004`).
+refuses; the app's llama-server folds them into the first one (`patches/0004`),
+on every endpoint.
 
 ## aider
 

@@ -95,6 +95,12 @@ v0.1.x are the upstream payload releases by cobanov.
   takes, so it looked hung (#30). It now says "Checking the SHA-256, 45%". The queue is saved
   before the check, so a restart during it checks the file again but no longer fetches the last
   piece first.
+- codex failed on Qwen models with "System message must be at the beginning" (#55): it sends two
+  developer messages after its instructions, and Qwen's template refuses a system message that is
+  not first. `patches/0004` folded such messages into the first one only for the Anthropic API
+  (Claude Code); it now does so for Chat Completions, Responses and Anthropic alike, with
+  `tests/server_system_messages_test.py` checking all three on a host build. docs/CLI.md's codex
+  setup is the one codex 0.166 reads: the profile in its own `~/.codex/ps5.config.toml`.
 
 ## [0.10.0] - 2026-11-01
 
