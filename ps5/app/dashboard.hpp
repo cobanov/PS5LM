@@ -61,6 +61,22 @@ class Dashboard {
     void set_logs(std::vector<std::string> app, std::vector<std::string> llama);
     bool wants_logs() const;  // the logs are on screen: keep them fresh
     void set_market(MarketView view) { market_ = std::move(view); }
+    // Where the app keeps its files: full storage (/data), or its own, of
+    // `app_gib`. `ask`: full storage is closed and no choice was made yet, so
+    // the question comes up over whatever page is open.
+    void set_storage(bool full, double app_gib, bool ask) {
+        full_storage_ = full;
+        app_storage_gib_ = app_gib;
+        if (ask) {
+            storage_dialog_ = true;
+            storage_howto_ = false;
+        }
+    }
+    // The debug report's row: being written, or where the last one went.
+    void set_report_status(bool busy, std::string status) {
+        report_busy_ = busy;
+        report_status_ = std::move(status);
+    }
     int  page() const { return page_; }
     void update(const hui::InputFrame & input, float dt, hui::ui::Feedback & feedback);
     void draw(DashboardFrame & frame) const;
@@ -69,7 +85,8 @@ class Dashboard {
     // changed (read them with settings()).
     struct Request {
         enum Kind { none, load, unload, settings, clear_scratch, market_search, market_open, market_plan, market_download,
-                    market_download_unload, download_pause, download_resume, download_remove, suggested_download, ask } kind = none;
+                    market_download_unload, download_pause, download_resume, download_remove, suggested_download, ask,
+                    debug_report, storage_app, restart } kind = none;
         std::string path;   // a model, a market query, the folder a download goes to (empty: the setting), or what to ask
         int repo = -1, file = -1;  // a market file, a download's index (repo), or a suggestion's (repo)
     };
@@ -108,6 +125,9 @@ class Dashboard {
     void draw_picker(hui::gfx::DrawList & list) const;
     void draw_logs(hui::gfx::DrawList & list, const hui::gfx::Rect & area) const;
     void draw_dialogs(hui::gfx::DrawList & list) const;
+    void draw_report_dialog(hui::gfx::DrawList & list) const;
+    void draw_storage_dialog(hui::gfx::DrawList & list) const;
+    void update_storage_dialog(const hui::InputFrame & input, hui::ui::Feedback & feedback);
     void draw_busy(hui::gfx::DrawList & list) const;
     void draw_hints(hui::gfx::DrawList & list) const;
 
@@ -154,6 +174,13 @@ class Dashboard {
     bool  in_rows_ = false;         // the focus is on the rows, not the categories
     bool  picker_ = false;          // a row's choices are open in a list under it
     int   picker_cursor_ = 0;
+    bool  full_storage_ = true;     // /data is open to the app
+    double app_storage_gib_ = 16;
+    bool  storage_dialog_ = false;  // full storage is closed: use the app's own, or how to open it
+    bool  storage_howto_ = false;   // ... showing how to open it
+    bool  report_dialog_ = false;   // what a debug report holds, before the first
+    bool  report_busy_ = false;     // one is being written
+    std::string report_status_;     // "Saved to ...", or why it failed
 
     // Console.
     bool  console_hour_ = false;    // the charts show the last hour, not the last two minutes

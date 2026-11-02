@@ -66,6 +66,23 @@ model = "ps5"
 
 Then `codex -p ps5`.
 
+### The Responses API
+
+`/v1/responses` is llama-server's own, on the same path as chat: `input` as a string or as messages
+(`input_text`, `input_image`; not `input_file`), `instructions`, `temperature`, `top_p`, `max_output_tokens`, `stream`
+(the `response.*` events, text arriving as `response.output_text.delta`), tools, and
+`reasoning.effort`. Each request stands alone: `previous_response_id` is refused, so send the whole
+conversation every time, as codex does. A reply cut off by `max_output_tokens` still reports
+`"status": "completed"`.
+
+```sh
+curl http://192.168.1.19:8081/v1/responses -H 'Content-Type: application/json' -d '{
+  "instructions": "Answer in one sentence.",
+  "input": "Why does a PS5 have a GPU?",
+  "temperature": 0.7, "max_output_tokens": 200, "stream": true
+}'
+```
+
 ## Claude Code
 
 ```sh

@@ -26,6 +26,8 @@ Settings load_settings(const char * path) {
     s.introspect    = j.value("introspect", s.introspect);
     s.scratch_limit_gib = j.value("scratch_limit_gib", s.scratch_limit_gib);
     s.download_dir  = j.value("download_dir", s.download_dir);
+    s.report_kernel_log = j.value("report_kernel_log", s.report_kernel_log);
+    s.report_explained  = j.value("report_explained", s.report_explained);
     return s;
 }
 
@@ -35,6 +37,7 @@ bool save_settings(const char * path, const Settings & s) {
         { "kv_type", s.kv_type },     { "sounds", s.sounds },       { "tools", s.tools },
         { "introspect", s.introspect },
         { "scratch_limit_gib", s.scratch_limit_gib }, { "download_dir", s.download_dir },
+        { "report_kernel_log", s.report_kernel_log }, { "report_explained", s.report_explained },
     };
     std::ofstream out(path);
     out << j.dump(2) << "\n";

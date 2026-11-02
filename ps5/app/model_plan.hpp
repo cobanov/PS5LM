@@ -24,6 +24,7 @@ struct ModelInfo {
     std::string decision;  // "<arch>.decision.type" (openjev, clef, lfm2-d1, ...): answers /v1/systemone, not chat
     uint64_t    file_bytes      = 0;
     uint32_t    n_layer         = 0;
+    uint32_t    n_ff            = 0;   // feed-forward width, the widest layer's
     uint32_t    n_head_kv       = 0;
     uint32_t    key_length      = 0;   // per KV head
     uint32_t    value_length    = 0;
@@ -64,9 +65,16 @@ struct Preset {
 const std::vector<Preset> & presets();
 const Preset * find_preset(const ModelInfo & m);
 
+// llama-server's -ub for language models: how many prompt tokens go through
+// the GPU at once. 64 is what the console has run since the first release;
+// scripts/bench-ubatch.py measures the others there. Decision models and
+// image encoders take 2048 whatever this says (a whole prompt or image in one).
+constexpr uint32_t kPromptUbatch = 64;
+
 struct Plan {
     bool        fits = false;
     uint32_t    ctx  = 0;
+    uint32_t    ubatch = 0;
     std::string kv_type;      // cache type for K and V
     double      weights_gib  = 0;
     double      kv_gib       = 0;
@@ -79,7 +87,9 @@ struct Plan {
 
 // budget_gib: device memory free before loading (the app reads it from ggml).
 // kv_force: one cache type ("f16", "q8_0", "q4_0") instead of the best that fits.
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr);
+// ubatch: the prompt batch for a language model (its compute buffers grow with it).
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr,
+                uint32_t ubatch = kPromptUbatch);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.
