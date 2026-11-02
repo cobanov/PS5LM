@@ -5,7 +5,7 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
-## [Unreleased]
+## [0.11.0] - 2026-11-02
 
 ### Added
 - **Settings > Debug report**: one file to attach to a GitHub issue, `/data/PS5LM/debug-report.txt`
