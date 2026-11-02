@@ -281,12 +281,12 @@
       <p class="sub">What people ask before they install it</p>
       <ul class="points two">
         <li><b>Does it run on the GPU?</b><span>Yes, every layer. llama.cpp's Vulkan backend runs on RADV, the open Mesa driver, ported to the PS5 by PS5_Vulkan.</span></li>
-        <li><b>How big a model can it run?</b><span>About 11 GB of model and context. Qwen 3.8 27B at 2-bit fits with a 64k context; the planner tells you what fits before you download.</span></li>
+        <li><b>How big a model can it run?</b><span>About 11.6 GB of model and context. Qwen 3.8 27B at 2-bit fits with a 64k context; the planner tells you what fits before you download.</span></li>
         <li><b>Does this run games or need any Sony code?</b><span>No. PS5LM runs open-weight models and nothing else. No games, keys, firmware or Sony SDK files are part of it.</span></li>
         <li><b>Can it break my console?</b><span>It writes only to its own folders, never to system files. Under a long load it runs warm and the fan spins up, as in a game; the Console page shows both.</span></li>
         <li><b>Is it the same as PS5LM Plus?</b><span>PS5LM grew from PS5LM Plus, the native GPU app by abhi245y, and now lives under its own title ID, PPSA99575, so the two install side by side.</span></li>
         <li><b>Which model for coding agents?</b><span>A smaller model with a long context: prompts are read several times faster. <a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">docs/CLI.md</a> has the trade-offs.</span></li>
-        <li><b>Can several consoles run one model?</b><span>Experimentally, with the fleet build, a separate zip. A PC runs the controller and each PS5 holds a run of one dense llama or qwen2 model's layers on its GPU. So far one PS5 has served a model together with a PC. RPC has no authentication, so keep it on an isolated network: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">docs/FLEET.md</a>.</span></li>
+        <li><b>Can several consoles run one model?</b><span>Experimentally, and every PS5LM can be a worker. A PC runs the controller and each PS5 holds a run of one dense llama or qwen2 model's layers on its GPU; the PC can add its CPU or its GPU (Metal, CUDA or Vulkan) as one more worker. So far one PS5 has served a model together with a PC's CPU, a Mac's GPU and an RTX 3090. RPC has no authentication, so keep it on an isolated network: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">docs/FLEET.md</a>.</span></li>
         <li><b>Can I see inside the model?</b><span>If you turn it on. <code>POST /v1/introspect</code> returns the logits where you ask, the top candidates and one layer's activations, and can zero, scale or add to a channel. It is off by default, under Settings &gt; Developer: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/INTROSPECTION.md">docs/INTROSPECTION.md</a>.</span></li>
       </ul>
     </section>
@@ -337,7 +337,7 @@
       </div>
       <div class="legal">
         <span>Made by <a href="https://cobanov.dev">Mert Cobanov</a></span>
-        <span>v0.10.0. Not affiliated with Sony Interactive Entertainment; PlayStation and PS5 are its trademarks</span>
+        <span>v0.11.0. Not affiliated with Sony Interactive Entertainment; PlayStation and PS5 are its trademarks</span>
       </div>
     </div>
   </footer>

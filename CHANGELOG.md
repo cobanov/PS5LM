@@ -19,7 +19,10 @@ v0.1.x are the upstream payload releases by cobanov.
 - **Ternary Bonsai 2**: a **Bonsai 2** preset (PrismML's sampling, 64k context at most) and
   **Bonsai 2 27B** in Suggested, upstream's `Q2_0` (7.1 GiB). The app's llama.cpp already reads the
   `prism.hadamard.*` rotation those files carry: checked on a PC with the 2B and the 27B, on the CPU
-  and on ggml-vulkan with the console's shader paths. Not yet run on the console.
+  and on ggml-vulkan with the console's shader paths. On a console, fetched from Suggested (the
+  download carried on across two restarts of the app): a 64k context with a q8_0 cache, 1.36 GiB
+  of the pool left once it serves, about 17 tokens a second, right answers with and without
+  thinking.
 - `scripts/bonsai-pq2-to-q2.py`: PrismML's `PQ2_0` files, which upstream llama.cpp (b11827 too)
   refuses, to `Q2_0`, with no loss: each 128-weight block becomes two 64-weight blocks with the same
   scale and codes. Python only, about 80 s for the 27B; the 2B and the 27B come out byte for byte
@@ -34,7 +37,10 @@ v0.1.x are the upstream payload releases by cobanov.
   storage, or how to open full storage (OnionHEN's `exact_title_ids`, etaHEN, other HENs) and start
   again, which asks the HEN once more. **Settings > Sound and storage > Where PS5LM keeps its
   files** shows which one is in use and how full it is. Models saved there stay in the library
-  once full storage opens.
+  once full storage opens. Checked on a console with `/data` made unwritable to the app: the
+  question on the screen, a model searched for, fetched to `/download0/PS5LM/models` and loaded
+  from there, the choice kept across the restart, and the model still in the library once `/data`
+  opened again.
 
 - Two probes for later decisions, out of the app's way (`ps5/app/probes.cpp`, run from the PC):
   `scripts/ps5lm-app.sh bench-read <model file>` measures a drive's sequential and random read
@@ -46,7 +52,9 @@ v0.1.x are the upstream payload releases by cobanov.
   blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
 - **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
   `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
-  GPU next to the consoles. The default host build stays CPU only.
+  GPU next to the consoles. The default host build stays CPU only. Run with a console: a PS5 and a
+  Mac's GPU (Metal), and a PS5 and an RTX 3090 over CUDA and over Vulkan, each serving
+  `qwen2.5-0.5b-instruct-q4_k_m.gguf` with blocks 0–19 on the PS5. See docs/FLEET.md.
 - `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
   (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
   ps5-homebrew-dev-protocol.
@@ -64,12 +72,15 @@ v0.1.x are the upstream payload releases by cobanov.
   `server-context.cpp`. It builds and links for the console as before.
 - The planner counts the compute buffers' growth with the prompt batch (`-ub`, about 38 bytes a
   token per unit of feed-forward width, measured with ggml-vulkan on the console's shader paths),
-  and the batch for language models is one constant, `kPromptUbatch`, still 64 until
-  `scripts/bench-ubatch.py` has measured the others on a console. See docs/CONSOLE.md.
+  and the batch for language models is one constant, `kPromptUbatch`, 64. `scripts/bench-ubatch.py`
+  measured the others on a console (Qwen 3.8 27B UD-IQ2_XXS, 64k, 2,048-token prompt): 124.6
+  tokens a second at 64, 107.1 at 128, 122.8 at 256, 102.0 at 512, and the larger sizes leave less
+  memory, so it stays 64. See docs/CONSOLE.md.
 - `downloadDataSize` in `sce_sys/param.json` is 16 GiB (16384 MiB, was 256 MiB): the size of
   the app's own storage. The app counts what it holds itself, as a title's `statvfs` is a stub.
-  Whether the system sets the whole 16 GiB aside on internal storage at the first start, or
-  only what is written, is not known yet; lowering it later frees nothing.
+  The system makes it an 18.8 GB image, `/user/download/PPSA99575/download0.dat`, at the first
+  start; whether all of that is taken on the drive at once was not measured. Lowering it later
+  frees nothing.
 - A download is refused before it starts, with the reason on the TV, when the drive has no room
   for it, the downloads already queued to that drive, and 1 GiB to spare. A model and its image
   projector are queued together or not at all.
@@ -80,13 +91,19 @@ v0.1.x are the upstream payload releases by cobanov.
   neither the GL stack nor RADV uses what the blocks configure. The planner reads the memory free,
   so every model's plan grows with it: with the dashboard up, v0.9.1 had 11.04 GiB free before a
   model and gave Qwen 3.8 27B UD-Q2_K_XL a 32k context, not the 64k it was suggested with; with
-  the 12 GiB pool it plans 64k again. Not yet measured on a console: `app.log` now records the pool
-  and the flexible memory at start (`memory at start`) and once the model serves (`memory when
-  ready`).
+  the 12 GiB pool it plans 64k again. On a console the pool is 12.0000 GiB and the planner has
+  11.6 GiB for a model (11.0 before); `app.log` records the pool and the flexible memory at start
+  (`memory at start`) and once the model serves (`memory when ready`).
 - Every line the app writes to `app.log` starts with the console's local time, as
   `22:56:01 ps5lm-app: start` (#40). Lines from the graphics stack keep their own form.
 
 ### Fixed
+- **A black screen on OnionHEN** with `PPSA99575` in `exact_title_ids` (#23, #32, #54). OnionHEN
+  opens `/data` with a full app jailbreak that also moves the process out of its sandbox, so
+  `/app0` and `/download0` were gone and the fonts did not load. Once `/data` is open, the app
+  finds its sandbox in `/mnt/sandbox/<title id>_<slot>` and reads its own files from there;
+  `app.log` says when it runs outside its sandbox. Unchanged on etaHEN, which keeps the sandbox.
+  Not yet run on an OnionHEN console.
 - A download that meets a full drive anyway stops at once, "Failed: App storage is full", instead
   of retrying twenty times.
 - At the end of a download, Models > Downloads said "starting" for the minutes the SHA-256 check
@@ -98,18 +115,24 @@ v0.1.x are the upstream payload releases by cobanov.
   not first. `patches/0004` folded such messages into the first one only for the Anthropic API
   (Claude Code); it now does so for Chat Completions, Responses and Anthropic alike, with
   `tests/server_system_messages_test.py` checking all three on a host build. docs/CLI.md's codex
-  setup is the one codex 0.166 reads: the profile in its own `~/.codex/ps5.config.toml`.
+  setup is the one codex 0.166 reads: the profile in its own `~/.codex/ps5.config.toml`. Checked
+  with codex 0.166 against a console.
 - Models with sliding-window attention got far less context than fits (#57): the planner counted
   every attention layer at full length. It now reads `<arch>.attention.sliding_window_pattern` and
   counts the window layers at their window, as llama.cpp keeps them. Spark-X2.6 4B (27 of 36 layers
-  keep 512 tokens) plans 256k with a q8_0 cache instead of 128k with q4_0. **Longest context** in
-  Settings goes to 192k and 256k, and the planner tries both.
+  keep 512 tokens) plans 256k with a q8_0 cache instead of 128k with q4_0; on a console the server
+  took the 262,144-token context with 2 GiB of the pool left, and found a needle in a 52,821-token
+  prompt. **Longest context** in Settings goes to 192k and 256k, and the planner tries both.
 - A console serving a model went into rest mode an hour after the last button press: requests
   from the network are not controller input. Rest mode ends the app, and on a jailbroken console the
   controllers do not connect again until a restart. While a model is loaded, a download is queued
   or running, or the app is a fleet worker, it now tells the system every 30 s that it is in use
   (`sceSystemServicePowerTick`, as a video player does); with nothing to do, the console's own
   rest-mode setting applies. `app.log` says when it starts doing so.
+- `scripts/bench-ubatch.py` took the old app's last lines, as it stopped, for the restarted one,
+  so a size that loads was reported as not loading, or its prompt went to the stopping server;
+  it never removed `app-args.txt` (ftpsrv answers a delete with 226, which ftplib refuses), and an
+  error mid-run left the test arguments for every later start. All three are fixed.
 
 ## [0.10.0] - 2026-11-01
 

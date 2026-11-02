@@ -2,9 +2,9 @@
 
 **Status: host controller, and a PS5 worker that is part of the app and starts
 only when you opt in; CPU RPC inference and the title's cross-build are tested
-in CI. On hardware, one PS5 worker has served one model together with a Linux
-CPU worker (2026-11-01, below); more consoles at once are not validated by the
-maintainers.** This is not a performance claim. Up to v0.10.0 the worker was a
+in CI. On hardware, one PS5 worker has served one model together with a PC's
+CPU, a Mac's GPU (Metal) and an RTX 3090 (CUDA and Vulkan) (2026-11-01 and
+11-02, below); more consoles at once are not validated by the maintainers.** This is not a performance claim. Up to v0.10.0 the worker was a
 separate build, `ps5lm-app-fleet-v0.10.0.zip`; from v0.11.0 every PS5LM has it.
 
 What it is for: a model that does not fit in one console's memory runs across
@@ -182,6 +182,14 @@ The same day, with the worker in the normal app (this build) and a Mac's GPU:
 M-series Mac, the controller on the Linux PC. Blocks 0–22 on the PS5, block 23
 and the output on the Mac's GPU; it answered correctly at 13 tokens/s (7.4 with
 the PC's CPU in that place). One small model, so not a performance figure.
+
+On 2026-11-02, the same PS5 worker with an RTX 3090 on the Linux PC, from
+`PS5LM_FLEET_GPU=cuda` and `vulkan` host builds (`ggml-rpc-server -d CUDA0`,
+`-d Vulkan0`), the controller on the same PC: blocks 0–19 on the PS5, blocks
+20–23 and the output on the 3090 (`--tensor-split 39,11`). Both answered
+correctly, at 28 to 30 tokens/s on a longer reply. The controller's binary must
+run on the PC it is started on: a `build/fleet-host` made inside a newer Linux
+container stops at `GLIBC_2.43 not found` on an older host.
 
 ## Configure workers (only after building and validating the title)
 

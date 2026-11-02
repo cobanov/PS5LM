@@ -16,10 +16,10 @@ Key facts:
 - Needs a PS5 on firmware 7.00 to 13.60 with kstuff-lite, etaHEN and ShadowMountPlus; elfldr and ftpsrv are
   recommended. Models live in `/data/PS5LM/models` or `PS5LM/models` on a USB drive.
 - Measured on a PS5 Slim: Qwen 3.5 9B Q4_K_M at 55 tokens a second, Qwen 3.8 27B UD-Q2_K_XL at about 20 with a
-  64k context, d1 Omni 600M answers three questions in 0.3 s. About 11 GB of model and context fits.
-- Fleet (experimental, since v0.10.0): a separate build, `ps5lm-app-fleet-vX.Y.Z.zip`, splits one dense `llama`
-  or `qwen2` GGUF across several consoles by layers over llama.cpp's RPC. A Linux or macOS PC runs the controller
-  and can add its CPU as a worker. RPC has no authentication: isolated networks only.
+  64k context, d1 Omni 600M answers three questions in 0.3 s. About 11.6 GB of model and context fits.
+- Fleet (experimental, since v0.10.0; part of every build from v0.11.0): splits one dense `llama` or `qwen2`
+  GGUF across several consoles by layers over llama.cpp's RPC. A Linux or macOS PC runs the controller and can
+  add its CPU or its GPU (Metal, CUDA, Vulkan) as a worker. RPC has no authentication: isolated networks only.
 
 ## Docs
 
