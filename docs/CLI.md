@@ -74,6 +74,11 @@ Codex sends two developer messages after its instructions. Qwen's chat template 
 message that is not first ("System message must be at the beginning"), so the app's llama-server
 folds them into the first one (`patches/0004`).
 
+If codex gets `404 Not Found` from the console while macOS has a system HTTP proxy (spoofdpi and
+similar tools set one), codex is sending through that proxy even for addresses on its exception
+list, and the proxy forwards the request in a form llama-server does not route. Start codex with
+`NO_PROXY=192.168.1.19` (the console's address).
+
 ### The Responses API
 
 `/v1/responses` is llama-server's own, on the same path as chat: `input` as a string or as messages
