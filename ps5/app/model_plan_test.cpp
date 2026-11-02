@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -23,6 +24,14 @@ struct Gguf {
     static std::string str(const std::string & v) { return raw<uint64_t>(v.size()) + v; }
     Gguf & kv(const std::string & k, const std::string & v) { kvs += str(k) + raw<uint32_t>(8) + str(v); n++; return *this; }
     Gguf & kv(const std::string & k, uint32_t v) { kvs += str(k) + raw<uint32_t>(4) + raw(v); n++; return *this; }
+    Gguf & kv(const std::string & k, const std::vector<bool> & v) {  // a bool array
+        kvs += str(k) + raw<uint32_t>(9) + raw<uint32_t>(7) + raw<uint64_t>(v.size());
+        for (bool b : v) {
+            kvs += (char) b;
+        }
+        n++;
+        return *this;
+    }
     // magic, version 3, tensor count, metadata count, metadata
     std::string bytes() const { return "GGUF" + raw<uint32_t>(3) + raw<uint64_t>(0) + raw(n) + kvs; }
 };
@@ -91,6 +100,28 @@ int main(int argc, char ** argv) {
     assert(!pq.ok && pq.error.find("bonsai-pq2-to-q2.py") != std::string::npos);
     const ps5lm::ModelInfo pt = ps5lm::read_model_header("Ternary-Bonsai-2-27B-PTQ1_0.gguf", bonsai(143), 5946648928ull);
     assert(!pt.ok && pt.error.find("PTQ1_0") != std::string::npos);
+
+    // Sliding-window attention (#57): Spark-X2.6 4B's header. 27 of its 36
+    // layers keep a 512-token window, so 256k fits; counted as full attention
+    // it stopped at 128k.
+    std::vector<bool> swa;
+    for (int i = 0; i < 36; i++) {
+        swa.push_back(i % 4 != 3);
+    }
+    Gguf spark;
+    spark.kv("general.architecture", "spark2_5").kv("spark2_5.block_count", 36u)
+        .kv("spark2_5.attention.head_count", 16u).kv("spark2_5.attention.head_count_kv", 4u)
+        .kv("spark2_5.embedding_length", 2560u).kv("spark2_5.attention.key_length", 256u)
+        .kv("spark2_5.attention.value_length", 256u).kv("spark2_5.context_length", 1048576u)
+        .kv("spark2_5.attention.sliding_window", 512u).kv("spark2_5.attention.sliding_window_pattern", swa);
+    const ps5lm::ModelInfo s = ps5lm::read_model_header("Spark-X2.6-4B-Q8_0.gguf", spark.bytes(), 4375021824ull);
+    assert(s.ok && s.n_swa_layers == 27 && s.swa_window == 512);
+    assert(kv_bytes_per_token(s, "q8_0") == 9 * 4 * 512 * 34.0 / 32);
+    const ps5lm::Plan sp = ps5lm::plan_model(s, budget, 262144);
+    assert(sp.fits && sp.ctx == 262144 && sp.kv_type == "q8_0");
+    ps5lm::ModelInfo full = s;
+    full.n_swa_layers = 0;
+    assert(ps5lm::plan_model(full, budget, 262144).ctx == 131072);
 
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");

@@ -1,0 +1,61 @@
+PS5LM: fold every system or developer message that is not first into the leading one (Codex and Claude Code send them), so templates like Qwen's accept the Chat Completions, Responses and Anthropic APIs.
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 4f1acba1a..76058afd7 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1405,6 +1405,54 @@ json oaicompat_chat_params_parse(
+     if (!messages.is_array()) {
+         throw std::invalid_argument("Expected 'messages' to be an array");
+     }
++
++    // PS5LM: templates such as Qwen's refuse a system message that is not
++    // first, and clients send them: Codex puts developer messages after its
++    // instructions, Claude Code puts system messages inside `messages`. Fold
++    // every later system or developer message into the leading one, for the
++    // Chat Completions, Responses and Anthropic endpoints alike.
++    {
++        const auto is_system = [](const json & m) {
++            const std::string r = json_value(m, "role", std::string());
++            return r == "system" || r == "developer";
++        };
++        json        kept = json::array();
++        std::string extra;
++        for (auto & m : messages) {
++            if (!kept.empty() && is_system(m)) {
++                const json c = m.contains("content") ? m.at("content") : json();
++                if (c.is_string()) {
++                    extra += "\n\n" + c.get<std::string>();
++                } else if (c.is_array()) {
++                    for (const auto & part : c) {
++                        if (part.contains("text")) {
++                            extra += "\n\n" + json_value(part, "text", std::string());
++                        }
++                    }
++                }
++                continue;
++            }
++            kept.push_back(std::move(m));
++        }
++        if (!extra.empty()) {
++            if (is_system(kept[0])) {
++                json & c = kept[0]["content"];
++                if (c.is_array()) {
++                    c.push_back({ { "type", "text" }, { "text", extra } });
++                } else {
++                    c = c.is_string() ? c.get<std::string>() + extra : extra.substr(2);
++                }
++            } else {
++                json front = json::array();
++                front.push_back({ { "role", "system" }, { "content", extra.substr(2) } });
++                for (auto & m : kept) {
++                    front.push_back(std::move(m));
++                }
++                kept = std::move(front);
++            }
++        }
++        messages = std::move(kept);
++    }
+     for (auto & msg : messages) {
+         std::string role = json_value(msg, "role", std::string());
+         if (role != "assistant" && !msg.contains("content")) {

@@ -44,6 +44,12 @@ v0.1.x are the upstream payload releases by cobanov.
 - The TV's request feed shows OpenAI Responses requests (`/v1/responses`, what codex sends): the
   question from `input`, the answer from the response or its `output_text` deltas. They showed
   blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
+- **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
+  `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
+  GPU next to the consoles. The default host build stays CPU only.
+- `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
+  (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
+  ps5-homebrew-dev-protocol.
 
 ### Changed
 - **The fleet worker is part of the app.** There is no separate fleet build or
@@ -80,14 +86,6 @@ v0.1.x are the upstream payload releases by cobanov.
 - Every line the app writes to `app.log` starts with the console's local time, as
   `22:56:01 ps5lm-app: start` (#40). Lines from the graphics stack keep their own form.
 
-### Added
-- **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
-  `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
-  GPU next to the consoles. The default host build stays CPU only.
-- `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
-  (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
-  ps5-homebrew-dev-protocol.
-
 ### Fixed
 - A download that meets a full drive anyway stops at once, "Failed: App storage is full", instead
   of retrying twenty times.
@@ -95,6 +93,17 @@ v0.1.x are the upstream payload releases by cobanov.
   takes, so it looked hung (#30). It now says "Checking the SHA-256, 45%". The queue is saved
   before the check, so a restart during it checks the file again but no longer fetches the last
   piece first.
+- codex failed on Qwen models with "System message must be at the beginning" (#55): it sends two
+  developer messages after its instructions, and Qwen's template refuses a system message that is
+  not first. `patches/0004` folded such messages into the first one only for the Anthropic API
+  (Claude Code); it now does so for Chat Completions, Responses and Anthropic alike, with
+  `tests/server_system_messages_test.py` checking all three on a host build. docs/CLI.md's codex
+  setup is the one codex 0.166 reads: the profile in its own `~/.codex/ps5.config.toml`.
+- Models with sliding-window attention got far less context than fits (#57): the planner counted
+  every attention layer at full length. It now reads `<arch>.attention.sliding_window_pattern` and
+  counts the window layers at their window, as llama.cpp keeps them. Spark-X2.6 4B (27 of 36 layers
+  keep 512 tokens) plans 256k with a q8_0 cache instead of 128k with q4_0. **Longest context** in
+  Settings goes to 192k and 256k, and the planner tries both.
 
 ## [0.10.0] - 2026-11-01
 

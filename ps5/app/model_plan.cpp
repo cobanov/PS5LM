@@ -170,6 +170,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     const uint64_t n_kv = r.get<uint64_t>();
 
     std::map<std::string, uint64_t> ints;  // every scalar, and the largest element of numeric arrays
+    std::map<std::string, uint64_t> sums;  // numeric arrays: the sum of their elements
     std::map<std::string, std::string> strs;
     for (uint64_t i = 0; i < n_kv && !r.bad; i++) {
         const std::string key = r.str();
@@ -184,11 +185,14 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                     r.skip(r.get<uint64_t>());
                 }
             } else if (n <= 4096) {  // per-layer values, such as head_count_kv
-                uint64_t mx = 0;
+                uint64_t mx = 0, sum = 0;
                 for (uint64_t j = 0; j < n; j++) {
-                    mx = std::max(mx, read_int(r, et));
+                    const uint64_t v = read_int(r, et);
+                    mx = std::max(mx, v);
+                    sum += v;
                 }
                 ints[key] = mx;
+                sums[key] = sum;
             } else {
                 r.skip(n * scalar_size(et));  // vocabularies and the like
             }
@@ -240,6 +244,14 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     m.value_length    = (uint32_t) num("attention.value_length", head_dim);
     m.full_attn_every = (uint32_t) std::max<uint64_t>(1, num("full_attention_interval", 1));
     m.n_ctx_train     = (uint32_t) num("context_length");
+    // Sliding-window attention with its layers listed (true: a window layer),
+    // as llama.cpp reads it. A pattern only in llama.cpp's code (Gemma) or a
+    // single number is counted as full attention, which over-reserves.
+    const auto pattern = sums.find(a + "attention.sliding_window_pattern");
+    if (pattern != sums.end() && num("attention.sliding_window")) {
+        m.n_swa_layers = (uint32_t) std::min<uint64_t>(pattern->second, m.n_kv_layers());
+        m.swa_window   = (uint32_t) num("attention.sliding_window");
+    }
     m.n_expert        = (uint32_t) num("expert_count");
 
     // Recurrent layers (Gated DeltaNet, Mamba): a fixed f32 state each,
@@ -278,9 +290,17 @@ ModelInfo read_model_header(const std::string & name, const std::string & head, 
     return parse_model_info(r, name, file_bytes);
 }
 
-double kv_bytes_per_token(const ModelInfo & m, const std::string & type) {
+namespace {
+
+double kv_bytes_per_layer_token(const ModelInfo & m, const std::string & type) {
     const double per_elem = type == "f16" ? 2.0 : type == "q8_0" ? 34.0 / 32 : 18.0 / 32;  // q4_0
-    return (double) m.n_kv_layers() * m.n_head_kv * (m.key_length + m.value_length) * per_elem;
+    return (double) m.n_head_kv * (m.key_length + m.value_length) * per_elem;
+}
+
+}  // namespace
+
+double kv_bytes_per_token(const ModelInfo & m, const std::string & type) {
+    return (m.n_kv_layers() - m.n_swa_layers) * kv_bytes_per_layer_token(m, type);
 }
 
 // Sampling as each model's authors recommend it. Settings the planner works
@@ -361,7 +381,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0) + ub_extra;
 
     // The longest context first, and at each length the best cache that fits.
-    static const uint32_t ctxs[]  = { 131072, 65536, 32768, 16384, 8192, 4096 };
+    static const uint32_t ctxs[]  = { 262144, 196608, 131072, 65536, 32768, 16384, 8192, 4096 };
     static const char *   types[] = { "f16", "q8_0", "q4_0" };
     for (uint32_t ctx : ctxs) {
         if (ctx > ctx_cap) {
@@ -375,7 +395,11 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             if (!kv_force && std::strcmp(t, "f16") == 0 && ctx > 8192) {
                 continue;
             }
-            const double kv    = kv_bytes_per_token(m, t) * ctx / kGiB;
+            // Window layers hold the window and one ubatch, padded to 256,
+            // whatever the context (llama.cpp's iSWA cache without --swa-full).
+            const uint32_t swa_tokens = std::min(ctx, (m.swa_window + p.ubatch + 255) / 256 * 256);
+            const double   kv         = (kv_bytes_per_token(m, t) * ctx +
+                                 m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
             const double total = p.weights_gib + kv + p.state_gib + p.reserve_gib;
             if (total <= budget_gib) {
                 p.fits = true;
