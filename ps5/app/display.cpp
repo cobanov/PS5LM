@@ -5,6 +5,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "display.hpp"
+#include "log.hpp"
 
 #include "gfx/renderer.hpp"
 
@@ -66,7 +67,7 @@ EGLSurface g_surface = EGL_NO_SURFACE;
 EGLContext g_context = EGL_NO_CONTEXT;
 
 bool fail(const char * what) {
-    std::printf("ps5lm-app: display: %s failed (egl 0x%04x)\n", what, (unsigned) eglGetError());
+    ps5lm::log_line("display: %s failed (egl 0x%04x)\n", what, (unsigned) eglGetError());
     return false;
 }
 
@@ -106,8 +107,8 @@ bool Display::open(int width, int height) {
     eglQuerySurface(g_display, g_surface, EGL_WIDTH, &width_);
     eglQuerySurface(g_display, g_surface, EGL_HEIGHT, &height_);
     eglSwapInterval(g_display, 1);
-    std::printf("ps5lm-app: display: egl %d.%d, %dx%d, %s\n", major, minor, width_, height_,
-                (const char *) glGetString(GL_RENDERER));
+    ps5lm::log_line("display: egl %d.%d, %dx%d, %s\n", major, minor, width_, height_,
+                    (const char *) glGetString(GL_RENDERER));
     return true;
 }
 

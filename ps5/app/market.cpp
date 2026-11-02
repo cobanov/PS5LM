@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "market.hpp"
+#include "log.hpp"
 
 #include "fetch.hpp"
 #include "ftp_writer.hpp"
@@ -339,7 +340,7 @@ bool Market::enqueue(const std::vector<MarketJob> & jobs, double free) {
                       jobs[0].file.c_str(), jobs.size() > 1 ? " and its image projector" : "", need, drive_name(dir).c_str(),
                       std::max(0.0, free - queued), queued > 0 ? " after the downloads queued there" : "");
         view_.note = text;
-        std::printf("ps5lm-app: download %s/%s: %s\n", jobs[0].repo.c_str(), jobs[0].file.c_str(), text);
+        ps5lm::log_line("download %s/%s: %s\n", jobs[0].repo.c_str(), jobs[0].file.c_str(), text);
         return false;
     }
     for (const auto & job : jobs) {
@@ -494,7 +495,7 @@ bool Market::fetch(Download & d) {
     const bool via_ftp = !own_storage && connect_ftp_writer(ftp, ftp_error);
     const std::string direct_note = via_ftp ? "" : "written without ftpsrv, slower after about 2 GB";
     if (!via_ftp) {
-        std::printf("ps5lm-app: download %s: the app writes the file itself, which gets slow after about 2.2 GB (%s)\n",
+        ps5lm::log_line("download %s: the app writes the file itself, which gets slow after about 2.2 GB (%s)\n",
                     d.file.c_str(), ftp_error.c_str());
     }
     const int fd = open(part.c_str(), O_WRONLY | O_CREAT, 0666);
@@ -537,7 +538,7 @@ bool Market::fetch(Download & d) {
         if (ftp_disk_full(error)) {
             return false;
         }
-        std::printf("ps5lm-app: download %s: piece at %llu: %s, writing it again\n", d.file.c_str(),
+        ps5lm::log_line("download %s: piece at %llu: %s, writing it again\n", d.file.c_str(),
                     (unsigned long long) off, error.c_str());
         error.clear();
         return ftp.write_at(part, off, buf.data(), buf.size(), error);
@@ -605,8 +606,8 @@ bool Market::fetch(Download & d) {
             }
             last_error = text;
             const int f = ++failures;
-            std::printf("ps5lm-app: download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
-                        (unsigned long long) off, (unsigned long long) got, text);
+            ps5lm::log_line("download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
+                            (unsigned long long) off, (unsigned long long) got, text);
             const int werr = write_errno;
             if (werr == ENOSPC || werr == EDQUOT || werr == EFBIG) {
                 last_error = drive_name(d.dir) + " is full";
@@ -727,7 +728,7 @@ bool Market::fetch(Download & d) {
         d.state = DownloadState::done;
         d.note = "Saved to " + to;
     }
-    std::printf("ps5lm-app: download %s/%s: %s\n", d.repo.c_str(), d.file.c_str(), d.note.c_str());
+    ps5lm::log_line("download %s/%s: %s\n", d.repo.c_str(), d.file.c_str(), d.note.c_str());
     publish(true);
     return d.state == DownloadState::done;
 }

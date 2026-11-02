@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "stats.hpp"
+#include "log.hpp"
+#include "storage.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -394,8 +396,8 @@ void StatsCollector::run() {
             logged = true;
             int t0 = -1000, t1 = -1000;
             const int r0 = sceKernelGetSocSensorTemperature(0, &t0), r1 = sceKernelGetCpuTemperature(&t1);
-            std::printf("ps5lm-app: sensors: soc rc 0x%x t %d, cpu rc 0x%x t %d, power raw %llu, cpu hz %ld\n", r0, t0,
-                        r1, t1, (unsigned long long) raw[0], hz);
+            ps5lm::log_line("sensors: soc rc 0x%x t %d, cpu rc 0x%x t %d, power raw %llu, cpu hz %ld\n", r0, t0,
+                            r1, t1, (unsigned long long) raw[0], hz);
         }
 #endif
         // A title may not read the sensors (0x80020002); a payload may.
@@ -409,9 +411,9 @@ void StatsCollector::run() {
             // Not running: hand the bundled copy to elfldr, at start and then
             // once a minute (elfldr may come later).
             if (p.empty() && (long) (wall - start) % 60 == 1) {
-                const bool sent = send_payload("/app0/payloads/ps5-exporter.elf", 9021);
-                std::printf("ps5lm-app: ps5-exporter not running; %s\n",
-                            sent ? "sent the bundled copy to elfldr" : "no elfldr on 9021 to load it");
+                const bool sent = send_payload(sandbox_path("/app0/payloads/ps5-exporter.elf").c_str(), 9021);
+                ps5lm::log_line("ps5-exporter not running; %s\n",
+                                sent ? "sent the bundled copy to elfldr" : "no elfldr on 9021 to load it");
             }
             if (!p.empty()) {
                 from_exporter = true;
