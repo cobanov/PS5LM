@@ -44,6 +44,12 @@ v0.1.x are the upstream payload releases by cobanov.
 - The TV's request feed shows OpenAI Responses requests (`/v1/responses`, what codex sends): the
   question from `input`, the answer from the response or its `output_text` deltas. They showed
   blank before. The API page lists the endpoint, and docs/CLI.md says what it takes.
+- **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
+  `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
+  GPU next to the consoles. The default host build stays CPU only.
+- `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
+  (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
+  ps5-homebrew-dev-protocol.
 
 ### Changed
 - **The fleet worker is part of the app.** There is no separate fleet build or
@@ -79,14 +85,6 @@ v0.1.x are the upstream payload releases by cobanov.
   ready`).
 - Every line the app writes to `app.log` starts with the console's local time, as
   `22:56:01 ps5lm-app: start` (#40). Lines from the graphics stack keep their own form.
-
-### Added
-- **A PC's GPU as a fleet worker.** `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`)
-  `scripts/build-fleet-host.sh` adds that backend, so `ggml-rpc-server -d MTL0` serves the PC's
-  GPU next to the consoles. The default host build stays CPU only.
-- `scripts/ps5lm-app.sh launch` works again, with PS5LM's own launcher payload
-  (`ps5/app/launch_app.c`, built by `build-app.sh`) instead of the removed
-  ps5-homebrew-dev-protocol.
 
 ### Fixed
 - A download that meets a full drive anyway stops at once, "Failed: App storage is full", instead
