@@ -12,8 +12,9 @@
 # (2,048 tokens of the LICENSE) twice with 128 tokens to generate, keeps the
 # faster run, and reads what the app logged about memory: the pool free once
 # the model serves and again after the prompt, and llama.cpp's buffers. A size
-# that does not load is reported as such. At the end app-args.txt is removed
-# and the model loads with the planner again.
+# that does not load, or whose prompt fails, is reported as such and ends the
+# run, since each larger size needs more memory. At the end, or on any error,
+# app-args.txt is removed and the model loads with the planner again.
 #
 # Needs the app running with /data open, ftpsrv on 2121, Python 3.8+.
 #
@@ -61,7 +62,7 @@ def get(name):
 def remove(name):
     try:
         with ftp() as f:
-            f.delete("%s/%s" % (DATA, name))
+            f.sendcmd("DELE %s/%s" % (DATA, name))  # ftpsrv answers 226, which ftplib's delete() refuses
     except ftplib.error_perm:
         pass
 
@@ -86,8 +87,8 @@ def wait_ready(started_after, timeout=1200):
         if "ps5lm-app: version" not in log:
             continue
         run = this_run(log)
-        if run == started_after:
-            continue  # the old process is still there
+        if run.startswith(started_after):
+            continue  # the old process, still there or writing its last lines as it stops
         if "llama_server returned" in run:
             return False, run
         try:
@@ -140,7 +141,7 @@ def main():
     if len(sys.argv) < 2:
         sys.exit("usage: bench-ubatch.py <model path on the console> [ubatch ...]")
     model = sys.argv[1]
-    sizes = [int(x) for x in sys.argv[2:]] or [64, 128, 256, 512]
+    sizes = sorted(int(x) for x in sys.argv[2:]) or [64, 128, 256, 512]
     prompt_text = open(os.path.join(ROOT, "LICENSE"), encoding="utf-8").read()
 
     print("bench-ubatch: loading %s with the planner" % model)
@@ -154,34 +155,41 @@ def main():
     print("bench-ubatch: the planner's arguments: %s" % " ".join(base))
 
     rows = []
-    for ub in sizes:
-        args = with_ubatch(base, ub)
-        before = run
-        put("app-args.txt", "\n".join(args) + "\n")
-        put("unload", "-\n")  # restarts the app, which then reads app-args.txt
-        ok, run = wait_ready(before)
-        if not ok:
-            rows.append((ub, None, None, None, None, "did not load (out of memory? see llama.log)"))
-            print("bench-ubatch: -ub %d did not load" % ub)
-            continue
-        tokens = post("/tokenize", {"content": prompt_text})["tokens"][:PROMPT_TOKENS]
-        post("/completion", {"prompt": tokens[:64], "n_predict": 4, "cache_prompt": False})  # shaders, buffers
-        best = None
-        for _ in range(2):
-            t = post("/completion", {"prompt": tokens, "n_predict": GENERATE, "cache_prompt": False,
-                                     "temperature": 0, "ignore_eos": True})["timings"]
-            best = t if best is None or t["prompt_per_second"] > best["prompt_per_second"] else best
-        put("memory", "-\n")
-        time.sleep(4)
-        run = this_run(get("app.log"))
-        buf = buffers(get("llama.log"))
-        compute = sum(v for k, v in buf.items() if k.endswith("compute"))
-        rows.append((ub, best["prompt_per_second"], best["predicted_per_second"], pool_free(run, "when ready"),
-                     pool_free(run, "asked"), "compute buffers %.0f MiB" % compute))
-        print("bench-ubatch: -ub %d: prompt %.1f tok/s, generation %.1f tok/s" % (ub, rows[-1][1], rows[-1][2]))
-
-    remove("app-args.txt")
-    put("load", model + "\n")
+    try:
+        for ub in sizes:
+            args = with_ubatch(base, ub)
+            before = run
+            put("app-args.txt", "\n".join(args) + "\n")
+            put("unload", "-\n")  # restarts the app, which then reads app-args.txt
+            ok, run = wait_ready(before)
+            if not ok:
+                rows.append((ub, None, None, None, None, "did not load (out of memory? see llama.log)"))
+                print("bench-ubatch: -ub %d did not load" % ub)
+                break
+            try:
+                tokens = post("/tokenize", {"content": prompt_text})["tokens"][:PROMPT_TOKENS]
+                post("/completion", {"prompt": tokens[:64], "n_predict": 4, "cache_prompt": False})  # shaders, buffers
+                best = None
+                for _ in range(2):
+                    t = post("/completion", {"prompt": tokens, "n_predict": GENERATE, "cache_prompt": False,
+                                             "temperature": 0, "ignore_eos": True})["timings"]
+                    best = t if best is None or t["prompt_per_second"] > best["prompt_per_second"] else best
+            except OSError as e:  # urllib's errors: the server failed the prompt or stopped
+                rows.append((ub, None, None, None, None, "loaded, the prompt failed: %s (see llama.log)" % e))
+                print("bench-ubatch: -ub %d: the prompt failed: %s" % (ub, e))
+                break
+            put("memory", "-\n")
+            time.sleep(4)
+            run = this_run(get("app.log"))
+            buf = buffers(get("llama.log"))
+            compute = sum(v for k, v in buf.items() if k.endswith("compute"))
+            rows.append((ub, best["prompt_per_second"], best["predicted_per_second"], pool_free(run, "when ready"),
+                         pool_free(run, "asked"), "compute buffers %.0f MiB" % compute))
+            print("bench-ubatch: -ub %d: prompt %.1f tok/s, generation %.1f tok/s" % (ub, rows[-1][1], rows[-1][2]))
+    finally:
+        # A test argument list left behind would replace the planner at every start.
+        remove("app-args.txt")
+        put("load", model + "\n")
     print()
     print("| -ub | prompt tok/s (%d tokens) | generation tok/s | pool free when ready | pool free after the prompt | |" % PROMPT_TOKENS)
     print("|---|---|---|---|---|---|")
