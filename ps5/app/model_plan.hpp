@@ -29,6 +29,8 @@ struct ModelInfo {
     uint32_t    key_length      = 0;   // per KV head
     uint32_t    value_length    = 0;
     uint32_t    full_attn_every = 1;   // 1: every layer is attention
+    uint32_t    n_swa_layers    = 0;   // attention layers that keep only a sliding window
+    uint32_t    swa_window      = 0;   // that window, in tokens
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
@@ -51,7 +53,8 @@ std::string find_mmproj(const std::string & model_path);
 
 ModelInfo read_model_info(const std::string & path);
 
-// Bytes of KV cache per token of context, for a cache type ("f16", "q8_0", "q4_0").
+// Bytes of KV cache per token of context, for a cache type ("f16", "q8_0", "q4_0"):
+// the full-attention layers. Sliding-window layers add a fixed amount (plan_model).
 double kv_bytes_per_token(const ModelInfo & m, const std::string & type);
 
 struct Preset {

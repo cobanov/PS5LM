@@ -101,6 +101,11 @@ v0.1.x are the upstream payload releases by cobanov.
   (Claude Code); it now does so for Chat Completions, Responses and Anthropic alike, with
   `tests/server_system_messages_test.py` checking all three on a host build. docs/CLI.md's codex
   setup is the one codex 0.166 reads: the profile in its own `~/.codex/ps5.config.toml`.
+- Models with sliding-window attention got far less context than fits (#57): the planner counted
+  every attention layer at full length. It now reads `<arch>.attention.sliding_window_pattern` and
+  counts the window layers at their window, as llama.cpp keeps them. Spark-X2.6 4B (27 of 36 layers
+  keep 512 tokens) plans 256k with a q8_0 cache instead of 128k with q4_0. **Longest context** in
+  Settings goes to 192k and 256k, and the planner tries both.
 
 ## [0.10.0] - 2026-11-01
 

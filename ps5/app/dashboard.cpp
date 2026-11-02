@@ -126,7 +126,7 @@ constexpr SettingCategory kCategories[] = {
 constexpr int kCategoryCount = 7;
 constexpr int kDiagnostics = 6;
 
-constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
+constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
