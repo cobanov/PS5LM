@@ -1,0 +1,11 @@
+// ps5lm.cobanov.dev: static files only, no Worker code. Deploy with `wrangler deploy` from this folder.
+{
+  "name": "ps5lm-site",
+  "compatibility_date": "2026-10-01",
+  "account_id": "c7127d8fc0f65ab18ec12bdd78dd3859",
+  "assets": {
+    "directory": "./",
+    "html_handling": "auto-trailing-slash"
+  },
+  "routes": [{ "pattern": "ps5lm.cobanov.dev", "custom_domain": true }]
+}

@@ -1,192 +1,363 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PS5LM: a model server on your PS5</title>
-<meta name="description" content="PS5LM runs llama.cpp on the PS5's GPU and serves language and decision models to every device on your network, with OpenAI and Anthropic APIs and a screen made for the TV.">
-<meta name="theme-color" content="#0e0e14">
-<link rel="canonical" href="https://ps5lm.cobanov.dev/">
-<link rel="icon" type="image/png" href="/media/favicon.png">
-<link rel="apple-touch-icon" href="/media/icon.png">
-<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/recursive-sans-v1.woff2" crossorigin>
-<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/recursive-mono-v1.woff2" crossorigin>
-<link rel="stylesheet" href="/assets/style.css?v=3">
-<meta property="og:type" content="website">
-<meta property="og:url" content="https://ps5lm.cobanov.dev/">
-<meta property="og:title" content="PS5LM: a model server on your PS5">
-<meta property="og:description" content="llama.cpp on the PS5's GPU: Qwen 3.5 9B at 55 tokens a second, decision models powered by Ollaya, OpenAI and Anthropic APIs. Open source, GPL-3.0.">
-<meta property="og:image" content="https://ps5lm.cobanov.dev/media/og.jpg">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta name="twitter:card" content="summary_large_image">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PS5LM</title>
+  <meta name="description" content="llama.cpp on a jailbroken PS5's GPU, serving every device on your network over OpenAI and Anthropic APIs, with decision models and a screen made for the TV.">
+  <link rel="canonical" href="https://ps5lm.cobanov.dev/">
+  <link rel="icon" type="image/png" href="/media/favicon.png">
+  <link rel="apple-touch-icon" href="/media/icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ps5lm.cobanov.dev/">
+  <meta property="og:title" content="PS5LM">
+  <meta property="og:description" content="llama.cpp on the PS5's GPU: Qwen 3.5 9B at 55 tokens a second, decision models powered by Ollaya, OpenAI and Anthropic APIs. Open source, GPL-3.0.">
+  <meta property="og:image" content="https://ps5lm.cobanov.dev/media/og.jpg?v=4">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preload" href="/assets/fonts/recursive-sans-v1.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/assets/fonts/recursive-mono-v1.woff2" as="font" type="font/woff2" crossorigin>
+  <meta name="theme-color" content="#0e0e14">
+  <style>
+    /* THEME. Same family as cobanov.dev: the dark ground, the self-hosted Recursive (mono cut for the wordmark,
+       headings, labels and buttons, sans cut for reading), near-square corners and the periwinkle accent. The app's
+       icon and home screen background were drawn from this palette, so the top of the page carries the same grid
+       and glow. */
+    @font-face { font-family: "Recursive Sans"; src: url(/assets/fonts/recursive-sans-v1.woff2) format("woff2"); font-weight: 300 1000; font-display: swap; }
+    @font-face { font-family: "Recursive Mono"; src: url(/assets/fonts/recursive-mono-v1.woff2) format("woff2"); font-weight: 300 1000; font-display: swap; }
+    :root {
+      color-scheme: dark;
+      --paper: #0e0e14;
+      --panel: #16161d;
+      --ink: #f2f2f7;
+      --muted: rgba(235, 235, 245, 0.6);
+      --rule: rgba(235, 235, 245, 0.1);
+      --soft: #22222c;
+      --accent: #8288f0;
+      --accent-ink: #0e0e14; /* white on the periwinkle is only 3.1:1 */
+      /* code: violet, green, the periwinkle and amber, lifted for the dark ground */
+      --hl-key: #c4b5fd;
+      --hl-str: #86efac;
+      --hl-fn: #a5aaf6;
+      --hl-num: #fdba74;
+      --radius: 6px;
+      --radius-sm: 4px;
+      --sans: "Recursive Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      --mono: "Recursive Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    /* The top of the page: the console's home screen background, a faint grid and a periwinkle glow, fading into
+       the ground before the video. */
+    .top {
+      background:
+        linear-gradient(180deg, transparent 50%, var(--paper)),
+        radial-gradient(55% 75% at 80% 35%, rgba(130, 136, 240, 0.2), rgba(130, 136, 240, 0.04) 55%, transparent),
+        linear-gradient(90deg, var(--paper) 0, transparent 45%),
+        repeating-linear-gradient(0deg, rgba(235, 235, 245, 0.04) 0 1px, transparent 1px 60px),
+        repeating-linear-gradient(90deg, rgba(235, 235, 245, 0.04) 0 1px, transparent 1px 60px),
+        var(--paper);
+      padding-bottom: 40px;
+    }
+    /* Headings, the wordmark, labels and buttons in the mono cut, bold, as on cobanov.dev. */
+    h1, h2, .btn, .points b, .code-head, .compare thead th, .screens figcaption b, .foot h3, .fig { font-family: var(--mono); }
+    h1 .accent { display: block; }
+    /* STRUCTURE, as on runyard.cobanov.dev. */
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); font-variant-numeric: tabular-nums; }
+    a { color: inherit; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+    .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    header { display: flex; align-items: center; gap: 16px; padding: 20px 0; }
+    .brand { display: flex; } /* the horizontal logo from brand/, PS5LM and its cursor */
+    .brand img { display: block; height: 30px; width: auto; }
+    .accent { color: var(--accent); }
+    nav { margin-left: auto; display: flex; gap: 20px; font-size: 0.9375rem; }
+    nav a { text-decoration: none; color: var(--muted); }
+    nav a:hover { color: var(--ink); }
+    @media (max-width: 480px) { nav { gap: 16px; } nav .wide { display: none; } }
+    .hero { padding: 56px 0 0; max-width: 680px; }
+    @media (max-width: 760px) { .hero { padding-top: 32px; } }
+    h1 { font-size: clamp(2.125rem, 5.5vw, 3.25rem); line-height: 1.08; letter-spacing: -0.045em; margin: 0 0 20px; font-weight: 700; text-wrap: balance; }
+    .lede { font-size: 1.1875rem; color: var(--muted); margin: 0 0 28px; max-width: 40ch; text-wrap: pretty; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+    .btn { display: inline-block; padding: 12px 20px; border-radius: var(--radius-sm); border: 1px solid var(--rule); background: var(--panel); text-decoration: none; font-size: 0.9375rem; font-weight: 500; letter-spacing: -0.02em; }
+    .btn:hover { border-color: var(--muted); }
+    .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .btn.primary:hover { background: #969bf3; border-color: #969bf3; }
+    /* The console, filmed on the TV. */
+    .shot { margin: 0 0 56px; }
+    .shot video { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border: 1px solid var(--rule); border-radius: var(--radius); background: #000; cursor: pointer; }
+    section { margin-bottom: 72px; }
+    h2 { font-size: clamp(1.5rem, 3vw, 1.875rem); font-weight: 700; letter-spacing: -0.035em; margin: 0 0 8px; text-wrap: balance; }
+    .sub { color: var(--muted); margin: 0 0 24px; font-size: 1.0625rem; max-width: 64ch; }
+    .sub a, .note a, .points span a { color: var(--accent); }
+    /* One line each: a reader takes in all six at a glance. */
+    .points { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 28px 32px; margin: 0; padding: 0; list-style: none; }
+    .points li { border-top: 1px solid var(--rule); padding-top: 12px; }
+    .points b { display: block; font-size: 1rem; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 4px; }
+    .points span { color: var(--muted); }
+    /* Longer answers and numbered steps: the same rule-topped items, two to a row. */
+    .points.two { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+    .points .num { display: inline-grid; place-items: center; width: 22px; height: 22px; margin-right: 8px; border-radius: 50%; background: var(--soft); font-weight: 500; font-size: 0.8125rem; vertical-align: 1px; }
+    /* Code: a labelled panel, lines wrap with a hanging indent, a copy button. */
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 20px; }
+    .code { border: 1px solid var(--rule); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+    .code-head { display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 16px; border-bottom: 1px solid var(--rule); font-size: 0.875rem; }
+    .code-head .num { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--soft); font-weight: 500; font-size: 0.8125rem; }
+    .code-head .file { color: var(--muted); font: 0.8125rem var(--mono); }
+    .copy { margin-left: auto; font: inherit; font-size: 0.8125rem; padding: 4px 12px; border: 1px solid var(--rule); border-radius: var(--radius-sm); background: transparent; color: var(--muted); cursor: pointer; }
+    .copy:hover { color: var(--ink); border-color: var(--muted); }
+    .code pre { margin: 0; padding: 16px; font: 0.875rem/1.65 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
+    @media (max-width: 480px) { .code pre { font-size: 0.75rem; padding: 12px; } } /* the 44-character lines fit a phone */
+    .ln { display: block; padding-left: 2ch; text-indent: -2ch; }
+    .code .c { color: var(--muted); }
+    .code .k { color: var(--hl-key); }
+    .code .s { color: var(--hl-str); }
+    .code .f { color: var(--hl-fn); }
+    .code .n { color: var(--hl-num); }
+    .code .n, .code .k, .nw { white-space: nowrap; }
+    code { font-family: var(--mono); font-size: 0.875em; }
+    /* Tables in the comparison frame: marks and figures, not sentences. Scrolls inside its frame on a phone. */
+    .compare { position: relative; overflow-x: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--panel); }
+    .compare table { border-collapse: separate; border-spacing: 0; width: 100%; min-width: 560px; font-size: 0.9375rem; }
+    .compare th, .compare td { padding: 12px 16px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: middle; }
+    .compare tbody tr:last-child > * { border-bottom: 0; }
+    .compare thead th { font-size: 0.875rem; font-weight: 500; color: var(--muted); white-space: nowrap; }
+    .compare tbody th { font-weight: 500; }
+    .compare th:first-child { position: sticky; left: 0; z-index: 1; background: var(--panel); border-right: 1px solid var(--rule); width: 34%; }
+    .compare tbody th a { text-decoration: none; }
+    .compare tbody th a:hover { text-decoration: underline; }
+    .compare .fig { font-weight: 500; white-space: nowrap; color: var(--ink); }
+    .compare th:last-child, .compare td:last-child { text-align: right; }
+    .q { color: var(--muted); font-size: 0.8125rem; white-space: nowrap; }
+    .note { color: var(--muted); font-size: 0.8125rem; margin: 12px 0 0; }
+    .hint { display: none; color: var(--muted); font-size: 0.8125rem; margin: 0 0 12px; }
+    @media (max-width: 600px) { .hint { display: block; } }
+    /* The app's own screens, two to a row. */
+    .screens { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 28px 20px; margin: 0; }
+    .screens figure { margin: 0; }
+    .screens img { display: block; width: 100%; height: auto; border: 1px solid var(--rule); border-radius: var(--radius); }
+    .screens figcaption { margin-top: 12px; color: var(--muted); }
+    .screens figcaption b { color: var(--ink); font-weight: 700; letter-spacing: -0.03em; margin-right: 8px; }
+    .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 24px; } /* minmax: the table scrolls in its frame, not the page */
+    .cta { text-align: center; padding: 48px 20px; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--panel); }
+    .cta .sub { margin: 0 auto 24px; }
+    footer { border-top: 1px solid var(--rule); background: var(--panel); margin-top: 24px; }
+    .foot { display: grid; grid-template-columns: 1.6fr repeat(3, 1fr); gap: 32px; padding: 40px 0 32px; font-size: 0.9375rem; }
+    @media (max-width: 760px) { .foot { grid-template-columns: repeat(2, 1fr); } .foot .about { grid-column: 1 / -1; } }
+    .foot h3 { margin: 0 0 12px; font-size: 0.875rem; font-weight: 500; color: var(--muted); }
+    .foot ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+    .foot a { text-decoration: none; }
+    .foot a:hover { text-decoration: underline; }
+    .about img { display: block; width: 36px; height: 36px; border-radius: var(--radius); margin-bottom: 12px; }
+    .about p { margin: 0 0 8px; color: var(--muted); max-width: 30ch; }
+    .legal { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; padding: 16px 0 28px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.875rem; }
+    .legal a { text-decoration: none; }
+    .legal a:hover { text-decoration: underline; }
+    a:focus-visible, button:focus-visible, video:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  </style>
 </head>
 <body>
-<header class="site-header">
-  <div class="wrap nav">
-    <a class="brand" href="/"><img src="/media/icon.png" width="28" height="28" alt=""><span>PS5<em>LM</em></span></a>
-    <span class="nav-spacer"></span>
-    <nav class="nav-links" aria-label="Primary">
-      <a href="#screens">The app</a>
-      <a href="#features">Features</a>
-      <a href="#decisions">Decisions</a>
-      <a href="#install">Install</a>
-      <a href="#faq">FAQ</a>
-    </nav>
-    <a class="btn" href="https://github.com/cobanov/PS5LM">GitHub</a>
+  <div class="top">
+  <div class="wrap">
+    <header>
+      <a class="brand" href="/"><img src="/media/logo.svg" width="135" height="30" alt="PS5LM"></a>
+      <nav>
+        <a href="#install">Install</a>
+        <a href="#use" class="wide">API</a>
+        <a href="#faq" class="wide">FAQ</a>
+        <a href="https://github.com/cobanov/PS5LM/tree/main/docs">Docs</a>
+        <a href="https://github.com/cobanov/PS5LM">GitHub</a>
+      </nav>
+    </header>
+
+    <div class="hero">
+      <h1>Your PS5 runs the language model <span class="accent">Every device on your network uses it</span></h1>
+      <p class="lede">llama.cpp on the console's GPU, with OpenAI and Anthropic APIs and a screen made for the TV. No PC, no cloud, no account.</p>
+      <div class="actions">
+        <a class="btn primary" href="https://github.com/cobanov/PS5LM/releases/latest">Get the app</a>
+        <a class="btn" href="#install">How to install</a>
+      </div>
+    </div>
   </div>
-</header>
+  </div>
 
-<main>
-  <section class="hero">
-    <div class="wrap">
-      <a class="pill" href="#decisions"><b>New</b> Decision models, powered by Ollaya</a>
-      <h1 class="display">Your PS5 runs the language model.<br><span>Every device on your network uses it.</span></h1>
-      <p class="lede">PS5LM loads a GGUF model onto the console's GPU and serves it to your laptop, your phone and your coding tools, with OpenAI and Anthropic APIs and a screen made for the TV. No PC while it runs, no cloud, no account.</p>
-      <div class="cta">
-        <a class="btn btn-primary" href="https://github.com/cobanov/PS5LM/releases/latest">Get the app</a>
-        <a class="btn" href="https://github.com/cobanov/PS5LM">Source on GitHub</a>
-      </div>
-      <p class="hero-note">Free and open source under GPL-3.0, for a jailbroken PS5 you own on firmware 7.00 to 13.60.</p>
-      <figure class="demo">
-        <video id="demo" src="/media/ps5lm-home.mp4" poster="/media/poster.jpg" muted loop playsinline preload="metadata"
-          aria-label="A PS5 on a TV: PS5LM's Home screen shows Qwen 3.5 9B generating at 52 tokens a second while requests from a laptop stream in."></video>
-        <figcaption>Qwen 3.5 9B answering requests from a laptop on a PS5 Slim.</figcaption>
-      </figure>
-    </div>
-  </section>
+  <div class="wrap">
+    <figure class="shot">
+      <video id="demo" src="/media/ps5lm-home.mp4" poster="/media/poster.jpg" muted loop playsinline preload="metadata"
+        aria-label="A PS5 on a TV: PS5LM's Home screen shows Qwen 3.5 9B generating while requests from a laptop stream in"></video>
+    </figure>
 
-  <section id="numbers">
-    <div class="wrap">
-      <h2>Measured on the console</h2>
-      <div class="grid stats">
-        <div class="stat"><p class="value">207<small>tok/s</small></p><p>Qwen 3.5 0.8B, Q4_K_M</p></div>
-        <div class="stat"><p class="value">55<small>tok/s</small></p><p>Qwen 3.5 9B, Q4_K_M, with a 64k context</p></div>
-        <div class="stat"><p class="value">20<small>tok/s</small></p><p>Qwen 3.8 27B, UD-Q2_K_XL, the biggest that fits</p></div>
-        <div class="stat"><p class="value">0.3<small>s</small></p><p>Three decisions from d1 Omni 600M; a 720p image and seven questions in 2.9 s</p></div>
-      </div>
-      <p class="note">A PS5 Slim, every layer on its RDNA 2 GPU through llama.cpp's Vulkan backend, with 11.4 GB of the shared memory for the model and its context.</p>
-    </div>
-  </section>
+    <section aria-label="What it does">
+      <ul class="points">
+        <li><b>On the GPU</b><span>llama.cpp's Vulkan backend on the RDNA 2 GPU, every layer</span></li>
+        <li><b>OpenAI and Anthropic APIs</b><span>Claude Code, opencode and codex work against it</span></li>
+        <li><b>Decision models</b><span>Typed answers about text and images, with calibrated probabilities</span></li>
+        <li><b>Made for the TV</b><span>Every request streams across Home as a chat</span></li>
+        <li><b>Picks what fits</b><span>The planner sizes context and cache to the memory free</span></li>
+        <li><b>Free</b><span>Open source under GPL-3.0, no PC while it runs</span></li>
+      </ul>
+    </section>
 
-  <section id="screens">
-    <div class="wrap">
-      <h2>Made for the TV</h2>
-      <p>Five pages you move between with L1 and R1. Everything is in reach of the DualSense, and every request another device makes shows up on Home as it happens.</p>
-      <div class="shots">
-        <figure><img src="/media/app/home.jpg" width="1600" height="900" loading="lazy" alt="Home: the model, its speed, and the requests as a chat"><figcaption><b>Home</b> The model, its speed, and every request and its answer as a chat. Square sends a demo, Triangle opens a keyboard.</figcaption></figure>
-        <figure><img src="/media/app/models.jpg" width="1600" height="900" loading="lazy" alt="Models: suggested models measured on the console"><figcaption><b>Models</b> What is on this PS5, models measured on the console, Hugging Face search and downloads.</figcaption></figure>
-        <figure><img src="/media/app/home-decision.jpg" width="1600" height="900" loading="lazy" alt="Home with a decision model loaded"><figcaption><b>Decisions</b> With a decision model, Home shows the time per decision and each answer.</figcaption></figure>
-        <figure><img src="/media/app/console.jpg" width="1600" height="900" loading="lazy" alt="Console: temperature, power, GPU and CPU charts"><figcaption><b>Console</b> Temperature, power, GPU and CPU over the last two minutes or the last hour.</figcaption></figure>
-        <figure><img src="/media/app/api.jpg" width="1600" height="900" loading="lazy" alt="API: the endpoints and an example"><figcaption><b>API</b> The address, the endpoints and a request to copy.</figcaption></figure>
-        <figure><img src="/media/app/settings.jpg" width="1600" height="900" loading="lazy" alt="Settings with a list of choices under a row"><figcaption><b>Settings</b> Startup, context and cache, storage, and the logs under Diagnostics.</figcaption></figure>
-      </div>
-    </div>
-  </section>
-
-  <section id="features">
-    <div class="wrap">
-      <h2>A model server under your TV</h2>
-      <div class="grid cards">
-        <div class="card"><h3>It runs on the GPU</h3><p>llama.cpp's Vulkan backend on the console's RDNA 2 GPU. Every architecture and quantization llama.cpp knows comes along.</p></div>
-        <div class="card"><h3>It answers your network</h3><p>OpenAI's <code>/v1/chat/completions</code>, Anthropic's <code>/v1/messages</code> (Claude Code works against it) and a chat page in any browser, at <code>http://&lt;console&gt;:8081</code>.</p></div>
-        <div class="card"><h3>It decides, too</h3><p>Load a decision model and the console answers <code>/v1/systemone</code>: choice, score and yes-or-no questions about text and images.</p></div>
-        <div class="card"><h3>It shows its work</h3><p>Every request streams across the TV as a chat: which device asked, what it asked, and the reply as it is written.</p></div>
-        <div class="card"><h3>It watches the console</h3><p>Charts of temperature, power and load, beside a table of every reading the console gives.</p></div>
-        <div class="card"><h3>It picks what fits</h3><p>The planner reads each GGUF and gives it the longest context and best cache that fit. Downloads go to internal storage, the M.2 drive or USB.</p></div>
-        <div class="card"><h3>It reads images</h3><p>Models with an image projector, such as Gemma 4, MiniCPM-V and d1, take pictures in chat and in decisions.</p></div>
-        <div class="card"><h3>It needs nothing else</h3><p>No PC while it runs, no cloud and no account. Your prompts never leave your home.</p></div>
-      </div>
-    </div>
-  </section>
-
-  <section id="decisions">
-    <div class="wrap">
-      <p class="eyebrow">Powered by <a href="https://ollaya.dev">Ollaya</a></p>
-      <h2>Decision models</h2>
-      <p><a href="https://github.com/ollaya-dev/ollaya">Ollaya</a> runs open decision models on a PC the way Ollama runs language models. PS5LM brings the same idea to the console: a decision model reads a state and answers typed questions in one forward pass, with calibrated probabilities and no text generated.</p>
-      <pre class="panel"><code><span class="dim">$</span> curl http://&lt;console&gt;:8081/v1/systemone -H 'Content-Type: application/json' -d '{
-  "state": "I was charged twice this month. Refund me or I cancel.",
-  "questions": {
-    "intent": {"type": "choice", "instructions": "What does the customer want?",
-               "criteria": {"refund": null, "information": null, "cancel": null}},
-    "angry":  {"type": "noul", "instructions": "Is the customer angry?"}
-  }
-}'</code></pre>
-      <p>The Suggested list has d1 Omni 600M, d1 3B and Clef Flash. Any GGUF that carries llama.cpp's decision metadata loads the same way, and the app labels it a decision model.</p>
-    </div>
-  </section>
-
-  <section id="install">
-    <div class="wrap">
-      <h2>Install</h2>
-      <p>You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded:</p>
-      <div class="table">
-        <table>
-          <thead><tr><th>Payload</th><th>For</th><th></th></tr></thead>
+    <section>
+      <h2 id="numbers">Measured on the console</h2>
+      <p class="sub">A PS5 Slim, every layer on its GPU, with 11.4 GB of the shared memory for the model and its context</p>
+      <p class="hint">Swipe the table to see the speeds</p>
+      <div class="compare">
+        <table aria-labelledby="numbers">
+          <thead>
+            <tr><th scope="col">Model</th><th scope="col">Size</th><th scope="col">On a PS5 Slim</th></tr>
+          </thead>
           <tbody>
-            <tr><td><a href="https://github.com/EchoStretch/kstuff-lite">kstuff-lite</a></td><td>the kernel patches homebrew runs on</td><td>required</td></tr>
-            <tr><td><a href="https://github.com/etaHEN/etaHEN">etaHEN</a></td><td>homebrew support</td><td>required</td></tr>
-            <tr><td><a href="https://github.com/drakmor/ShadowMountPlus">ShadowMountPlus</a></td><td>puts PS5LM on the home screen from <code>/data/homebrew</code></td><td>required</td></tr>
-            <tr><td><a href="https://github.com/ps5-payload-dev/elfldr">elfldr</a></td><td>temperature, power and real free space</td><td>recommended</td></tr>
-            <tr><td><a href="https://github.com/ps5-payload-dev/ftpsrv">ftpsrv</a></td><td>installing the app, copying models from a PC</td><td>recommended</td></tr>
+            <tr><th scope="row">Qwen 3.5 0.8B, Q4_K_M</th><td>0.5 GB</td><td><span class="fig">207</span> tokens a second</td></tr>
+            <tr><th scope="row">Qwen 3.5 9B, Q4_K_M</th><td>5.3 GB</td><td><span class="fig">55</span> tokens a second</td></tr>
+            <tr><th scope="row">Qwen 3.8 27B, UD-Q2_K_XL</th><td>9.2 GB</td><td>about <span class="fig">20</span> tokens a second, 64k context</td></tr>
+            <tr><th scope="row">d1 Omni 600M, a decision model</th><td>1.1 GB</td><td><span class="fig">3</span> questions in <span class="fig">0.3 s</span></td></tr>
           </tbody>
         </table>
       </div>
-      <ol class="steps-list">
-        <li>Download <code>ps5lm-app-vX.Y.Z.zip</code> from the <a href="https://github.com/cobanov/PS5LM/releases/latest">latest release</a> and unzip it.</li>
-        <li>Copy the <code>PPSA99575</code> folder to <code>/data/homebrew</code> over FTP. ShadowMountPlus adds <strong>PS5LM</strong> to the home screen.</li>
-        <li>Open PS5LM, go to <strong>Models &gt; Suggested</strong> and get a model. Or copy a <code>.gguf</code> to <code>/data/PS5LM/models</code>, or to <code>PS5LM/models</code> on a USB drive.</li>
-        <li>Load it. Once Home says Ready, open <code>http://&lt;console&gt;:8081</code> in a browser, or point your OpenAI or Anthropic client at it.</li>
+      <p class="note">A 720p image and seven questions take d1 Omni 600M 2.9 s. Generation is bound by memory bandwidth: the 9B model reads its weights at about 70% of the GPU's 448 GB/s.</p>
+    </section>
+
+    <section>
+      <h2 id="screens">Made for the TV</h2>
+      <p class="sub">Five pages you move between with L1 and R1, all in reach of the DualSense</p>
+      <div class="screens">
+        <figure><img src="/media/app/home.jpg" width="1600" height="900" loading="lazy" alt="Home: the model, its speed, and the requests as a chat"><figcaption><b>Home</b>The model, its speed, and every request and its answer as a chat</figcaption></figure>
+        <figure><img src="/media/app/models.jpg" width="1600" height="900" loading="lazy" alt="Models: suggested models measured on the console"><figcaption><b>Models</b>What is on this PS5, models measured on the console, Hugging Face search</figcaption></figure>
+        <figure><img src="/media/app/home-decision.jpg" width="1600" height="900" loading="lazy" alt="Home with a decision model loaded"><figcaption><b>Decisions</b>With a decision model, Home shows the time per decision and each answer</figcaption></figure>
+        <figure><img src="/media/app/console.jpg" width="1600" height="900" loading="lazy" alt="Console: temperature, power, GPU and CPU charts"><figcaption><b>Console</b>Temperature, power, GPU and CPU over two minutes or an hour</figcaption></figure>
+        <figure><img src="/media/app/api.jpg" width="1600" height="900" loading="lazy" alt="API: the endpoints and an example"><figcaption><b>API</b>The address, the endpoints and a request to copy</figcaption></figure>
+        <figure><img src="/media/app/settings.jpg" width="1600" height="900" loading="lazy" alt="Settings with a list of choices under a row"><figcaption><b>Settings</b>Startup, context and cache, storage, and the logs</figcaption></figure>
+      </div>
+    </section>
+
+    <section>
+      <h2 id="use">Use it from any device</h2>
+      <p class="sub">Once Home says Ready, the console answers on port 8081. The model name in a request is ignored: the loaded one answers.</p>
+      <div class="steps">
+        <div class="code">
+          <div class="code-head"><span class="num">1</span>Chat <span class="file">OpenAI API</span><button class="copy" type="button">Copy</button></div>
+<pre><code><span class="ln"><span class="c"># the address Home shows on the TV</span></span><span class="ln">PS5=<span class="s">http://192.168.8.53:8081</span></span><span class="ln"> </span><span class="ln"><span class="f">curl</span> $PS5/v1/chat/completions \</span><span class="ln">  <span class="k">-H</span> <span class="s">'Content-Type: application/json'</span> \</span><span class="ln">  <span class="k">-d</span> <span class="s">'{"model": "ps5", "messages": [</span></span><span class="ln"><span class="s">    {"role": "user",</span></span><span class="ln"><span class="s">     "content": "Hello from my laptop"}]}'</span></span></code></pre>
+        </div>
+        <div class="code" id="decisions">
+          <div class="code-head"><span class="num">2</span>Decide <span class="file">/v1/systemone</span><button class="copy" type="button">Copy</button></div>
+<pre><code><span class="ln"><span class="f">curl</span> $PS5/v1/systemone \</span><span class="ln">  <span class="k">-H</span> <span class="s">'Content-Type: application/json'</span> \</span><span class="ln">  <span class="k">-d</span> <span class="s">'{"state": "Charged twice. Refund me.",</span></span><span class="ln"><span class="s">  "questions": {</span></span><span class="ln"><span class="s">    "intent": {"type": "choice",</span></span><span class="ln"><span class="s">      "instructions":</span></span><span class="ln"><span class="s">        "What does the customer want?",</span></span><span class="ln"><span class="s">      "criteria": {"refund": null,</span></span><span class="ln"><span class="s">        "information": null,</span></span><span class="ln"><span class="s">        "cancel": null}},</span></span><span class="ln"><span class="s">    "angry": {"type": "noul",</span></span><span class="ln"><span class="s">      "instructions":</span></span><span class="ln"><span class="s">        "Is the customer angry?"}}}'</span></span></code></pre>
+        </div>
+      </div>
+      <p class="note">Decision models are powered by <a href="https://ollaya.dev">Ollaya</a>, which runs them on a PC the way Ollama runs language models: one forward pass, no text generated. The Suggested list has d1 Omni 600M, d1 3B and Clef Flash. Claude Code, opencode and codex setups are in <a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">docs/CLI.md</a>.</p>
+    </section>
+
+    <section class="stack">
+      <div>
+        <h2 id="install">Install</h2>
+        <p class="sub">A PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded</p>
+        <div class="compare">
+          <table aria-labelledby="install">
+            <thead>
+              <tr><th scope="col">Payload</th><th scope="col">For</th><th scope="col"><span class="sr">Needed</span></th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row"><a href="https://github.com/EchoStretch/kstuff-lite">kstuff-lite</a></th><td>The kernel patches homebrew runs on</td><td><span class="q">Required</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/etaHEN/etaHEN">etaHEN</a></th><td>Homebrew support</td><td><span class="q">Required</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/drakmor/ShadowMountPlus">ShadowMountPlus</a></th><td>Puts PS5LM on the home screen from <code>/data/homebrew</code></td><td><span class="q">Required</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/elfldr">elfldr</a></th><td>Temperature, power and real free space; full-speed downloads, through the app's own ftpsrv</td><td><span class="q">Recommended</span></td></tr>
+              <tr><th scope="row"><a href="https://github.com/ps5-payload-dev/ftpsrv">ftpsrv</a></th><td>Installing the app, copying models from a PC; downloads write through it when it runs</td><td><span class="q">Recommended</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <ol class="points two">
+        <li><b><span class="num">1</span>Download</b><span><code>ps5lm-app-vX.Y.Z.zip</code> from the <a href="https://github.com/cobanov/PS5LM/releases/latest">latest release</a>, and unzip it</span></li>
+        <li><b><span class="num">2</span>Copy</b><span>The <code>PPSA99575</code> folder to <code>/data/homebrew</code> over FTP. ShadowMountPlus adds PS5LM to the home screen</span></li>
+        <li><b><span class="num">3</span>Get a model</b><span>In Models &gt; Suggested, or copy a <code>.gguf</code> to <code>/data/PS5LM/models</code> or to <code>PS5LM/models</code> on a USB drive</span></li>
+        <li><b><span class="num">4</span>Load it</b><span>Once Home says Ready, open <code>http://&lt;console&gt;:8081</code> in a browser, or point your client at it</span></li>
       </ol>
-      <p>To update, copy the new folder over the old one; settings, models and downloads stay in <code>/data/PS5LM</code>. Using it from coding tools (opencode, Codex, Claude Code) is in <a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">docs/CLI.md</a>, building it in <a href="https://github.com/cobanov/PS5LM/blob/main/docs/BUILDING.md">docs/BUILDING.md</a>.</p>
-    </div>
-  </section>
+      <p class="note">To update, copy the new folder over the old one: settings, models and downloads stay in <code>/data/PS5LM</code>. If the app says it cannot write to <code>/data/PS5LM</code>, the HEN has not opened storage to it; the fix for each HEN is in the <a href="https://github.com/cobanov/PS5LM#readme">README</a>.</p>
+    </section>
 
-  <section id="faq" class="faq">
-    <div class="wrap">
-      <h2>Questions</h2>
-      <h3>Does it run on the GPU?</h3>
-      <p>Yes, every layer. llama.cpp's Vulkan backend runs on RADV, the open Mesa driver, ported to the PS5 by PS5_Vulkan. Generation is bound by memory bandwidth, and the 9B model reads its weights at about 70% of the GPU's 448 GB/s.</p>
-      <h3>How big a model can it run?</h3>
-      <p>About 11 GB of model and context. Qwen 3.8 27B at 2-bit fits with a 64k context; a 9B at 4-bit fits with room to spare. The planner tells you what fits before you download.</p>
-      <h3>Does this run games or need any Sony code?</h3>
-      <p>No. PS5LM runs open-weight models and nothing else. No games, keys, firmware or Sony SDK files are part of it.</p>
-      <h3>Can it break my console?</h3>
-      <p>It writes only to its own folders, never to system files. Under a long load the console runs warm and the fan spins up, as it does in a game; the Console page shows both.</p>
-      <h3>Is it the same as PS5LM Plus?</h3>
-      <p>PS5LM grew from PS5LM Plus, the native GPU app by abhi245y, and now lives under its own title ID, PPSA99575, so the two install side by side.</p>
-    </div>
-  </section>
-</main>
+    <section>
+      <h2 id="faq">Questions</h2>
+      <p class="sub">What people ask before they install it</p>
+      <ul class="points two">
+        <li><b>Does it run on the GPU?</b><span>Yes, every layer. llama.cpp's Vulkan backend runs on RADV, the open Mesa driver, ported to the PS5 by PS5_Vulkan.</span></li>
+        <li><b>How big a model can it run?</b><span>About 11 GB of model and context. Qwen 3.8 27B at 2-bit fits with a 64k context; the planner tells you what fits before you download.</span></li>
+        <li><b>Does this run games or need any Sony code?</b><span>No. PS5LM runs open-weight models and nothing else. No games, keys, firmware or Sony SDK files are part of it.</span></li>
+        <li><b>Can it break my console?</b><span>It writes only to its own folders, never to system files. Under a long load it runs warm and the fan spins up, as in a game; the Console page shows both.</span></li>
+        <li><b>Is it the same as PS5LM Plus?</b><span>PS5LM grew from PS5LM Plus, the native GPU app by abhi245y, and now lives under its own title ID, PPSA99575, so the two install side by side.</span></li>
+        <li><b>Which model for coding agents?</b><span>A smaller model with a long context: prompts are read several times faster. <a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">docs/CLI.md</a> has the trade-offs.</span></li>
+        <li><b>Can several consoles run one model?</b><span>Experimentally, with the fleet build, a separate zip. A PC runs the controller and each PS5 holds a run of one dense llama or qwen2 model's layers on its GPU. So far one PS5 has served a model together with a PC. RPC has no authentication, so keep it on an isolated network: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">docs/FLEET.md</a>.</span></li>
+        <li><b>Can I see inside the model?</b><span>If you turn it on. <code>POST /v1/introspect</code> returns the logits where you ask, the top candidates and one layer's activations, and can zero, scale or add to a channel. It is off by default, under Settings &gt; Developer: <a href="https://github.com/cobanov/PS5LM/blob/main/docs/INTROSPECTION.md">docs/INTROSPECTION.md</a>.</span></li>
+      </ul>
+    </section>
 
-<footer class="site-footer">
-  <div class="wrap">
-    <div class="foot-row">
-      <span>PS5LM, by <a href="https://cobanov.dev">Mert Cobanov</a></span>
-      <a href="https://github.com/cobanov/PS5LM">GitHub</a>
-      <a href="https://ollaya.dev">Ollaya</a>
-      <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>
-      <a href="https://github.com/mihawk-99/PS5_Vulkan">PS5_Vulkan</a>
-      <a href="https://github.com/blackbearreloaded/ps5-homebrew-ui">ps5-homebrew-ui</a>
-    </div>
-    <p>PS5LM is not affiliated with Sony Interactive Entertainment. PlayStation and PS5 are its trademarks.</p>
+    <section class="cta">
+      <h2>Run it on your PS5</h2>
+      <p class="sub">Free and open source, for a jailbroken PS5 you own on firmware 7.00 to 13.60</p>
+      <a class="btn primary" href="https://github.com/cobanov/PS5LM/releases/latest">Get the app</a>
+    </section>
   </div>
-</footer>
 
-<script>
-  (function () {
-    var video = document.getElementById('demo');
-    var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (still) {
-      video.setAttribute('controls', '');
-      return;
+  <footer>
+    <div class="wrap">
+      <div class="foot">
+        <div class="about">
+          <img src="/media/icon.png" width="36" height="36" alt="">
+          <p>Your PS5 runs the language model</p>
+          <p>Free and open source, GPL-3.0</p>
+        </div>
+        <div>
+          <h3>Product</h3>
+          <ul>
+            <li><a href="https://github.com/cobanov/PS5LM/releases">Releases</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/CHANGELOG.md">Changelog</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/issues">Issues</a></li>
+            <li><a href="/llms.txt">llms.txt</a></li>
+          </ul>
+        </div>
+        <div>
+          <h3>Docs</h3>
+          <ul>
+            <li><a href="https://github.com/cobanov/PS5LM#readme">Install</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/CLI.md">Coding tools</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/MODELS.md">Models</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/FLEET.md">Fleet</a></li>
+            <li><a href="https://github.com/cobanov/PS5LM/blob/main/docs/BUILDING.md">Building</a></li>
+          </ul>
+        </div>
+        <div>
+          <h3>Built on</h3>
+          <ul>
+            <li><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a></li>
+            <li><a href="https://github.com/mihawk-99/PS5_Vulkan">PS5_Vulkan</a></li>
+            <li><a href="https://ollaya.dev">Ollaya</a></li>
+            <li><a href="https://github.com/abhi245y/ps5-homebrew-ui">ps5-homebrew-ui</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="legal">
+        <span>Made by <a href="https://cobanov.dev">Mert Cobanov</a></span>
+        <span>v0.10.0. Not affiliated with Sony Interactive Entertainment; PlayStation and PS5 are its trademarks</span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Copy takes the code as typed, without the panel's label.
+    for (const b of document.querySelectorAll('.copy'))
+      b.onclick = () =>
+        navigator.clipboard.writeText(b.closest('.code').querySelector('code').innerText.trimEnd()).then(
+          () => ((b.textContent = 'Copied'), setTimeout(() => (b.textContent = 'Copy'), 1500)),
+          () => (b.textContent = 'Select and copy'),
+        )
+    // The demo plays on its own unless the reader asked for less motion; a click pauses it.
+    const video = document.getElementById('demo')
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) video.controls = true
+    else {
+      video.autoplay = true
+      video.play()?.catch(() => (video.controls = true))
+      video.onclick = () => (video.paused ? video.play() : video.pause())
     }
-    video.autoplay = true;
-    var p = video.play();
-    if (p && p.catch) p.catch(function () { video.setAttribute('controls', ''); });
-    video.addEventListener('click', function () { if (video.paused) video.play(); else video.pause(); });
-  })();
-</script>
+  </script>
 </body>
 </html>

@@ -1,0 +1,35 @@
+# PS5LM
+
+> llama.cpp on a jailbroken PS5: the app loads a GGUF model onto the console's RDNA 2 GPU through llama.cpp's
+> Vulkan backend and serves it to every device on the network over OpenAI and Anthropic APIs. Decision models
+> (d1, Clef) answer Ollaya's `/v1/systemone`. Open source, GPL-3.0, title ID PPSA99575.
+
+Key facts:
+
+- The console answers on `http://<console>:8081` once the app's Home screen says Ready. The model name in a request
+  is ignored: the loaded model answers, so any name works.
+- Endpoints: `/v1/chat/completions` (OpenAI Chat Completions), `/v1/responses` (codex), `/v1/messages` (Anthropic,
+  Claude Code), `/v1/systemone` (decision models), and a chat page at `/` in any browser. `/v1/introspect`
+  (logits and activations) is off by default: Settings > Developer, or `LLAMA_INTROSPECT=1`.
+- Claude Code: `ANTHROPIC_BASE_URL=http://<console>:8081 ANTHROPIC_AUTH_TOKEN=ps5lm ANTHROPIC_MODEL=ps5
+  ANTHROPIC_SMALL_FAST_MODEL=ps5 CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536 claude`.
+- Needs a PS5 on firmware 7.00 to 13.60 with kstuff-lite, etaHEN and ShadowMountPlus; elfldr and ftpsrv are
+  recommended. Models live in `/data/PS5LM/models` or `PS5LM/models` on a USB drive.
+- Measured on a PS5 Slim: Qwen 3.5 9B Q4_K_M at 55 tokens a second, Qwen 3.8 27B UD-Q2_K_XL at about 20 with a
+  64k context, d1 Omni 600M answers three questions in 0.3 s. About 11 GB of model and context fits.
+- Fleet (experimental, since v0.10.0): a separate build, `ps5lm-app-fleet-vX.Y.Z.zip`, splits one dense `llama`
+  or `qwen2` GGUF across several consoles by layers over llama.cpp's RPC. A Linux or macOS PC runs the controller
+  and can add its CPU as a worker. RPC has no authentication: isolated networks only.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/cobanov/PS5LM/main/README.md): install, payloads, HEN storage fixes
+- [Coding tools](https://raw.githubusercontent.com/cobanov/PS5LM/main/docs/CLI.md): opencode, codex and Claude Code against the console
+- [Models](https://raw.githubusercontent.com/cobanov/PS5LM/main/docs/MODELS.md): which models fit and how fast they run
+- [Fleet](https://raw.githubusercontent.com/cobanov/PS5LM/main/docs/FLEET.md): one model across several consoles, experimental
+- [Introspection](https://raw.githubusercontent.com/cobanov/PS5LM/main/docs/INTROSPECTION.md): the opt-in logits and activations API
+- [Building](https://raw.githubusercontent.com/cobanov/PS5LM/main/docs/BUILDING.md): building the app and llama.cpp for the PS5
+
+## Optional
+
+- [CHANGELOG](https://raw.githubusercontent.com/cobanov/PS5LM/main/CHANGELOG.md): what changed in each release
