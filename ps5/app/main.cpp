@@ -1083,6 +1083,12 @@ int main(int, char **) {
         boot();
         booted = true;
     };
+    // The pad before the boot thread's wait, so the pages can be walked during it.
+    hui::ps5::Pad pad;
+    pad.open();
+    hui::InputTracker tracker;
+    hui::PadSample samples[64];
+    dash.set_settings(models.settings);
     const pthread_t booting = start_thread(boot_then);
     {
         hui::ui::Feedback quiet;  // no sounds yet: the mixer starts after
@@ -1095,7 +1101,14 @@ int main(int, char **) {
             }
             dash.set_live(stats.snapshot());
             quiet.clear();
-            dash.update(hui::InputFrame{}, std::min(0.05f, (float) (now - at) / 1e6f), quiet);
+            // L1/R1 only (#62): anything else could ask for what the boot thread
+            // still owns, and Dashboard keeps one request, unread until the loop below.
+            const size_t count = pad.read(samples);
+            const hui::InputFrame pressed = tracker.update(std::span<const hui::PadSample>(samples, count), (uint64_t) now);
+            hui::InputFrame pages;
+            pages.connected = pressed.connected;
+            pages.pressed = pressed.pressed & (hui::action_bit(hui::Action::page_prev) | hui::action_bit(hui::Action::page_next));
+            dash.update(pages, std::min(0.05f, (float) (now - at) / 1e6f), quiet);
             at = now;
             render();
             display.swap();
@@ -1103,10 +1116,7 @@ int main(int, char **) {
     }
     pthread_join(booting, nullptr);
 
-    // Input and sound, as ps5-homebrew-ui's own app does.
-    hui::ps5::Pad pad;
-    pad.open();
-    hui::InputTracker tracker;
+    // Sound, as ps5-homebrew-ui's own app does.
     hui::audio::Mixer mixer;
     hui::ps5::AudioOut audio_out;
     audio_out.start(mixer);
@@ -1117,7 +1127,6 @@ int main(int, char **) {
     Market    market;
     market.start(models.budget_gib);
     int  saved_seen = 0;  // downloads finished, as last seen
-    dash.set_settings(models.settings);
     dash.set_storage(!app_storage(), app_storage_size() / 1073741824.0, app_storage() && storage_choice().empty());
     bool      scratch_warned = false;
     // Downloads left queued or running carry on, on their own page.
@@ -1131,7 +1140,6 @@ int main(int, char **) {
         }
     }
     hui::ui::Feedback feedback;
-    hui::PadSample samples[64];
     int64_t last = hui::sys::monotonic_us();
     bool was_serving = false;
     bool rescanning = false;
