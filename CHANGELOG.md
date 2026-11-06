@@ -5,6 +5,13 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Fixed
+- L1 and R1 walk the pages while the app starts, instead of the controller doing nothing until the
+  GPU is open and every model's header is read (#62). The other buttons still wait for the start
+  to finish.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
