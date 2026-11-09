@@ -20,3 +20,7 @@ ps5/app/sce_sys/*.dds
 # Python bytecode from the fleet controller and its tests
 __pycache__/
 *.pyc
+
+# the fleet control server's settings (python3 -m fleet control)
+fleet/control.json
+fleet/control.json.tmp
