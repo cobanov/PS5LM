@@ -132,7 +132,7 @@ with context without flash attention (0.5 to 1.8 GiB per worker at 32k for the
 models above). So before llama-server starts, `serve` and the control server run
 `llama-fit-params --fit-print on` with the plan's exact split against the live
 workers. It refuses to start when llama.cpp projects any worker within 256 MiB of
-its budget (`llama_check` in the printed plan). A successful plan is still **not
+its budget, or an eighth of a smaller budget (`llama_check` in the printed plan). A successful plan is still **not
 an allocation guarantee or reservation**; live memory can change.
 
 ## Security boundary — read before enabling workers
