@@ -99,8 +99,13 @@ def probe(binary, config, timeout=20):
 
 
 # Headroom llama.cpp's projection must leave on every worker, for driver
-# allocation granularity and what it does not count.
+# allocation granularity and what it does not count: 256 MiB, or an eighth of
+# a smaller budget (a test worker of 128 MiB keeps 16).
 CHECK_MARGIN_MIB = 256
+
+
+def check_margin(budget_mib):
+    return min(CHECK_MARGIN_MIB, max(1, budget_mib // 8))
 
 
 def llama_check(binary, model_path, placement, timeout=300):
@@ -111,7 +116,7 @@ def llama_check(binary, model_path, placement, timeout=300):
     settings, and prints each device's weights, cache and compute buffers. It
     counts what the estimator leaves to the reserve (compute buffers) and checks
     the estimator's layout. Returns {worker id: MiB figures}; raises FleetError
-    when a worker would not keep CHECK_MARGIN_MIB free.
+    when a worker would not keep check_margin() of its budget free.
     """
     fit = Path(binary).resolve().parent / 'llama-fit-params'
     if not fit.is_file():
@@ -132,9 +137,10 @@ def llama_check(binary, model_path, placement, timeout=300):
         total = weights + cache + compute
         report[node['id']] = dict(weights_mib=weights, cache_mib=cache, compute_mib=compute, total_mib=total,
                                   budget_mib=node['memory_mib'])
-        if total + CHECK_MARGIN_MIB > node['memory_mib']:
+        margin = check_margin(node['memory_mib'])
+        if total + margin > node['memory_mib']:
             over.append(f"{node['id']} needs {total} MiB (weights {weights}, cache {cache}, compute {compute}) "
-                        f"of {node['memory_mib']} MiB")
+                        f"and {margin} MiB to spare, of {node['memory_mib']} MiB")
     if over:
         raise FleetError('llama.cpp projects more memory than the workers have: ' + '; '.join(over))
     return report
@@ -180,7 +186,7 @@ def direct_command(binary, model_path, device, context, port, slots=1, unified=F
 def direct_check(binary, model_path, device, free_mib, context, slots=1, unified=False, cache_type='f16',
                  flash_attn=False, timeout=300):
     """llama.cpp's projection for a model on one local GPU; raises when it would
-    not leave CHECK_MARGIN_MIB of the free memory."""
+    not leave check_margin() of the free memory."""
     if CACHE_TYPES.get(cache_type, (1,))[0] > 1 and not flash_attn:
         raise FleetError('A quantized cache needs flash attention: llama.cpp quantizes V only with it')
     fit = Path(binary).resolve().parent / 'llama-fit-params'
@@ -193,9 +199,10 @@ def direct_check(binary, model_path, device, free_mib, context, slots=1, unified
     weights, cache, compute = rows[device]
     total = weights + cache + compute
     report = dict(weights_mib=weights, cache_mib=cache, compute_mib=compute, total_mib=total, budget_mib=free_mib)
-    if total + CHECK_MARGIN_MIB > free_mib:
+    margin = check_margin(free_mib)
+    if total + margin > free_mib:
         raise FleetError(f'{device} needs {total} MiB (weights {weights}, cache {cache}, compute {compute}) '
-                         f'with {free_mib} MiB free')
+                         f'and {margin} MiB to spare, with {free_mib} MiB free')
     return report
 
 

@@ -25,7 +25,8 @@ v0.1.x are the upstream payload releases by cobanov.
     gave the same greedy tokens as one worker (docs/FLEET.md).
 - Before llama-server starts, `fleet serve` checks the plan with llama.cpp itself:
   `llama-fit-params --fit-print` against the live workers, compute buffers
-  included. It refuses a worker that would come within 256 MiB of its budget.
+  included. It refuses a worker that would come within 256 MiB of its budget, or
+  an eighth of a smaller budget.
   `scripts/build-fleet-host.sh` builds `llama-fit-params`.
 - **`python3 -m fleet control`** runs a fleet of any size from one JSON
   configuration: devices (consoles, this PC's GPUs, other RPC servers), and pools.

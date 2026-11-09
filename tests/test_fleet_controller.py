@@ -177,6 +177,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args[args.index('--ctx-checkpoints')+1], '1')
         self.assertEqual(args[args.index('--cache-ram')+1], '0')
 
+    def test_check_margin_scales_down_for_small_budgets(self):
+        self.assertEqual(controller.check_margin(12000), controller.CHECK_MARGIN_MIB)
+        self.assertEqual(controller.check_margin(128), 16)      # the RPC smoke test's workers
+        self.assertEqual(controller.check_margin(4), 1)
+
     def test_direct_command_uses_one_local_gpu(self):
         args = controller.direct_command('/tmp/server', '/tmp/m.gguf', 'CUDA0', 65536, 18100, slots=2,
                                          cache_type='q8_0', flash_attn=True)
