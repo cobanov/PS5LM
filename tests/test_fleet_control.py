@@ -335,6 +335,20 @@ class FleetTests(unittest.TestCase):
             self.fleet._start_replica(replica, settings)
         serve.assert_called_once_with('192.168.50.21', args, worker=False)
 
+    def test_stopping_a_console_replica_unloads_its_model(self):
+        self.fleet.apply(dict(devices=[ps5()], pools=[pool(running=True, replicas=[dict(devices=['ps5-a'])])]))
+        (replica,) = self.fleet.replicas
+        replica.state = 'ready'
+        with patch.object(devices, 'stop_serving') as unload:
+            self.fleet.update_pool('qwen', dict(running=False))
+            self.fleet._reconcile(control.concurrent.futures.ThreadPoolExecutor(2))
+            for _ in range(250):
+                if replica.state == 'stopped':
+                    break
+                time.sleep(0.02)
+        unload.assert_called_once_with('192.168.50.21')
+        self.assertEqual(replica.state, 'stopped')
+
     def test_a_start_under_way_is_not_failed_by_the_watcher(self):
         # A console replica copies its model before it sets a load deadline; the
         # watcher must not read the missing deadline as a passed one.

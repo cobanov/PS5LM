@@ -984,19 +984,23 @@ class Fleet:
         else:
             self._set(replica, 'waiting', f'open PS5LM on {name}; it loads the model when it opens')
 
-    def _stop(self, replica, reason='stopped'):
+    def _stop(self, replica, reason='stopped', was=None):
+        """Stop a replica. `was` is its state before stopping began, when the
+        caller has already marked it stopping (_stop_soon)."""
         with self.lock:
             replica.cancel.set()
             process, replica.process = replica.process, None
-            was = replica.state
+            was = was or replica.state
             self._set(replica, 'stopping', reason)
         if process is not None:
             process.stop()
         if replica.via == 'app' and was in ('starting', 'ready', 'waiting'):
             device = next((d for d in self.config['devices'] if d['id'] == replica.spec['devices'][0]), None)
             if device is not None:
-                with contextlib.suppress(*ERRORS):
+                try:
                     devices.stop_serving(device['address'])
+                except ERRORS as exc:
+                    self.note(f"{replica.key}: could not ask {device['id']} to unload the model: {exc}")
         with self.lock:
             self._free_port(replica)
             replica.failures, replica.retry_at = 0, 0.0
@@ -1007,9 +1011,10 @@ class Fleet:
             # Already stopping, or stopped with nothing starting: nothing to do.
             if replica.state == 'stopping' or (replica.state == 'stopped' and replica.thread is None):
                 return
+            was = replica.state
             replica.cancel.set()
             self._set(replica, 'stopping', reason)
-        threading.Thread(target=self._stop, args=(replica, reason), daemon=True).start()
+        threading.Thread(target=self._stop, args=(replica, reason, was), daemon=True).start()
 
     def _start_rpc_server(self, device, manual=False):
         with self.lock:
