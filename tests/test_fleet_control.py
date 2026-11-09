@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -308,6 +309,25 @@ class FleetTests(unittest.TestCase):
             self.fleet.remove_device('ps5-a')
         with self.assertRaisesRegex(control.ControlError, 'takes worker, leave'):
             self.fleet.device_action('ps5-a', 'stop')
+
+    def test_a_start_under_way_is_not_failed_by_the_watcher(self):
+        # A console replica copies its model before it sets a load deadline; the
+        # watcher must not read the missing deadline as a passed one.
+        self.fleet.apply(dict(devices=[ps5()], pools=[pool(running=True, replicas=[dict(devices=['ps5-a'])])]))
+        (replica,) = self.fleet.replicas
+        idle = {'ps5-a': dict(mode='idle', checked=time.time() + 1)}
+        copying = threading.Event()
+        with patch.object(self.fleet, '_start_replica', lambda r, p: copying.wait(5)):
+            self.fleet._launch(replica, self.fleet.pool('qwen'))
+            self.fleet._check(replica, idle)
+            self.assertEqual(replica.state, 'starting')
+            copying.set()
+            replica.thread.join(5)
+        self.fleet._check(replica, idle)
+        self.assertEqual(replica.state, 'starting')
+        replica.deadline = time.time() - 1
+        self.fleet._check(replica, idle)
+        self.assertEqual(replica.state, 'failed')
 
     def test_pools_share_devices_but_run_one_at_a_time(self):
         self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[

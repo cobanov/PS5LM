@@ -785,6 +785,7 @@ class Fleet:
                 return
             replica.cancel = threading.Event()
             replica.placement = replica.check = None
+            replica.deadline = 0.0        # set once the start has handed over to loading
             self._set(replica, 'starting', 'starting')
             replica.thread = threading.Thread(target=self._start, args=(replica, copy.deepcopy(pool)), daemon=True)
             replica.thread.start()
@@ -1110,6 +1111,10 @@ class Fleet:
         """Move a starting replica to ready, and a ready one that lost its process,
         server or a device to failed."""
         with self.lock:
+            # A start under way (copying a model, making workers, checking the
+            # plan) owns the replica until it hands over.
+            if replica.thread is not None:
+                return
             state, process, url, deadline = replica.state, replica.process, replica.url, replica.deadline
         if replica.via in ('rpc', 'direct'):
             if state not in ('starting', 'ready') or process is None:
@@ -1137,7 +1142,7 @@ class Fleet:
             serving = device_status.get('mode') == 'serving' and Path(device_status.get('model') or '').name == replica.expect
             if serving and state != 'ready':
                 self._ready(replica)
-            elif state == 'starting' and time.time() > deadline:
+            elif state == 'starting' and deadline and time.time() > deadline:
                 self._fail(replica, 'PS5LM did not serve the model in 15 minutes; see llama.log in /data/PS5LM')
             elif state == 'ready' and not serving and device_status.get('checked', 0) > replica.since:
                 self._fail(replica, f"{replica.spec['devices'][0]} stopped serving the model "
