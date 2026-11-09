@@ -349,8 +349,12 @@ The control server runs a fleet of any size from one JSON document,
   | `{"devices": ["pc-gpu"]}` | one of this computer's GPUs, directly (`"via": "direct"`), checked with `llama-fit-params` first |
   | `{"url": "http://10.0.0.9:8080"}` | a server run elsewhere (another control server, a plain llama-server), only routed to |
 
-  `"split": [40, 25]` sets a split's block counts by hand. A device is in at most
-  one replica.
+  `"split": [40, 25]` sets a split's block counts by hand. Pools may share
+  devices, so the same consoles can be laid out several ways (two-console splits
+  of a big model, or one console each for a small one). Only one of those runs
+  at a time: within a pool, and among running pools, a device serves one
+  replica. A pool started on another's devices waits until that pool has let go
+  of them.
 - **Settings:**
   - `api_port` (8081) and `api_lan`: the API listens on 127.0.0.1 unless `api_lan` is set.
   - `api_key`: once set, every request needs it as `Authorization: Bearer` or `x-api-key`.
