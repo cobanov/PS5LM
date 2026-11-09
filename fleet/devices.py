@@ -55,6 +55,9 @@ WORKER_FILE = f'{DATA}/fleet-worker.txt'
 ARGS_FILE = f'{DATA}/app-args.txt'
 ACK = 'I_UNDERSTAND_RPC_IS_UNAUTHENTICATED'
 PS5_MODELS = f'{DATA}/models'
+# How long a running PS5LM gets to take a request file. It looks once a second,
+# but an app short of memory under load was measured taking longer than 6 s.
+TAKE_SECONDS = 20
 
 
 # --- discovery ----------------------------------------------------------------------
@@ -291,7 +294,7 @@ def make_worker(address, port=WORKER_PORT):
             delete(ftp, f'{DATA}/{stale}')
         put_text(ftp, WORKER_FILE, worker_file(address, port))
         put_text(ftp, f'{DATA}/unload', '-\n')
-        if request_consumed(ftp, 'unload', 6):
+        if request_consumed(ftp, 'unload', TAKE_SECONDS):
             return True
         delete(ftp, f'{DATA}/unload')     # a worker never reads it; the app would later
         return False
@@ -304,7 +307,7 @@ def leave_worker(address):
     with console_ftp(address) as ftp:
         delete(ftp, f'{DATA}/unload')
         put_text(ftp, f'{DATA}/leave-worker', '-\n')
-        if request_consumed(ftp, 'leave-worker', 8):
+        if request_consumed(ftp, 'leave-worker', TAKE_SECONDS):
             return 'restarted'
         # A build without leave-worker: forget the config and quit instead.
         delete(ftp, f'{DATA}/leave-worker')
@@ -342,12 +345,12 @@ def serve_model(address, args, worker=False):
             # Not open: PS5LM loads app-args.txt when it is next opened.
             delete(ftp, WORKER_FILE)
             put_text(ftp, f'{DATA}/unload', '-\n')
-            if request_consumed(ftp, 'unload', 6):
+            if request_consumed(ftp, 'unload', TAKE_SECONDS):
                 return True
             delete(ftp, f'{DATA}/unload')
             return False
         put_text(ftp, f'{DATA}/leave-worker', '-\n')
-        if request_consumed(ftp, 'leave-worker', 8):
+        if request_consumed(ftp, 'leave-worker', TAKE_SECONDS):
             return True
         delete(ftp, f'{DATA}/leave-worker')
         return False
@@ -358,7 +361,7 @@ def stop_serving(address):
     with console_ftp(address) as ftp:
         delete(ftp, ARGS_FILE)
         put_text(ftp, f'{DATA}/unload', '-\n')
-        if not request_consumed(ftp, 'unload', 6):
+        if not request_consumed(ftp, 'unload', TAKE_SECONDS):
             delete(ftp, f'{DATA}/unload')
 
 
