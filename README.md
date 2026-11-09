@@ -100,7 +100,9 @@ decision metadata loads the same way, and the app labels it a decision model.
 
 ## Try it
 
-You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded:
+You need a PS5 on firmware 7.00 to 13.60 (also reported working on 5.50,
+[#37](https://github.com/cobanov/PS5LM/issues/37); older firmware is untested), jailbroken, with
+these payloads loaded:
 
 | Payload | For | |
 |---|---|---|
