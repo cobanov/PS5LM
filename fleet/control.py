@@ -271,18 +271,27 @@ def validate_config(raw):
     pool_ids = [p['id'] for p in config['pools']]
     if len(set(pool_ids)) != len(pool_ids):
         raise ControlError('Pool names must be unique')
-    names, users = {}, {}
+    # Pools may share devices, so the same consoles can be laid out several ways
+    # and switched between. Within a pool, and among running pools, a device
+    # serves one replica.
+    names, running = {}, {}
     for pool in config['pools']:
         for name in {pool['id'].lower(), *(a.lower() for a in pool['aliases'])}:
             if names.get(name, pool['id']) != pool['id']:
                 raise ControlError(f"{name} names two pools ({names[name]} and {pool['id']})")
             names[name] = pool['id']
+        users = {}
         for index, replica in enumerate(pool['replicas']):
             for device in replica.get('devices', []):
                 if device in users:
-                    raise ControlError(f"{device} is in two replicas ({users[device]} and {pool['id']}/{index}); "
+                    raise ControlError(f"{device} is in two replicas of {pool['id']} ({users[device]} and {index}); "
                                        'a device serves one replica')
-                users[device] = f"{pool['id']}/{index}"
+                users[device] = index
+                if pool['running']:
+                    if device in running:
+                        raise ControlError(f"{device} is in running pools {running[device]} and {pool['id']}; "
+                                           f"stop {running[device]} first")
+                    running[device] = pool['id']
     return config
 
 
@@ -1073,15 +1082,22 @@ class Fleet:
         checks = [executor.submit(self._check, r, status) for r in replicas]
         concurrent.futures.wait(checks, timeout=20)
         now = time.time()
+        # Stop first, then start: a pool that takes over another's devices waits
+        # until that pool's replicas have let go of them.
+        for replica in replicas:
+            with self.lock:
+                idle, state = replica.thread is None, replica.state
+            if not pools[replica.pool_id]['running'] and (state not in ('stopped', 'stopping') or not idle):
+                self._stop_soon(replica, 'pool stopped')
         for replica in replicas:
             pool = pools[replica.pool_id]
             with self.lock:
                 idle, state = replica.thread is None, replica.state
-            if pool['running']:
-                if idle and state in ('stopped', 'failed') and now >= replica.retry_at:
-                    self._launch(replica, pool)
-            elif state not in ('stopped', 'stopping') or not idle:
-                self._stop_soon(replica, 'pool stopped')
+                held = {d for r in self.replicas if r is not replica and (r.state != 'stopped' or r.thread is not None)
+                        and r.state != 'failed' for d in r.spec.get('devices', [])}
+            if (pool['running'] and idle and state in ('stopped', 'failed') and now >= replica.retry_at
+                    and not held & set(replica.spec.get('devices', []))):
+                self._launch(replica, pool)
         with self.lock:
             active = {d for r in self.replicas if r.via == 'rpc' and (r.state in ('starting', 'ready')
                                                                        or r.thread is not None)
@@ -1237,7 +1253,12 @@ class Fleet:
     def snapshot(self):
         with self.lock:
             config = masked(self.config)
-            used = {d: r.key for r in self.replicas for d in r.spec.get('devices', [])}
+            # A device's replica: the one of a running pool, else the first that lists it.
+            running = {p['id'] for p in self.config['pools'] if p['running']}
+            used = {}
+            for replica in sorted(self.replicas, key=lambda r: r.pool_id not in running):
+                for device_id in replica.spec.get('devices', []):
+                    used.setdefault(device_id, replica.key)
             device_views = []
             for device in config['devices']:
                 status = dict(self.status.get(device['id'], {'mode': 'checking'}))

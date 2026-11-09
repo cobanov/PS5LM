@@ -72,7 +72,8 @@ class ConfigTests(unittest.TestCase):
             fleet(pool(replicas=[dict(devices=['missing'])])),
             fleet(pool(replicas=[dict(devices=['ps5-a', 'ps5-a'])])),
             fleet(pool(replicas=[dict(devices=['ps5-a']), dict(devices=['ps5-a', 'pc-gpu'])])),   # one replica each
-            fleet(pool(replicas=[dict(devices=['ps5-a'])]), pool('other', replicas=[dict(devices=['ps5-a'])])),
+            fleet(pool(running=True, replicas=[dict(devices=['ps5-a'])]),          # two running pools, one device
+                  pool('other', running=True, replicas=[dict(devices=['ps5-a', 'pc-gpu'])])),
             fleet(pool(aliases=['shared']), pool('other', aliases=['SHARED'])),
             fleet(pool(), pool()),
             fleet(pool(replicas=[dict(url='ftp://10.0.0.9')])),
@@ -307,6 +308,27 @@ class FleetTests(unittest.TestCase):
             self.fleet.remove_device('ps5-a')
         with self.assertRaisesRegex(control.ControlError, 'takes worker, leave'):
             self.fleet.device_action('ps5-a', 'stop')
+
+    def test_pools_share_devices_but_run_one_at_a_time(self):
+        self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[
+            pool('big', replicas=[dict(devices=['ps5-a', 'pc-gpu'])]),
+            pool('small', model='/m/small.gguf', replicas=[dict(devices=['ps5-a']), dict(devices=['pc-gpu'])])]))
+        self.fleet.update_pool('big', dict(running=True))
+        with self.assertRaisesRegex(control.ControlError, 'stop big first'):
+            self.fleet.update_pool('small', dict(running=True))
+        # Taking over: big still holds its devices while it stops, so small waits for them.
+        big, small_a, small_b = self.fleet.replicas
+        big.state = 'stopping'
+        self.fleet.update_pool('big', dict(running=False))
+        self.fleet.update_pool('small', dict(running=True))
+        launched = []
+        with patch.object(self.fleet, '_launch', lambda replica, pool: launched.append(replica.key)), \
+                patch.object(self.fleet, '_stop_soon', lambda replica, reason: None):
+            self.fleet._reconcile(control.concurrent.futures.ThreadPoolExecutor(2))
+            self.assertEqual(launched, [])
+            big.state = 'stopped'
+            self.fleet._reconcile(control.concurrent.futures.ThreadPoolExecutor(2))
+        self.assertEqual(launched, ['small/0', 'small/1'])
 
     def test_routing(self):
         self.fleet.apply(dict(devices=[], pools=[
