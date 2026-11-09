@@ -310,6 +310,31 @@ class FleetTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, 'takes worker, leave'):
             self.fleet.device_action('ps5-a', 'stop')
 
+    def test_a_console_already_serving_the_model_is_taken_over(self):
+        model = self.dir / 'm.gguf'
+        model.write_bytes(b'gguf')
+        self.fleet.apply(dict(devices=[ps5()], pools=[pool(model=str(model), running=True,
+                                                           replicas=[dict(devices=['ps5-a'])])]))
+        (replica,) = self.fleet.replicas
+        settings = self.fleet.pool('qwen')
+        args = devices.replica_args('/data/PS5LM/models/m.gguf', settings['context'], settings['slots'],
+                                    settings['cache_type'], settings['flash_attn'], settings['shared_context'])
+        serving = dict(mode='serving', model='/data/PS5LM/models/m.gguf')
+        with patch.object(devices, 'ps5_mode', return_value=serving), \
+                patch.object(devices, 'read_text', return_value='\n'.join(args) + '\n'), \
+                patch.object(devices, 'serve_model') as serve, patch.object(devices, 'push_file') as push:
+            self.fleet._start_replica(replica, settings)
+        self.assertEqual((replica.state, replica.url), ('starting', 'http://192.168.50.21:8081'))
+        serve.assert_not_called()
+        push.assert_not_called()
+        # Other settings on the console: load the pool's.
+        with patch.object(devices, 'ps5_mode', return_value=serving), \
+                patch.object(devices, 'read_text', return_value='-m\n/data/PS5LM/models/m.gguf\n-c\n4096\n'), \
+                patch.object(devices, 'console_has', return_value=True), \
+                patch.object(devices, 'serve_model', return_value=True) as serve:
+            self.fleet._start_replica(replica, settings)
+        serve.assert_called_once_with('192.168.50.21', args, worker=False)
+
     def test_a_start_under_way_is_not_failed_by_the_watcher(self):
         # A console replica copies its model before it sets a load deadline; the
         # watcher must not read the missing deadline as a passed one.

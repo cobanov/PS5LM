@@ -234,6 +234,17 @@ def put_text(ftp, path, text):
     ftp.storbinary(f'STOR {path}', io.BytesIO(text.encode('utf-8')))
 
 
+def read_text(address, path, limit=1 << 20):
+    """A small text file from the console, or '' when it is not there."""
+    buffer = io.BytesIO()
+    with console_ftp(address) as ftp:
+        try:
+            ftp.retrbinary(f'RETR {path}', lambda chunk: buffer.write(chunk) if buffer.tell() < limit else None)
+        except ftplib.error_perm:
+            return ''
+    return buffer.getvalue()[:limit].decode('utf-8', 'replace')
+
+
 def delete(ftp, path):
     """DELE that accepts any 2xx reply (ftpsrv answers 226, which ftplib.delete refuses)."""
     with contextlib.suppress(ftplib.error_perm):

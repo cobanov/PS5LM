@@ -944,10 +944,22 @@ class Fleet:
 
     def _start_app(self, replica, pool, device, path):
         name, address = device['id'], device['address']
-        if devices.ps5_mode(address, device['port'])['mode'] == 'offline':
+        mode = devices.ps5_mode(address, device['port'])
+        if mode['mode'] == 'offline':
             raise ControlError(f'{name} does not answer: off, in rest mode, or not jailbroken since it started')
         size = path.stat().st_size
         remote = f'{devices.PS5_MODELS}/{path.name}'
+        args = devices.replica_args(remote, pool['context'], pool['slots'], pool['cache_type'], pool['flash_attn'],
+                                    pool['shared_context'])
+        # Already serving this model with these settings (the control server
+        # restarted, say): take it over as it is instead of reloading it.
+        if (mode['mode'] == 'serving' and Path(mode.get('model') or '').name == path.name
+                and devices.read_text(address, devices.ARGS_FILE).splitlines() == args):
+            with self.lock:
+                replica.url, replica.expect = f'http://{address}:{devices.APP_PORT}', path.name
+                replica.deadline = time.time() + LOAD_TIMEOUT['app']
+            self._set(replica, 'starting', f'{name} already serves the model')
+            return
         replica.detail = f'looking for the model on {name}'
         if not devices.console_has(address, remote, size):
             def progress(sent, total):
@@ -956,8 +968,6 @@ class Fleet:
                 replica.detail = f'copying the model to {name}: {sent * 100 // total}% of {total / 2**30:.1f} GiB'
             devices.push_file(address, path, remote, progress)
         self._checkpoint(replica)
-        args = devices.replica_args(remote, pool['context'], pool['slots'], pool['cache_type'], pool['flash_attn'],
-                                    pool['shared_context'])
         with self.lock:
             replica.url, replica.expect = f'http://{address}:{devices.APP_PORT}', path.name
             replica.deadline = time.time() + LOAD_TIMEOUT['app']
