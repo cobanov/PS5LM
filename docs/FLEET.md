@@ -13,6 +13,16 @@ worker over the network, so it is not faster than one console; it makes larger
 models possible. Workers are PS5s; a PC can join too, with its CPU or, with a
 GPU host build (`PS5LM_FLEET_GPU`), its GPU.
 
+Any single-file model the pinned llama.cpp loads as one stack of decoder blocks
+can be split: Llama, Qwen 2.5, Qwen 3.5/3.6/3.8 (hybrid Gated DeltaNet, dense and
+MoE), Gemma 3/4, gpt-oss and the other attention, sliding-window and Mamba-style
+hybrid models ([Which models](#which-models)). The control server
+(`python3 -m fleet control`, and `python3 -m fleet ctl` for shells and agents)
+runs many devices as pools of replicas behind one OpenAI- and Anthropic-style
+API. A replica is a layer split, one console serving a model by itself, or a
+GPU. The server moves consoles in and out of worker mode over the network and
+restarts what fails ([Control server](#control-server)).
+
 ## Quick start
 
 1. **On each PS5:** PS5LM v0.11.0 or later (for v0.10.0, its
@@ -25,8 +35,10 @@ GPU host build (`PS5LM_FLEET_GPU`), its GPU.
    --depth 1 third_party/llama.cpp`, then `scripts/build-fleet-host.sh`
    ([Host](#host-cpu--rpc)). To add the PC's GPU as a worker, build with
    `PS5LM_FLEET_GPU=metal` (or `cuda`, `vulkan`) and start
-   `build/fleet-host/bin/ggml-rpc-server -H <PC IP> -p 30053 -d MTL0`
-   (`CUDA0`, `Vulkan0`), then list it as one more node.
+   `GGML_RPC_NO_COMM=1 build/fleet-host/bin/ggml-rpc-server -H <PC IP> -p 30053 -d MTL0`
+   (`CUDA0`, `Vulkan0`), then list it as one more node. `GGML_RPC_NO_COMM=1`
+   makes the server refuse the peer-to-peer requests a layer split never uses
+   (`patches/fleet/0002`); the control server sets it for the workers it starts.
 3. **Nodes:** copy `fleet/nodes.example.json` and list each console's
    `IP:port` with its memory budget.
 4. **Plan, then serve:** `python3 -m fleet plan --model model.gguf --nodes
@@ -37,10 +49,12 @@ GPU host build (`PS5LM_FLEET_GPU`), its GPU.
    `/data/PS5LM/leave-worker` file on it: a worker takes it within a second and
    restarts as the app (PS5LM after v0.11.0).
 
-Dense `llama` and `qwen2` GGUFs only; Qwen 3.5/3.8 (`qwen35`) is refused. RPC
-has no authentication: keep workers on a network you trust. On macOS, the app
-that runs the controller (Terminal, iTerm, a multiplexer) needs Local Network
-permission, or connections to the consoles fail with "No route to host".
+Or, instead of steps 1 and 3 to 5: `python3 -m fleet control` and the page at
+http://127.0.0.1:8090 ([Control server](#control-server)).
+
+RPC has no authentication: keep workers on a network you trust. On macOS, the
+app that runs the controller (Terminal, iTerm, a multiplexer) needs Local
+Network permission, or connections to the consoles fail with "No route to host".
 
 ## Architecture
 
@@ -70,30 +84,56 @@ logical slots (the extra slot is output), avoiding floating-point boundary drift
 Host accelerators are not silently added. The planner minimises the maximum
 estimated memory utilisation for the **given node order**, not latency or tokens/s.
 
-### Deliberately narrow model admission
+### Which models
 
-- 2–15 selected workers, exactly one device per endpoint, at least one repeating
-  layer per worker. The pinned CLI rejects 16 tensor-split entries.
-- Complete, single-file, little-endian GGUF v3, **dense `llama` or `qwen2`**
-  layouts, at most 512 layers, known tensor encodings and validated shapes.
-- One sequence, FP16 K/V cache, fixed context no greater than training context.
-  KV is rounded up to 256 tokens conservatively. Flash attention, automatic fit,
-  lazy loading and opportunistic host-operation offload are disabled.
-- Unknown architectures, hybrid/recurrent state, MoE, split GGUF, missing tensors,
-  unsupported quantizations and replicated RoPE weight tensors fail closed.
-- Budgets include exact inspected weight spans, tied-output duplication, estimated
-  per-layer KV and operator-selected reserves. Reserves must cover allocations,
-  dequantization, activation/compute buffers and backend overhead. A successful
-  plan **is not an allocation guarantee or reservation**. Live memory can change.
+- 2–15 selected workers, exactly one device per endpoint, at least one block per
+  worker. The pinned CLI rejects 16 tensor-split entries.
+- Complete, single-file, little-endian GGUF v3, at most 512 blocks, in any of the
+  35 tensor types the pinned ggml defines (IQ, TQ, MXFP4 and Q2_0 included).
+- One sequence, FP16 K/V cache, flash attention off, fixed context no greater than
+  training context. Automatic fit, lazy loading and opportunistic host-operation
+  offload are disabled.
 
-**Why not the README's Qwen 3.8 27B yet?** `docs/MODELS.md` identifies that model's
-architecture as `qwen35`. PS5LM's normal single-console planner has broader
-architecture support than this first fleet estimator. The fleet does not yet
-model Qwen35's hybrid/recurrent state and placement, so it rejects that model
-rather than extrapolating a dense-transformer KV formula. Next step is a
-Qwen35-specific inspector/placement test against the pinned loader, followed by
-small real RPC inference and two-console validation. This is not a claim that
-upstream RPC itself cannot run it.
+The estimator follows where the pinned llama.cpp puts each tensor and what cache
+it keeps for each block, for any architecture:
+
+- **Weights:** exact file spans per block. `token_embd` (and Gemma's per-layer
+  embeddings) stay on the controller. RoPE factor tensors (Llama 3.1+) get one
+  copy on every worker. Gemma's `per_layer_model_proj` lives with the first
+  worker. The output head, final norm and a tied output copy of `token_embd` live
+  with the last worker.
+- **NextN (MTP) blocks** (Qwen 3.8 27B's block 64): they take a tensor-split slot,
+  but llama-server loads neither their weights (`load_mtp` is off) nor a cache.
+- **Attention cache:** per-block K, and V rows as wide as the model's widest V,
+  since without flash attention llama.cpp pads them (`n_embd_v_gqa_max()`).
+  Sliding-window blocks keep `min(context, window + 128)` tokens padded to 256, from
+  the file's per-block list or llama.cpp's own pattern for the architecture
+  (gpt-oss, Gemma 2/3, Cohere 2, ...). Gemma's shared-KV blocks keep none.
+- **Recurrent state:** Qwen 3.5/3.6/3.8 keep attention every fourth block and a
+  Gated DeltaNet state in the others. Mamba keeps a state in every block.
+  Granite 4, Nemotron-H, Jamba and LFM2 keep one where `head_count_kv` is 0. The
+  state is `n_embd_r + n_embd_s` floats per block.
+- **Refused:** RWKV, KDA, linear and latent (MLA) attention caches, parallel
+  attention+SSM (Falcon-H1), encoder-decoder and audio-codec layouts, tensors
+  llama.cpp would not place, and split GGUF files.
+
+Checked against llama.cpp itself: `llama-fit-params --fit-print on` loads a model
+without allocating and prints each device's weights, cache and compute buffers.
+For the planner's own two-worker split, over two local RPC workers, it matched the
+estimate within 1 MiB, weights and cache on every device, at 4k and 32k tokens,
+for Llama 3.1 8B, Qwen 2.5 0.5B, Qwen 3.5 0.8B and 9B, Qwen 3.6 35B-A3B,
+Qwen 3.8 27B (UD-Q2_K_XL and UD-Q4_K_XL), Gemma 4 E4B and gpt-oss 20B (2026-11-09).
+Qwen 3.5 0.8B and Gemma 3 270M, split over two CPU RPC workers by
+`python3 -m fleet serve`, gave the same greedy tokens as the whole model on one RPC
+worker.
+
+The compute buffers are not in the estimate; the reserve covers them. They grow
+with context without flash attention (0.5 to 1.8 GiB per worker at 32k for the
+models above). So before llama-server starts, `serve` and the control server run
+`llama-fit-params --fit-print on` with the plan's exact split against the live
+workers. It refuses to start when llama.cpp projects any worker within 256 MiB of
+its budget (`llama_check` in the printed plan). A successful plan is still **not
+an allocation guarantee or reservation**; live memory can change.
 
 ## Security boundary — read before enabling workers
 
@@ -139,8 +179,8 @@ scripts/build-fleet-host.sh
 ```
 
 The host script applies the repository's numbered llama.cpp patches and
-`patches/fleet`, disables RDMA, and builds the RPC tools plus the upstream
-multi-server regression. It is CPU only unless `PS5LM_FLEET_GPU` is `metal`,
+`patches/fleet`, disables RDMA, and builds the RPC tools, `llama-fit-params` (the
+memory check before every start) and the upstream multi-server regression. It is CPU only unless `PS5LM_FLEET_GPU` is `metal`,
 `cuda` or `vulkan`; then `ggml-rpc-server -d MTL0` (`CUDA0`, `Vulkan0`) serves
 that GPU as a worker. The controller always names its RPC devices explicitly,
 so a GPU in the host build is used only through a worker you start and list. It does not fetch model weights or start a listener. Set `CMAKE`,
@@ -275,6 +315,134 @@ unsupported operations, worker disconnect or OOM is not converted into a
 successful fleet deployment. A snapshot/printed plan does not mean inference
 has started. Input and unsupported-operation work can still occur on the host;
 backend behaviour and memory must be checked on real consoles.
+
+## Control server
+
+```sh
+python3 -m fleet control            # page and JSON API on http://127.0.0.1:8090
+python3 -m fleet control --build ~/PS5LM/build/fleet-host --port 8090 --config fleet/control.json
+python3 -m fleet ctl status         # the same, as JSON, from a shell or an agent
+```
+
+The control server runs a fleet of any size from one JSON document,
+`fleet/control.json` (ignored by git). It holds three things:
+
+- **Devices** hold layers:
+  - `ps5`: a console with PS5LM and ftpsrv.
+  - `gpu`: one of this computer's GPUs.
+  - `rpc`: a `ggml-rpc-server` elsewhere.
+
+  Each device has a memory budget (or `null` for the free memory it reports), a
+  reserve, and tags for picking groups.
+- **Pools** are one model and how to serve it:
+  - `context`: tokens per request.
+  - `slots`: requests at once per replica. With `shared_context` the slots share
+    one cache of `context` tokens (llama-server's `--kv-unified`).
+  - `cache_type` and `flash_attn`: the cache (default `q8_0` with flash attention).
+
+  A pool's replicas each serve the whole model:
+
+  | Replica | Runs as |
+  |---|---|
+  | `{"devices": ["ps5-a", "pc-gpu"]}` | a layer split over RPC, 1 to 15 devices in layer order (`"via": "rpc"`), planned and checked like `serve` |
+  | `{"devices": ["ps5-b"]}` | one console serving the model with PS5LM itself (`"via": "app"`): the model is copied to `/data/PS5LM/models` over FTP once, and `app-args.txt` sets the pool's context, slots and cache |
+  | `{"devices": ["pc-gpu"]}` | one of this computer's GPUs, directly (`"via": "direct"`), checked with `llama-fit-params` first |
+  | `{"url": "http://10.0.0.9:8080"}` | a server run elsewhere (another control server, a plain llama-server), only routed to |
+
+  `"split": [40, 25]` sets a split's block counts by hand. A device is in at most
+  one replica.
+- **Settings:**
+  - `api_port` (8081) and `api_lan`: the API listens on 127.0.0.1 unless `api_lan` is set.
+  - `api_key`: once set, every request needs it as `Authorization: Bearer` or `x-api-key`.
+  - The controller's own memory, and `lan`, the network to search.
+
+Raising throughput means more replicas. Fitting a bigger model or a longer
+context means more devices per replica. Both work at once: 100 consoles can be
+50 two-console replicas of one model. `"auto": {"count": 50, "per": 2,
+"kinds": ["ps5"], "tags": ["rack1"]}` in a new pool (or `pool add --auto 50
+--per 2`) picks free devices in the order they are listed.
+
+**The API** (fleet/router.py) is one endpoint for every pool, on `api_port`:
+- It takes `/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+  `/v1/embeddings`, `/completion` and the rest of llama-server's API.
+- The request's `model` picks the pool: its id, an alias, or its model file's
+  name. A name no pool has goes to the only ready pool, when exactly one is.
+- Within a pool, the replica with the fewest requests in flight for its slots
+  gets the request.
+- A replica that refuses the connection is skipped, and the request goes to another.
+- Responses stream through (`"stream": true`).
+- `/v1/models` lists the pools; `/health` says whether any can take a request.
+- Other GETs, `/` (llama-server's chat page) included, go to the first ready pool.
+
+**Running pools are kept running.** Starting a pool (`"running": true`) starts
+its replicas:
+- A split makes its consoles workers when they are not (over FTP, as below) and
+  starts the GPU's RPC worker. It probes their free memory, plans, checks with
+  llama.cpp, and starts llama-server on a local port.
+- The control server watches every device and replica. A replica that fails,
+  loses a device (a console that stops answering or leaves worker mode) or stops
+  answering is marked failed. It starts again after 15 s, then 30 s, and so on
+  up to 10 minutes.
+- Changing what a replica serves (the model, context, cache, its devices)
+  restarts only that replica. Aliases or other pools leave it alone.
+
+**Consoles over the network.** All of this goes through ftpsrv (2121) and
+PS5LM's request files, so no one has to be at the console:
+- **Search** sends the PlayStation discovery query (UDP 9302) to every address of
+  the LAN, one by one, so it also works from WSL's NAT. Under WSL it asks Windows
+  which network that is.
+- **worker** writes `/data/PS5LM/fleet-worker.txt` (its own address, port 30052
+  and the acknowledgement) and sends `unload`: a running PS5LM restarts as a
+  worker. When PS5LM is closed, the request is not taken within 6 s and is
+  removed. The console then becomes a worker when PS5LM is next opened.
+- **leave** sends `leave-worker`. PS5LM restarts as the app
+  ([Configure workers](#configure-workers-only-after-building-and-validating-the-title)).
+  An older PS5LM can only quit; the worker file is then removed, and it opens as
+  the app from the home screen.
+- **quit** closes PS5LM, and **unload** stops a model it serves.
+- A device's mode comes from the network:
+  - `worker`: its RPC port answers.
+  - `serving` (with the model file), or `loading`: PS5LM's server answers.
+  - `idle`: ftpsrv answers, but neither of those does.
+  - `offline`: nothing answers.
+
+  At most three short connection attempts, every 4 s, 32 at a time.
+- A device of a running pool belongs to it: stop the pool before acting on it.
+
+From a shell or an agent, `python3 -m fleet ctl` does all of it and answers in
+JSON. It exits 1 with the refusal in `"error"`:
+
+```sh
+ctl() { python3 -m fleet ctl "$@"; }          # --url or $PS5LM_FLEET_URL for another server
+ctl search --wait                             # consoles on the LAN
+ctl device add ps5-a --kind ps5 --address 192.168.50.21
+ctl device add pc-gpu --kind gpu --device CUDA0
+ctl pool add qwen27 --model ~/models/Qwen3.8-27B-UD-Q4_K_XL.gguf --context 131072 \
+    --cache-type q4_0 --replica ps5-a,pc-gpu
+ctl pool plan qwen27 --wait                   # blocks and memory per device, with llama.cpp's check
+ctl pool start qwen27 --wait 900              # exits 0 when every replica is ready
+ctl pool set qwen27 context=81920 cache_type=q8_0
+ctl device leave ps5-a --wait               # after `ctl pool stop qwen27`
+ctl config > fleet.json; ctl apply fleet.json # the whole configuration; keys stay "set"
+```
+
+On 2026-11-09 this ran Qwen3.8-27B-UD-Q4_K_XL (16.6 GB) as one replica split
+over one PS5 (firmware 11.60) and an RTX 3080 (10 GB) under WSL.
+- **128k context:** fits with a q4_0 cache. llama.cpp projected 10,547 of 11,854
+  MiB on the console (blocks 0–39) and 8,497 of 9,069 MiB on the 3080 (blocks
+  40–64 and the output). The planner was within 1 MiB of it on the cache.
+- **q8_0 cache:** 80k fits; 96k does not.
+- **Start:** 2 minutes 21 seconds, with both devices already workers.
+- **Through the API:** 14.4 tokens/s generating, and the first streamed token
+  after 1.35 s.
+
+The page listens on loopback only. It can write to consoles and start processes,
+so it answers only requests whose Host header is its own (no DNS rebinding) and
+changes that carry its own request header (no other site can drive it from your
+browser). Under WSL, Windows reaches it at http://localhost:8090. Behind a proxy
+that only your own devices reach, such as `tailscale serve`, add
+`--allow-host NAME:PORT`. The workers' RPC is unauthenticated whatever the page
+does: keep them on a network you trust.
 
 ## Tests / CI
 
