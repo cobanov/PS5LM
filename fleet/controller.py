@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 from .models import ModelError, fetch_model, inspect_file
-from .planner import FleetError, MIB, inventory, plan
+from .planner import CACHE_TYPES, FleetError, MIB, UBATCH, inventory, plan
 
 LLAMA_REVISION = '970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc'
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,18 +33,40 @@ def child_environment():
     return env
 
 
-def command(binary, model_path, placement, port=8081):
+def cache_args(placement):
+    """The context, slots, cache type and flash attention the plan was priced for."""
+    cache = placement.get('cache_dtype', 'f16')
+    return ['--ctx-size', str(placement['context_tokens']),
+            '--parallel', str(placement.get('parallel_sequences', 1)),
+            *(['--kv-unified'] if placement.get('kv_unified') else []),
+            '--cache-type-k', cache, '--cache-type-v', cache,
+            '--flash-attn', 'on' if placement.get('flash_attn') else 'off']
+
+
+def command(binary, model_path, placement, port=8081, host='127.0.0.1', api_key=None):
+    """llama-server arguments for a placement.
+
+    The API listens on loopback unless host is '0.0.0.0', which the control
+    server sets only when asked to share the API on the network; api_key then
+    makes llama-server require that key on every request.
+    """
+    if host not in ('127.0.0.1', '0.0.0.0'):
+        raise FleetError('The API listens on 127.0.0.1, or on 0.0.0.0 when shared on purpose')
     nodes = placement['nodes']
     return [str(Path(binary).resolve()), '--model', str(Path(model_path).resolve()),
             '--rpc', ','.join(n['endpoint'] for n in nodes),
             '--device', ','.join(n['device'] for n in nodes),
             '--gpu-layers', 'all', '--split-mode', 'layer',
             '--tensor-split', ','.join(str(v) for v in placement['tensor_split']),
-            '--fit', 'off', '--ctx-size', str(placement['context_tokens']), '--parallel', '1',
-            '--cache-type-k', 'f16', '--cache-type-v', 'f16', '--flash-attn', 'off',
+            '--fit', 'off', *cache_args(placement),
             '--load-mode', 'mmap', '--lazy-mode', 'off', '--no-op-offload',
-            '--batch-size', '128', '--ubatch-size', '128', '--no-warmup',
-            '--host', '127.0.0.1', '--port', str(port)]
+            '--batch-size', str(UBATCH), '--ubatch-size', str(UBATCH), '--no-warmup',
+            # Saving a prompt cache or a checkpoint reads the KV cache or
+            # recurrent state back from every worker over the network; keep one
+            # checkpoint (what hybrid models need to reuse a prompt) and no RAM
+            # prompt cache, as the console app does.
+            '--ctx-checkpoints', '1', '--cache-ram', '0',
+            '--host', host, '--port', str(port)] + (['--api-key', api_key] if api_key else [])
 
 
 def probe(binary, config, timeout=20):
@@ -74,6 +96,107 @@ def probe(binary, config, timeout=20):
             raise FleetError(f'{node["id"]}: worker did not report valid free memory')
         node['memory_mib'] = min(node['memory_mib'], free)
     return config
+
+
+# Headroom llama.cpp's projection must leave on every worker, for driver
+# allocation granularity and what it does not count.
+CHECK_MARGIN_MIB = 256
+
+
+def llama_check(binary, model_path, placement, timeout=300):
+    """llama.cpp's own projection of every worker's memory for this placement.
+
+    llama-fit-params (built next to llama-server) loads the model without
+    allocating, against the live workers and with the same split and cache
+    settings, and prints each device's weights, cache and compute buffers. It
+    counts what the estimator leaves to the reserve (compute buffers) and checks
+    the estimator's layout. Returns {worker id: MiB figures}; raises FleetError
+    when a worker would not keep CHECK_MARGIN_MIB free.
+    """
+    fit = Path(binary).resolve().parent / 'llama-fit-params'
+    if not fit.is_file():
+        raise FleetError(f'No {fit}; rebuild the host with scripts/build-fleet-host.sh')
+    nodes = placement['nodes']
+    args = [str(fit), '--model', str(Path(model_path).resolve()),
+            '--rpc', ','.join(n['endpoint'] for n in nodes),
+            '--device', ','.join(n['device'] for n in nodes),
+            '--gpu-layers', 'all', '--split-mode', 'layer',
+            '--tensor-split', ','.join(str(v) for v in placement['tensor_split']), *cache_args(placement),
+            '--batch-size', str(UBATCH), '--ubatch-size', str(UBATCH), '--fit-print', 'on']
+    rows = fit_rows(args, timeout)
+    report, over = {}, []
+    for node in nodes:
+        if node['device'] not in rows:
+            raise FleetError(f"llama-fit-params reported no figures for {node['device']}")
+        weights, cache, compute = rows[node['device']]
+        total = weights + cache + compute
+        report[node['id']] = dict(weights_mib=weights, cache_mib=cache, compute_mib=compute, total_mib=total,
+                                  budget_mib=node['memory_mib'])
+        if total + CHECK_MARGIN_MIB > node['memory_mib']:
+            over.append(f"{node['id']} needs {total} MiB (weights {weights}, cache {cache}, compute {compute}) "
+                        f"of {node['memory_mib']} MiB")
+    if over:
+        raise FleetError('llama.cpp projects more memory than the workers have: ' + '; '.join(over))
+    return report
+
+
+def fit_rows(args, timeout):
+    """Run llama-fit-params and read its table: {device: [model, context, compute] MiB}."""
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=child_environment())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FleetError(f'llama-fit-params did not finish ({type(exc).__name__})') from exc
+    if result.returncode:
+        raise FleetError(f'llama-fit-params exited {result.returncode}:\n' + (result.stderr or result.stdout)[-1500:])
+    rows = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and re.fullmatch(r'[A-Za-z]{2,16}[0-9]{0,3}', parts[0]) and all(p.isdigit() for p in parts[1:]):
+            rows[parts[0]] = [int(p) for p in parts[1:]]
+    return rows
+
+
+# A model on one of this computer's GPUs, with no RPC: llama.cpp's own batch
+# sizes, which a local GPU handles (the fleet's small ubatch is for consoles).
+DIRECT_BATCH, DIRECT_UBATCH = 2048, 512
+
+
+def direct_args(model_path, device, context, slots=1, unified=False, cache_type='f16', flash_attn=False):
+    placement = dict(context_tokens=context, parallel_sequences=slots, kv_unified=unified,
+                     cache_dtype=cache_type, flash_attn=flash_attn)
+    return ['--model', str(Path(model_path).resolve()), '--device', device, '--gpu-layers', 'all',
+            *cache_args(placement), '--batch-size', str(DIRECT_BATCH), '--ubatch-size', str(DIRECT_UBATCH)]
+
+
+def direct_command(binary, model_path, device, context, port, slots=1, unified=False, cache_type='f16',
+                   flash_attn=False):
+    """llama-server on one local GPU, on loopback (the control server's router is the way in)."""
+    # llama-server's prompt cache in RAM, 8 GiB by default, shares the
+    # controller with the splits' host processes: a smaller one.
+    return [str(Path(binary).resolve()), *direct_args(model_path, device, context, slots, unified, cache_type, flash_attn),
+            '--fit', 'off', '--cache-ram', '2048', '--host', '127.0.0.1', '--port', str(port)]
+
+
+def direct_check(binary, model_path, device, free_mib, context, slots=1, unified=False, cache_type='f16',
+                 flash_attn=False, timeout=300):
+    """llama.cpp's projection for a model on one local GPU; raises when it would
+    not leave CHECK_MARGIN_MIB of the free memory."""
+    if CACHE_TYPES.get(cache_type, (1,))[0] > 1 and not flash_attn:
+        raise FleetError('A quantized cache needs flash attention: llama.cpp quantizes V only with it')
+    fit = Path(binary).resolve().parent / 'llama-fit-params'
+    if not fit.is_file():
+        raise FleetError(f'No {fit}; rebuild the host with scripts/build-fleet-host.sh')
+    rows = fit_rows([str(fit), *direct_args(model_path, device, context, slots, unified, cache_type, flash_attn),
+                     '--fit-print', 'on'], timeout)
+    if device not in rows:
+        raise FleetError(f'llama-fit-params reported no figures for {device}')
+    weights, cache, compute = rows[device]
+    total = weights + cache + compute
+    report = dict(weights_mib=weights, cache_mib=cache, compute_mib=compute, total_mib=total, budget_mib=free_mib)
+    if total + CHECK_MARGIN_MIB > free_mib:
+        raise FleetError(f'{device} needs {total} MiB (weights {weights}, cache {cache}, compute {compute}) '
+                         f'with {free_mib} MiB free')
+    return report
 
 
 def checksum(path):
@@ -141,6 +264,10 @@ def main(argv=None):
     parser.add_argument('--model', required=True, help='single-file local GGUF or public HTTPS URL')
     parser.add_argument('--nodes', required=True, help='inventory JSON; see fleet/nodes.example.json')
     parser.add_argument('--context', type=int, default=4096, help='total context for one sequence, default 4096')
+    parser.add_argument('--cache-type', default='f16', choices=sorted(CACHE_TYPES),
+                        help='KV cache type (llama-server -ctk/-ctv); quantized types need --flash-attn on')
+    parser.add_argument('--flash-attn', default='off', choices=('on', 'off'),
+                        help='flash attention; on keeps each layer\'s V at its own width and the compute buffers small')
     parser.add_argument('--binary', default=str(DEFAULT_BINARY))
     parser.add_argument('--cache-dir', default=str(ROOT / 'models/fleet-cache'))
     parser.add_argument('--sha256', help='optional expected full-file SHA256')
@@ -178,10 +305,12 @@ def main(argv=None):
         model = inspect_file(path)
         if args.action == 'serve':
             config = probe(args.binary, config)
-        placement = plan(model, config, args.context)
+        placement = plan(model, config, args.context, cache_type=args.cache_type, flash_attn=args.flash_attn == 'on')
         placement.update(model_path=str(Path(path).resolve()), model_sha256=digest,
                          llama_revision=LLAMA_REVISION,
                          memory_source='min(operator_budget,live_RPC_snapshot)' if args.action == 'serve' else 'operator_budgets_only')
+        if args.action == 'serve':
+            placement['llama_check'] = llama_check(args.binary, path, placement)
         placement['argv'] = command(args.binary, path, placement, args.port)
         encoded = json.dumps(placement, indent=2) + '\n'
         if args.plan_out:

@@ -75,9 +75,41 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(planner.FleetError, 'Host'):
             planner.plan(model(), conf)
 
+    def test_window_state_and_per_worker_memory(self):
+        info = dict(model(), swa_kv_bytes_per_layer_per_token=[32]*6, sliding_window=100,
+                    state_bytes_per_layer=[1000]*6, per_worker_bytes=4096)
+        result = planner.plan(info, inventory(), 300)
+        # 512-token cache; window layers keep min(512, 100 + 128) padded to 256.
+        self.assertEqual(result['window_tokens'], 256)
+        self.assertEqual(sum(n['kv_bytes'] for n in result['nodes']), 6*64*512 + 6*32*256)
+        self.assertEqual(sum(n['state_bytes'] for n in result['nodes']), 6000)
+        plain = planner.plan(model(), inventory(), 300)
+        for with_extras, without in zip(result['nodes'], plain['nodes']):
+            self.assertEqual(with_extras['weights_bytes'] - without['weights_bytes'], 4096)
+        first = planner.plan(dict(model(), first_worker_bytes=8192), inventory(), 300)
+        self.assertEqual([n['weights_bytes'] - p['weights_bytes'] for n, p in zip(first['nodes'], plain['nodes'])],
+                         [8192, 0])
+        with self.assertRaisesRegex(planner.FleetError, 'window size'):
+            planner.plan(dict(info, sliding_window=0), inventory(), 300)
+
+    def test_manual_split(self):
+        result = planner.plan(model(), inventory(), 300, layer_counts=[2, 4])
+        self.assertEqual([(n['layer_start'], n['layer_end']) for n in result['nodes']], [(0, 2), (2, 6)])
+        self.assertEqual(result['split_mode'], 'manual')
+        for counts in ([3, 3, 0], [1, 4], [0, 6], [6]):
+            with self.subTest(counts=counts), self.assertRaisesRegex(planner.FleetError, 'manual split'):
+                planner.plan(model(), inventory(), 300, layer_counts=counts)
+        with self.assertRaisesRegex(planner.FleetError, 'does not fit'):
+            planner.plan(model(), inventory(memory=12), 300, layer_counts=[1, 5])
+
+    def test_any_supported_architecture_is_planned(self):
+        result = planner.plan(dict(model(), architecture='qwen35'), inventory(), 300)
+        self.assertEqual(result['architecture'], 'qwen35')
+
     def test_unsupported_and_long_context(self):
-        for change in [dict(supported=False, unsupported_reasons=['hybrid']), dict(architecture='qwen35'),
-                       dict(kv_cache_dtype='q8_0'), dict(kv_bytes_per_layer_per_token=[]), dict(layer_count=513)]:
+        for change in [dict(supported=False, unsupported_reasons=['hybrid']),
+                       dict(kv_cache_dtype='q8_0'), dict(kv_bytes_per_layer_per_token=[]), dict(layer_count=513),
+                       dict(state_bytes_per_layer=[1]*5)]:
             with self.subTest(change=change), self.assertRaises(planner.FleetError):
                 planner.plan(dict(model(), **change), inventory())
         with self.assertRaisesRegex(planner.FleetError, 'training context'):
@@ -92,8 +124,34 @@ class PlannerTests(unittest.TestCase):
         for value in ('192.168.1.21:50052', '10.1.1.1:50052', '172.31.1.1:1', '127.0.0.1:50052'):
             self.assertEqual(planner.endpoint(value), value)
 
+    def test_parallel_slots(self):
+        # Each slot its own stream: ctx-size / slots cells each, padded to 256.
+        self.assertEqual(planner.cache_cells(1000, 4), (1024, 0, 256))
+        self.assertEqual(planner.cache_cells(4096, 4, window=100), (4096, 4 * 256, 1024))
+        # One shared stream; window layers keep window * slots + ubatch.
+        self.assertEqual(planner.cache_cells(4096, 4, unified=True, window=100), (4096, 768, 4096))
+        info = dict(model(), state_bytes_per_layer=[1000]*6)
+        one = planner.plan(info, inventory(memory=64), 1024)
+        four = planner.plan(info, inventory(memory=64), 4096, slots=4)
+        self.assertEqual(sum(n['state_bytes'] for n in four['nodes']), 4 * 6000)
+        self.assertEqual(sum(n['kv_bytes'] for n in four['nodes']), 4 * sum(n['kv_bytes'] for n in one['nodes']))
+        self.assertEqual((four['parallel_sequences'], four['kv_unified'], four['context_per_slot']), (4, False, 1024))
+        # The training context limits each request, not the whole cache.
+        planner.plan(info, inventory(memory=64), 16384, slots=4)
+        with self.assertRaisesRegex(planner.FleetError, 'training context'):
+            planner.plan(info, inventory(memory=64), 8192, slots=4, unified=True)
+        args = controller.command('/tmp/server', '/tmp/m.gguf', planner.plan(info, inventory(memory=64), 4096,
+                                                                           slots=4, unified=True))
+        self.assertEqual(args[args.index('--parallel')+1], '4')
+        self.assertIn('--kv-unified', args)
+
+    def test_one_node_is_a_split_of_one(self):
+        result = planner.plan(model(), inventory(1, memory=64), 300)
+        self.assertEqual((result['nodes'][0]['layer_start'], result['nodes'][0]['layer_end']), (0, 6))
+        self.assertTrue(result['nodes'][0]['output_layer'])
+
     def test_inventory_invalid(self):
-        for conf in ({}, dict(inventory(), nodes=[]), inventory(1), inventory(16), inventory(17), inventory(reserve=32)):
+        for conf in ({}, dict(inventory(), nodes=[]), inventory(16), inventory(17), inventory(reserve=32)):
             with self.subTest(config=conf), self.assertRaises(planner.FleetError):
                 planner.inventory(conf)
         conf = inventory()
@@ -115,6 +173,20 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args[args.index('--fit')+1], 'off')
         self.assertEqual(args[args.index('--model')+1], str(Path('/tmp/a model.gguf').resolve()))
         self.assertEqual(args[args.index('--parallel')+1], '1')
+        self.assertEqual(args[args.index('--ubatch-size')+1], str(planner.UBATCH))
+        self.assertEqual(args[args.index('--ctx-checkpoints')+1], '1')
+        self.assertEqual(args[args.index('--cache-ram')+1], '0')
+
+    def test_direct_command_uses_one_local_gpu(self):
+        args = controller.direct_command('/tmp/server', '/tmp/m.gguf', 'CUDA0', 65536, 18100, slots=2,
+                                         cache_type='q8_0', flash_attn=True)
+        for flag, value in (('--device', 'CUDA0'), ('--ctx-size', '65536'), ('--parallel', '2'),
+                            ('--cache-type-k', 'q8_0'), ('--flash-attn', 'on'), ('--host', '127.0.0.1'),
+                            ('--port', '18100'), ('--ubatch-size', str(controller.DIRECT_UBATCH))):
+            self.assertEqual(args[args.index(flag)+1], value)
+        self.assertNotIn('--rpc', args)
+        with self.assertRaisesRegex(planner.FleetError, 'flash attention'):
+            controller.direct_check('/tmp/server', '/tmp/m.gguf', 'CUDA0', 8000, 4096, cache_type='q8_0')
 
     def test_environment_cannot_override_plan(self):
         with patch.dict(os.environ, {'LLAMA_ARG_MODEL': 'bad', 'LLAMA_ARG_RPC': '8.8.8.8:1'}):
