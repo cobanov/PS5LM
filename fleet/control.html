@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS5LM Fleet</title>
+<style>
+:root {
+  --bg: #f3f4f7; --surface: #ffffff; --ink: #121722; --muted: #5d6576; --line: #dcdfe7;
+  --accent: #1f5af0; --accent-ink: #ffffff; --ok: #12784a; --ok-bg: #e2f4ea; --warn: #8a5300;
+  --warn-bg: #fff2dc; --bad: #a3221f; --bad-bg: #fbe7e6; --code: #0f141e; --code-ink: #dfe5ef;
+  --chip: #e6e9f2;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0b0e14; --surface: #131823; --ink: #e5e9f2; --muted: #9aa3b5; --line: #262d3c;
+    --accent: #7aa2ff; --accent-ink: #0b0e14; --ok: #7bd8a4; --ok-bg: #10261a; --warn: #f2c27a;
+    --warn-bg: #2a1e0b; --bad: #ff9c97; --bad-bg: #2c1314; --code: #06080d; --code-ink: #d5dbe6;
+    --chip: #222a3a; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px;
+  background: var(--surface); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header h1 { margin: 0; font-size: 17px; }
+.api { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+main { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px; padding: 16px 16px 40px; }
+@media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+section { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+section h2 { margin: 0 0 2px; font-size: 15px; }
+.sub { color: var(--muted); margin: 0 0 10px; font-size: 13px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.spread { justify-content: space-between; }
+button { font: inherit; font-weight: 600; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  padding: 6px 12px; border-radius: 8px; cursor: pointer; min-height: 34px; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--bad); }
+button.small { padding: 2px 9px; min-height: 28px; font-size: 12px; }
+button:disabled { opacity: 0.5; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+input, select, textarea { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 8px; min-width: 0; width: 100%; }
+textarea { font: 12px/1.4 var(--mono); }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; font-weight: 600; color: var(--muted); }
+label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--ink); font-weight: 500; font-size: 13px; }
+label.check input { width: auto; }
+.form { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 10px 0; }
+.form .wide { grid-column: 1 / -1; }
+.pill { display: inline-flex; align-items: center; padding: 1px 9px; border-radius: 999px; font-size: 12px;
+  font-weight: 600; background: var(--chip); color: var(--muted); white-space: nowrap; }
+.pill.ok { background: var(--ok-bg); color: var(--ok); }
+.pill.warn { background: var(--warn-bg); color: var(--warn); }
+.pill.bad { background: var(--bad-bg); color: var(--bad); }
+.pool { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; }
+.pool h3 { margin: 0; font-size: 15px; }
+.meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.replica { border-top: 1px solid var(--line); padding: 8px 0 2px; margin-top: 8px; }
+.replica .detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.layers { font: 12px var(--mono); color: var(--muted); }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
+  font-weight: 600; padding: 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kind { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); }
+.notice { border-radius: 8px; padding: 8px 10px; font-size: 13px; margin: 8px 0; }
+.notice.bad { background: var(--bad-bg); color: var(--bad); }
+.notice.warn { background: var(--warn-bg); color: var(--warn); }
+pre { margin: 6px 0 0; background: var(--code); color: var(--code-ink); border-radius: 8px; padding: 8px;
+  font: 11px/1.4 var(--mono); max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.messages { list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--muted); max-height: 320px; overflow: auto; }
+.messages li + li { margin-top: 3px; }
+.empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+code { font-family: var(--mono); font-size: 12px; }
+#toast { position: fixed; left: 16px; right: 16px; bottom: 16px; max-width: 640px; margin: 0 auto; z-index: 3; }
+details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PS5LM Fleet</h1>
+  <span class="pill" id="summary">loading</span>
+  <span class="api" id="api"></span>
+</header>
+<main>
+  <div class="col">
+    <section aria-labelledby="pools-h">
+      <div class="row spread">
+        <h2 id="pools-h">Pools</h2>
+        <button id="new-pool" class="small">New pool</button>
+      </div>
+      <p class="sub">A pool is one model and how it is served. Each replica serves all of it: split over its devices,
+        on one console by itself, on this PC's GPU, or a server elsewhere. Requests go to the pool their "model" names.</p>
+      <div id="pool-form" hidden>
+        <div class="form">
+          <label>Name<input id="p-id" placeholder="qwen27" autocomplete="off"></label>
+          <label>Context per request<input id="p-context" type="number" min="256" step="1024" value="32768"></label>
+          <label>Slots per replica<input id="p-slots" type="number" min="1" max="64" value="1"></label>
+          <label>Cache<select id="p-cache"><option>q8_0</option><option>q4_0</option><option>q5_0</option><option>f16</option></select></label>
+          <label class="wide">Model: a GGUF path on this computer, or an https:// URL<input id="p-model" autocomplete="off"></label>
+          <label class="wide">SHA-256 (optional)<input id="p-sha" placeholder="64 hex characters" autocomplete="off"></label>
+          <label class="wide">Replicas: one per line; devices of a split joined by +, optional :rpc, :app or :direct; or a server URL
+            <textarea id="p-replicas" rows="3" placeholder="ps5-a+pc-gpu&#10;ps5-b&#10;http://10.0.0.9:8080"></textarea></label>
+          <label>Or add, from free devices<input id="p-auto" type="number" min="0" placeholder="replicas"></label>
+          <label>devices each<input id="p-per" type="number" min="1" value="1"></label>
+          <label>of kind<select id="p-kind"><option value="">any</option><option>ps5</option><option>gpu</option><option>rpc</option></select></label>
+          <label>Aliases (spaces between)<input id="p-aliases" placeholder="qwen gpt-4o" autocomplete="off"></label>
+          <label class="check"><input id="p-shared" type="checkbox"> Slots share one context</label>
+          <label class="check"><input id="p-fa" type="checkbox" checked> Flash attention</label>
+          <label class="check"><input id="p-start" type="checkbox"> Start now</label>
+        </div>
+        <div class="row"><button id="p-save" class="primary">Save pool</button><button id="p-cancel">Cancel</button></div>
+      </div>
+      <div id="pools"></div>
+    </section>
+    <section aria-labelledby="devices-h">
+      <div class="row spread">
+        <h2 id="devices-h">Devices</h2>
+        <div class="row">
+          <button id="search" class="small">Search the network</button>
+          <button id="new-device" class="small">Add device</button>
+        </div>
+      </div>
+      <p class="sub">Consoles switch between worker mode and the app from here; a running pool's devices are its own.</p>
+      <div id="device-form" hidden>
+        <div class="form">
+          <label>Kind<select id="d-kind"><option value="ps5">PS5 console</option><option value="gpu">GPU on this PC</option><option value="rpc">RPC server</option></select></label>
+          <label>Name<input id="d-id" autocomplete="off"></label>
+          <label class="d-net">Address<input id="d-address" placeholder="192.168.50.21" autocomplete="off"></label>
+          <label>Port<input id="d-port" type="number" placeholder="30052"></label>
+          <label class="d-gpu" hidden>GPU<input id="d-device" value="CUDA0"></label>
+          <label>Memory MiB<input id="d-memory" type="number" placeholder="what it reports"></label>
+          <label>Reserve MiB<input id="d-reserve" type="number" value="1024"></label>
+          <label>Tags<input id="d-tags" placeholder="rack1 lounge" autocomplete="off"></label>
+        </div>
+        <div class="row"><button id="d-save" class="primary">Add device</button><button id="d-cancel">Cancel</button></div>
+      </div>
+      <div id="consoles"></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Device</th><th>Where</th><th>Now</th><th>Replica</th><th>Memory</th><th></th></tr></thead>
+        <tbody id="devices"></tbody>
+      </table></div>
+    </section>
+  </div>
+  <div class="col">
+    <section aria-labelledby="settings-h">
+      <h2 id="settings-h">API and settings</h2>
+      <p class="sub" id="api-sub"></p>
+      <div class="form">
+        <label>API port<input id="s-port" type="number" min="1024" max="65535"></label>
+        <label>Network to search<input id="s-lan" placeholder="detected"></label>
+        <label>Controller memory MiB<input id="s-host" type="number"></label>
+        <label>Controller reserve MiB<input id="s-reserve" type="number"></label>
+        <label class="wide">API key (optional; every request needs it once set)<input id="s-key" type="password" autocomplete="off" placeholder="none"></label>
+        <label class="check wide"><input id="s-lan-api" type="checkbox"> Share the API on the network (0.0.0.0)</label>
+      </div>
+      <div class="row"><button id="s-save" class="primary">Save settings</button></div>
+    </section>
+    <section aria-labelledby="jobs-h">
+      <h2 id="jobs-h">Activity</h2>
+      <div id="jobs"></div>
+      <ul class="messages" id="messages"></ul>
+    </section>
+    <section aria-labelledby="agents-h">
+      <h2 id="agents-h">From a shell or an agent</h2>
+      <p class="sub">The same controls as JSON: <code>python3 -m fleet ctl status</code>, <code>ctl pool start ID --wait 900</code>,
+        <code>ctl device leave ps5-a --wait</code>, or <code>ctl config &gt; fleet.json</code> then <code>ctl apply fleet.json</code>.
+        See <code>python3 -m fleet ctl help</code>.</p>
+    </section>
+  </div>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let state = null, settingsLoaded = false, editing = null;
+
+async function post(path, body = {}) {
+  try {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Fleet-Control": "1" },
+      body: JSON.stringify(body) });
+    const data = await response.json();
+    if (data.state) render(data.state);
+    if (!data.ok) toast(data.error || "Refused", true);
+    else if (data.result) toast(data.result);
+    else if (data.job) toast(data.job.label + "…");
+    return data;
+  } catch (error) {
+    toast("The control server did not answer: " + error, true);
+    return { ok: false };
+  }
+}
+
+function toast(text, bad = false) {
+  const box = $("toast");
+  box.replaceChildren(el("div", { class: "notice " + (bad ? "bad" : "warn") }, text));
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => box.replaceChildren(), bad ? 9000 : 4000);
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "on") for (const [event, fn] of Object.entries(value)) node.addEventListener(event, fn);
+    else if (key === "class") node.className = value;
+    else if (value === true) node.setAttribute(key, "");
+    else if (value !== false && value != null) node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) if (child != null && child !== false) node.append(child);
+  return node;
+}
+
+const TONE = { ready: "ok", worker: "ok", serving: "ok", direct: "ok", starting: "warn", loading: "warn", waiting: "warn",
+  stopping: "warn", partial: "warn", checking: "", failed: "bad", offline: "bad", unknown: "bad", empty: "" };
+const pill = (text, tone = TONE[text] ?? "") => el("span", { class: "pill " + tone }, text);
+const button = (label, fn, cls = "small") => el("button", { class: cls, on: { click: fn } }, label);
+const file = (path) => (path || "").split("?")[0].split("/").pop();
+
+function renderPools(s) {
+  const box = $("pools");
+  if (!s.pools.length) { box.replaceChildren(el("p", { class: "empty" }, "No pools yet.")); return; }
+  box.replaceChildren(...s.pools.map((p) => {
+    const head = el("div", { class: "row spread" },
+      el("div", { class: "row" }, el("h3", {}, p.id), pill(p.state), el("span", { class: "meta" }, `${p.ready} of ${p.replicas.length} ready`)),
+      el("div", { class: "row" },
+        p.running ? button("Stop", () => post("/api/pools/stop", { id: p.id }))
+                  : button("Start", () => post("/api/pools/start", { id: p.id }), "small primary"),
+        button("Plan", () => post("/api/pools/plan", { id: p.id })),
+        button("Edit", () => editPool(p)),
+        button("Remove", () => confirm(`Remove pool ${p.id}?`) && post("/api/pools/remove", { id: p.id }), "small danger")));
+    const meta = el("div", { class: "meta" },
+      `${file(p.model) || "no model"} · ${p.context.toLocaleString()} tokens per request · ${p.slots} slot${p.slots > 1 ? "s" : ""}` +
+      `${p.shared_context ? " sharing one context" : ""} · ${p.cache_type} cache${p.flash_attn ? ", flash attention" : ""}` +
+      (p.aliases.length ? ` · also "${p.aliases.join('", "')}"` : ""));
+    const replicas = p.replicas.map((r) => {
+      const where = r.url && r.via === "server" ? r.url : r.devices.join(" + ") + ` (${r.via === "rpc" ? "split" : r.via})`;
+      const load = r.state === "ready" ? `${r.in_flight}/${r.slots} busy · ${r.served} served` : "";
+      const retry = r.state === "failed" && r.retry_in ? ` · retrying in ${r.retry_in} s` : "";
+      return el("div", { class: "replica" },
+        el("div", { class: "row spread" },
+          el("div", { class: "row" }, el("strong", {}, r.key), pill(r.state), el("span", { class: "meta" }, where)),
+          el("div", { class: "row" }, el("span", { class: "meta" }, load),
+            p.running && r.state !== "stopped" ? button("Restart", () => post("/api/replicas/restart", { key: r.key })) : null)),
+        r.detail ? el("div", { class: "detail" }, r.detail + retry) : null,
+        r.layers ? el("div", { class: "layers" }, r.layers.map((n) =>
+          `${n.id}: blocks ${n.first}-${n.last}${n.output ? " + output" : ""}, ${n.weights_mib} + ${n.cache_mib} MiB` +
+          (r.check && r.check[n.id] ? ` (llama.cpp ${r.check[n.id].total_mib} of ${r.check[n.id].budget_mib})` : "")).join(" · ")) : null,
+        !r.layers && r.check ? el("div", { class: "layers" }, Object.entries(r.check).map(([id, c]) =>
+          `${id}: llama.cpp ${c.total_mib} of ${c.budget_mib} MiB`).join(" · ")) : null,
+        r.log && r.log.length && r.state !== "ready" ? el("pre", {}, r.log.join("\n")) : null);
+    });
+    return el("div", { class: "pool" }, head, meta, replicas.length ? replicas : el("p", { class: "empty" }, "No replicas."));
+  }));
+}
+
+function memory(d) {
+  if (d.kind === "gpu" && state.gpus[d.device]) return `${state.gpus[d.device].free_mib} free`;
+  return d.memory_mib ? `${d.memory_mib} budget` : "reported";
+}
+
+function renderDevices(s) {
+  const rows = s.devices.map((d) => {
+    const mode = d.status.mode;
+    const now = mode === "serving" && d.status.model ? `serving ${file(d.status.model)}` :
+      mode === "worker" && d.status.busy ? "worker, in use" : mode;
+    const actions = [];
+    const label = { worker: d.kind === "gpu" ? "Start worker" : "Make worker", leave: "Leave worker mode", quit: "Quit app",
+      unload: "Unload model", stop: "Stop worker" };
+    const owner = s.pools.find((p) => p.running && p.replicas.some((r) => r.devices.includes(d.id)));
+    for (const action of owner ? [] : d.actions) {
+      if (d.kind === "ps5" && action === "worker" && mode === "worker") continue;
+      if (d.kind === "ps5" && action === "leave" && mode !== "worker") continue;
+      if (d.kind === "ps5" && action === "unload" && !["serving", "loading"].includes(mode)) continue;
+      if (d.kind === "ps5" && action === "quit" && mode === "offline") continue;
+      if (d.kind === "gpu" && action === "worker" && d.rpc_worker) continue;
+      if (d.kind === "gpu" && action === "stop" && !d.rpc_worker) continue;
+      actions.push(button(label[action], () => post("/api/devices/action", { id: d.id, action })));
+    }
+    if (owner) {
+      actions.push(el("span", { class: "meta" }, `in use by ${owner.id}; stop it to change this device`));
+    } else {
+      actions.push(button(d.enabled ? "Disable" : "Enable", () => post("/api/devices/update", { id: d.id, enabled: !d.enabled })));
+      actions.push(button("Remove", () => confirm(`Remove ${d.id}?`) && post("/api/devices/remove", { id: d.id }), "small danger"));
+    }
+    const where = d.kind === "gpu" ? `${d.device}, worker port ${d.port}` : `${d.address}:${d.port}`;
+    return el("tr", {},
+      el("td", {}, el("div", {}, el("strong", {}, d.id)), el("span", { class: "kind" }, d.kind + (d.enabled ? "" : " · disabled")),
+        d.tags.length ? el("div", { class: "meta" }, d.tags.join(" ")) : null),
+      el("td", { class: "num" }, where),
+      el("td", {}, pill(d.busy ? d.busy + "…" : now, d.busy ? "warn" : TONE[mode] ?? "")),
+      el("td", { class: "num" }, d.replica || ""),
+      el("td", { class: "num" }, memory(d)),
+      el("td", {}, el("div", { class: "row" }, actions)));
+  });
+  $("devices").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: 6, class: "empty" }, "No devices yet."))]));
+  const fresh = s.consoles.filter((c) => !c.added);
+  $("consoles").replaceChildren(...fresh.map((c) => el("div", { class: "notice warn row spread" },
+    `Found ${c.name || c.address} at ${c.address} (${c.state}${c.firmware ? ", firmware " + c.firmware : ""})`,
+    button("Add", () => post("/api/devices/add", { id: (c.name || "ps5-" + c.address.split(".").pop()).replace(/[^A-Za-z0-9_.-]/g, "-"),
+      kind: "ps5", address: c.address })))));
+}
+
+function renderActivity(s) {
+  const running = s.jobs.filter((j) => j.state === "running");
+  $("jobs").replaceChildren(...running.map((j) => el("div", { class: "notice warn" }, j.label + "…")));
+  $("messages").replaceChildren(...s.messages.slice().reverse().map((m) => el("li", {}, m)));
+}
+
+function render(s) {
+  state = s;
+  const ready = s.pools.filter((p) => p.state === "ready").length;
+  const devicesUp = s.devices.filter((d) => !["offline", "unknown", "checking"].includes(d.status.mode)).length;
+  $("summary").textContent = `${ready}/${s.pools.length} pools ready · ${devicesUp}/${s.devices.length} devices up`;
+  $("summary").className = "pill " + (s.pools.length && ready === s.pools.length ? "ok" : ready ? "warn" : "");
+  $("api").textContent = s.api.listening ? `API ${s.api.url}${s.api.lan ? " (and on the network)" : ""} · ${s.api.requests} requests` : s.api.error || "API not listening";
+  $("api-sub").textContent = `OpenAI and Anthropic requests at ${s.api.url}; "model" picks the pool.` +
+    (s.build.llama_server ? "" : " The host build is missing: run scripts/build-fleet-host.sh.");
+  renderPools(s);
+  renderDevices(s);
+  renderActivity(s);
+  if (!settingsLoaded) {
+    settingsLoaded = true;
+    $("s-port").value = s.settings.api_port; $("s-lan").value = s.settings.lan;
+    $("s-host").value = s.settings.host_memory_mib; $("s-reserve").value = s.settings.host_reserve_mib;
+    $("s-key").value = s.settings.api_key; $("s-lan-api").checked = s.settings.api_lan;
+  }
+}
+
+function parseReplicas(text) {
+  return text.split(/[\n,]+/).map((line) => line.trim()).filter(Boolean).map((line) => {
+    if (/^https?:\/\//.test(line)) return { url: line };
+    const [ids, via] = line.split(":");
+    const replica = { devices: ids.split("+").map((x) => x.trim()).filter(Boolean) };
+    if (via) replica.via = via.trim();
+    return replica;
+  });
+}
+
+function defaultVia(ids) {
+  if (ids.length !== 1) return "rpc";
+  const device = state.devices.find((d) => d.id === ids[0]);
+  return device && device.kind === "ps5" ? "app" : device && device.kind === "gpu" ? "direct" : "rpc";
+}
+
+function editPool(p) {
+  editing = p ? p.id : null;
+  $("pool-form").hidden = false;
+  $("p-id").value = p ? p.id : ""; $("p-id").disabled = !!p;
+  $("p-model").value = p ? p.model : ""; $("p-sha").value = p ? p.sha256 : "";
+  $("p-context").value = p ? p.context : 32768; $("p-slots").value = p ? p.slots : 1;
+  $("p-cache").value = p ? p.cache_type : "q8_0"; $("p-fa").checked = p ? p.flash_attn : true;
+  $("p-shared").checked = p ? p.shared_context : false; $("p-aliases").value = p ? p.aliases.join(" ") : "";
+  $("p-replicas").value = p ? p.replicas.map((r) => r.via === "server" ? r.url :
+    r.devices.join("+") + (r.via === defaultVia(r.devices) ? "" : ":" + r.via)).join("\n") : "";
+  $("p-auto").value = ""; $("p-start").checked = p ? p.running : false;
+  $("p-id").focus();
+}
+
+$("new-pool").addEventListener("click", () => editPool(null));
+$("p-cancel").addEventListener("click", () => { $("pool-form").hidden = true; });
+$("p-save").addEventListener("click", async () => {
+  const body = { id: $("p-id").value.trim(), model: $("p-model").value.trim(), sha256: $("p-sha").value.trim(),
+    context: Number($("p-context").value), slots: Number($("p-slots").value), cache_type: $("p-cache").value,
+    flash_attn: $("p-fa").checked, shared_context: $("p-shared").checked,
+    aliases: $("p-aliases").value.split(/\s+/).filter(Boolean), replicas: parseReplicas($("p-replicas").value),
+    running: $("p-start").checked };
+  const keep = editing && state.pools.find((p) => p.id === editing);
+  // Keep what the form does not show: a server's slots and key, a split's block counts.
+  if (keep) body.replicas = body.replicas.map((r) => {
+    if (r.url) {
+      const old = keep.replicas.find((o) => o.via === "server" && o.url === r.url);
+      return old ? { url: r.url, slots: old.slots, api_key: "set" } : r;
+    }
+    const old = keep.replicas.find((o) => o.via !== "server" && o.devices.join("+") === r.devices.join("+"));
+    return old && old.split.length && (r.via || defaultVia(r.devices)) === old.via ? { ...r, split: old.split } : r;
+  });
+  if (Number($("p-auto").value) > 0) body.auto = { count: Number($("p-auto").value), per: Number($("p-per").value) || 1,
+    kinds: $("p-kind").value ? [$("p-kind").value] : [] };
+  const result = await post(editing ? "/api/pools/update" : "/api/pools/add", body);
+  if (result.ok) $("pool-form").hidden = true;
+});
+
+function deviceKind() {
+  const kind = $("d-kind").value;
+  for (const node of document.querySelectorAll(".d-net")) node.hidden = kind === "gpu";
+  for (const node of document.querySelectorAll(".d-gpu")) node.hidden = kind !== "gpu";
+  $("d-port").placeholder = kind === "ps5" ? "30052" : "50052";
+}
+$("d-kind").addEventListener("change", deviceKind);
+$("new-device").addEventListener("click", () => { $("device-form").hidden = false; deviceKind(); $("d-id").focus(); });
+$("d-cancel").addEventListener("click", () => { $("device-form").hidden = true; });
+$("d-save").addEventListener("click", async () => {
+  const kind = $("d-kind").value;
+  const body = { id: $("d-id").value.trim(), kind, reserve_mib: Number($("d-reserve").value) || 1024,
+    tags: $("d-tags").value.split(/\s+/).filter(Boolean) };
+  if (kind === "gpu") body.device = $("d-device").value.trim(); else body.address = $("d-address").value.trim();
+  if ($("d-port").value) body.port = Number($("d-port").value);
+  if ($("d-memory").value) body.memory_mib = Number($("d-memory").value);
+  const result = await post("/api/devices/add", body);
+  if (result.ok) $("device-form").hidden = true;
+});
+$("search").addEventListener("click", () => post("/api/search"));
+$("s-save").addEventListener("click", () => post("/api/settings", { api_port: Number($("s-port").value), lan: $("s-lan").value.trim(),
+  host_memory_mib: Number($("s-host").value), host_reserve_mib: Number($("s-reserve").value), api_key: $("s-key").value,
+  api_lan: $("s-lan-api").checked }));
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/state");
+    if (response.ok) render(await response.json());
+  } catch (error) { /* the next poll tries again */ }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
