@@ -95,13 +95,19 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(model['kv_element_bytes'], 2)
         self.assertEqual(model['context_length'], 4096)
         self.assertEqual(model['file_size_bytes'], self.path.stat().st_size)
-        self.assertEqual(sum(model['layer_bytes']) + model['input_bytes'] + model['output_bytes'],
+        self.assertEqual(sum(model['layer_bytes']) + model['input_bytes'] + model['output_bytes']
+                         + model['per_worker_bytes'] + model['first_worker_bytes'] + model['mtp_bytes'],
                          model['tensor_storage_bytes'] + model['replicated_output_bytes'])
+        self.assertEqual(model['state_bytes_per_layer'], [0, 0])
+        self.assertEqual(model['swa_kv_bytes_per_layer_per_token'], [0, 0])
 
-    def test_rope_replication_fails_closed(self):
+    def test_rope_freqs_one_copy_per_worker(self):
+        baseline = models.inspect_file(write_gguf(self.path))
         model = models.inspect_file(write_gguf(self.path, extra=[('rope_freqs.weight', [2], 0)]))
-        self.assertFalse(model['supported'])
-        self.assertTrue(any('replication' in reason for reason in model['unsupported_reasons']))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        self.assertEqual(model['per_worker_bytes'], 32)
+        self.assertEqual(model['input_bytes'], baseline['input_bytes'])
+        self.assertEqual(model['output_bytes'], baseline['output_bytes'])
 
     def test_qwen2_untied_output(self):
         model = models.inspect_file(write_gguf(self.path, arch='qwen2', tied=False))
@@ -113,8 +119,10 @@ class InspectionTests(unittest.TestCase):
     def test_per_layer_gqa_and_head_size(self):
         model = models.inspect_file(write_gguf(self.path, kv_heads=[1, 2], metadata={
             'llama.attention.key_length': 3, 'llama.attention.value_length': 2}))
-        self.assertEqual(model['kv_bytes_per_layer_per_token'], [10, 20])
-        self.assertEqual(model['kv_elements_per_layer_per_token'], [5, 10])
+        # K per layer (3 and 6 values); without flash attention both layers' V
+        # rows take the widest V (2 heads * 2 = 4 values).
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [14, 20])
+        self.assertEqual(model['kv_elements_per_layer_per_token'], [7, 10])
 
     def test_identity_is_explicitly_not_full_weight_hash(self):
         write_gguf(self.path, fill=1)
@@ -127,22 +135,123 @@ class InspectionTests(unittest.TestCase):
         self.assertNotEqual(sha1, sha2)
         self.assertEqual(first['identity_kind'], 'metadata-only-sha256')
 
-    def test_hybrid_architecture_no_fake_kv(self):
+    def test_hybrid_without_state_sizes_no_fake_kv(self):
         model = models.inspect_file(write_gguf(self.path, arch='qwen35'))
         self.assertFalse(model['supported'])
         self.assertEqual(model['kv_bytes_per_layer_per_token'], [])
-        self.assertIn('Hybrid/recurrent', ' '.join(model['unsupported_reasons']))
+        self.assertIn('state sizes', ' '.join(model['unsupported_reasons']))
 
-    def test_missing_tensor_not_supported(self):
-        model = models.inspect_file(write_gguf(self.path, omit=['blk.1.attn_k.weight']))
+    QWEN35_SSM = {'qwen35.ssm.conv_kernel': 4, 'qwen35.ssm.inner_size': 8,
+                  'qwen35.ssm.state_size': 2, 'qwen35.ssm.group_count': 1}
+
+    def test_qwen35_attention_every_fourth_layer_rest_recurrent(self):
+        model = models.inspect_file(write_gguf(self.path, arch='qwen35', layers=8, metadata=self.QWEN35_SSM))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        # n_embd_r = (4-1)*(8+2*1*2) = 36, n_embd_s = 2*8 = 16, f32: 208 bytes.
+        self.assertEqual(model['state_bytes_per_layer'], [208, 208, 208, 0, 208, 208, 208, 0])
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 0, 0, 8, 0, 0, 0, 8])
+        self.assertEqual(model['recurrent_layer_count'], 6)
+
+    def test_qwen35_interval_and_explicit_recurrent_flags(self):
+        model = models.inspect_file(write_gguf(self.path, arch='qwen35', layers=4, metadata=dict(
+            self.QWEN35_SSM, **{'qwen35.full_attention_interval': 2})))
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 8, 0, 8])
+        model = models.inspect_file(write_gguf(self.path, arch='qwen35', layers=4, metadata=dict(
+            self.QWEN35_SSM, **{'qwen35.attention.recurrent_layers': [0, 1, 1, 0]})))
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [8, 0, 0, 8])
+
+    def test_nextn_block_neither_resident_nor_cached(self):
+        model = models.inspect_file(write_gguf(self.path, arch='qwen35', layers=5, metadata=dict(
+            self.QWEN35_SSM, **{'qwen35.nextn_predict_layers': 1})))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        # The NextN block keeps its tensor-split slot, but llama-server loads
+        # neither its weights (load_mtp is off) nor a cache for it.
+        self.assertEqual(model['layer_count'], 5)
+        self.assertEqual(model['mtp_layers'], 1)
+        self.assertEqual(model['layer_bytes'][4], 0)
+        self.assertEqual(model['mtp_bytes'], 640)
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 0, 0, 8, 0])
+        self.assertEqual(model['state_bytes_per_layer'][4], 0)
+
+    def test_sliding_window_pattern_head_sizes_and_shared_cache(self):
+        model = models.inspect_file(write_gguf(self.path, arch='gemma4', layers=4, metadata={
+            'gemma4.attention.sliding_window': 16, 'gemma4.attention.sliding_window_pattern': [1, 0, 1, 0],
+            'gemma4.attention.key_length_swa': 1, 'gemma4.attention.value_length_swa': 1,
+            'gemma4.attention.shared_kv_layers': 1}))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        # Without flash attention every layer's V takes the widest V (2 here):
+        # window layers keep K 1 + V 2, full layers K 2 + V 2, at 2 bytes each.
+        self.assertEqual(model['swa_kv_bytes_per_layer_per_token'], [6, 0, 6, 0])
+        # The last layer reuses an earlier layer's cache.
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 8, 0, 0])
+        self.assertEqual(model['sliding_window'], 16)
+
+    def test_default_window_pattern_from_llama_cpp(self):
+        model = models.inspect_file(write_gguf(self.path, arch='gpt-oss', layers=4,
+                                               metadata={'gpt-oss.attention.sliding_window': 8}))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        # gpt-oss: period 2, the last layer of each pair keeps the full context.
+        self.assertEqual(model['swa_kv_bytes_per_layer_per_token'], [8, 0, 8, 0])
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 8, 0, 8])
+        model = models.inspect_file(write_gguf(self.path, arch='gpt-oss', layers=4, metadata={
+            'gpt-oss.attention.sliding_window': 8, 'gpt-oss.attention.sliding_window_pattern': 4}))
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [0, 0, 0, 8])
+
+    def test_sliding_window_without_pattern_counts_full_context(self):
+        model = models.inspect_file(write_gguf(self.path, metadata={'llama.attention.sliding_window': 8}))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [8, 8])
+        self.assertEqual(model['swa_kv_bytes_per_layer_per_token'], [0, 0])
+        self.assertEqual(model['sliding_window'], 0)
+        self.assertIn('full context', ' '.join(model['notes']))
+
+    def test_layer_zero_tensors_go_with_the_first_worker(self):
+        model = models.inspect_file(write_gguf(self.path, extra=[('per_layer_model_proj.weight', [4, 2], 0)]))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        self.assertEqual(model['first_worker_bytes'], 32)
+
+    def test_zero_kv_head_layers_are_recurrent_in_known_hybrids(self):
+        model = models.inspect_file(write_gguf(
+            self.path, arch='nemotron_h', layers=4, kv_heads=[1, 1, 1, 1],
+            metadata={'nemotron_h.attention.head_count_kv': [1, 0, 1, 0], 'nemotron_h.ssm.conv_kernel': 4,
+                      'nemotron_h.ssm.inner_size': 8, 'nemotron_h.ssm.state_size': 2, 'nemotron_h.ssm.group_count': 1}))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        self.assertEqual(model['kv_bytes_per_layer_per_token'], [8, 0, 8, 0])
+        self.assertEqual(model['state_bytes_per_layer'], [0, 208, 0, 208])
+
+    def test_unmodeled_cache_layouts_fail_closed(self):
+        cases = [('rwkv7', {}), ('falcon-h1', {}), ('llama', {'llama.attention.kv_lora_rank': 4}),
+                 ('newhybrid', {'newhybrid.ssm.inner_size': 8, 'newhybrid.ssm.state_size': 2})]
+        for arch, extra in cases:
+            with self.subTest(arch=arch):
+                model = models.inspect_file(write_gguf(self.path, arch=arch, metadata=extra))
+                self.assertFalse(model['supported'])
+                self.assertIn('not modeled', ' '.join(model['unsupported_reasons']))
+
+    def test_moe_and_iq_types_are_counted(self):
+        model = models.inspect_file(write_gguf(
+            self.path, hidden=32, dtype=20, metadata={'llama.expert_count': 4, 'llama.expert_used_count': 2},
+            extra=[('blk.0.ffn_up_exps.weight', [32, 8, 4], 0)]))
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
+        self.assertEqual(model['expert_count'], 4)
+        self.assertEqual(model['input_bytes'], 160)  # IQ4_NL: 256/32*18 = 144, aligned to 32
+
+    def test_missing_token_embedding_not_supported(self):
+        model = models.inspect_file(write_gguf(self.path, omit=['token_embd.weight'], tied=False))
         self.assertFalse(model['supported'])
-        self.assertIn('Block 1 is incomplete', ' '.join(model['unsupported_reasons']))
+        self.assertIn('token_embd', ' '.join(model['unsupported_reasons']))
+
+    def test_encoder_decoder_layout_not_split(self):
+        model = models.inspect_file(write_gguf(self.path, extra=[('enc.blk.0.attn_q.weight', [4, 4], 0)]))
+        self.assertFalse(model['supported'])
+        self.assertIn('Encoder-decoder', ' '.join(model['unsupported_reasons']))
 
     def test_shared_unknown_tensor_is_counted_and_rejected(self):
         baseline = models.inspect_file(write_gguf(self.path))
         model = models.inspect_file(write_gguf(self.path, extra=[('surprise.weight', [4], 0)]))
         self.assertFalse(model['supported'])
-        self.assertEqual(model['input_bytes'], baseline['input_bytes'] + 32)
+        self.assertEqual(model['output_bytes'], baseline['output_bytes'] + 32)
+        self.assertIn('surprise.weight', ' '.join(model['unsupported_reasons']))
 
     def test_split_metadata_is_not_supported(self):
         model = models.inspect_file(write_gguf(self.path, metadata={'split.count': 2}))
@@ -158,9 +267,11 @@ class InspectionTests(unittest.TestCase):
         self.assertFalse(model['supported'])
         self.assertIn('999', ' '.join(model['unsupported_reasons']))
 
-    def test_unknown_block_tensor_is_counted_and_rejected(self):
+    def test_any_block_tensor_is_counted_with_its_layer(self):
+        # Block contents differ per architecture; llama.cpp itself checks them at
+        # load. Their memory belongs to the layer, whatever they are called.
         model = models.inspect_file(write_gguf(self.path, extra=[('blk.0.unrecognized.weight', [4], 0)]))
-        self.assertFalse(model['supported'])
+        self.assertTrue(model['supported'], model['unsupported_reasons'])
         self.assertEqual(model['layer_bytes'][0], 672)
 
     def test_directory_and_fifo_are_rejected_without_blocking(self):

@@ -45,8 +45,10 @@ MAX_LAYERS = 4096
 DEFAULT_MAX_BYTES = 16 * 1024**3
 DEFAULT_MAX_CACHE_BYTES = 64 * 1024**3
 DISK_RESERVE_BYTES = 16 * 1024**2
-# GGML type id -> (elements per block, bytes per block). Unknown types must not
-# be estimated from a filename or bits-per-weight label.
+# GGML type id -> (elements per block, bytes per block): every type the pinned
+# ggml defines (ggml/include/ggml.h), with block sizes compiled from its
+# ggml-common.h. Unknown types must not be estimated from a filename or
+# bits-per-weight label.
 GGML_TYPES = {
     0: (1, 4),       # F32
     1: (1, 2),       # F16
@@ -62,16 +64,76 @@ GGML_TYPES = {
     13: (256, 176),  # Q5_K
     14: (256, 210),  # Q6_K
     15: (256, 292),  # Q8_K
+    16: (256, 66),   # IQ2_XXS
+    17: (256, 74),   # IQ2_XS
+    18: (256, 98),   # IQ3_XXS
+    19: (256, 50),   # IQ1_S
+    20: (32, 18),    # IQ4_NL
+    21: (256, 110),  # IQ3_S
+    22: (256, 82),   # IQ2_S
+    23: (256, 136),  # IQ4_XS
+    24: (1, 1),      # I8
+    25: (1, 2),      # I16
+    26: (1, 4),      # I32
+    27: (1, 8),      # I64
+    28: (1, 8),      # F64
+    29: (256, 56),   # IQ1_M
     30: (1, 2),      # BF16
+    34: (256, 54),   # TQ1_0
+    35: (256, 66),   # TQ2_0
+    39: (32, 17),    # MXFP4
+    40: (64, 36),    # NVFP4
+    41: (128, 18),   # Q1_0
+    42: (64, 18),    # Q2_0
 }
 _SCALARS = {0: 'B', 1: 'b', 2: 'H', 3: 'h', 4: 'I', 5: 'i',
             6: 'f', 7: 'B', 10: 'Q', 11: 'q', 12: 'd'}
 _BLOCK = re.compile(r'^blk\.(0|[1-9][0-9]*)\.(.+)$')
-_ARRAY_KEYS = {f'{arch}.attention.{suffix}' for arch in ('llama', 'qwen2')
-               for suffix in ('head_count', 'head_count_kv', 'key_length', 'value_length')}
-_REQUIRED = ('attn_norm.weight', 'attn_q.weight', 'attn_k.weight',
-             'attn_v.weight', 'attn_output.weight', 'ffn_norm.weight',
-             'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight')
+
+# Tensors outside the blocks, by where the pinned llama.cpp keeps them
+# (LLM_TENSOR_INFOS in src/llama-arch.cpp). Input tensors stay on the
+# controller. RoPE factor tensors are created for every layer and duplicated,
+# so each worker that holds layers keeps one copy. Everything else that
+# llama.cpp knows outside the blocks (output head, final norms, projections)
+# lives on the output device, the last worker.
+INPUT_TENSORS = frozenset({'token_embd', 'per_layer_token_embd', 'position_embd', 'token_types',
+                           'masked_embd_centroids', 'masked_embd_ordering'})
+PER_WORKER_TENSORS = frozenset({'rope_freqs', 'rope_factors_long', 'rope_factors_short'})
+# Created as layer 0's (tn(..., "weight", 0) in src/models/gemma3n.cpp and
+# gemma4.cpp), so they live with the first worker.
+FIRST_WORKER_TENSORS = frozenset({'per_layer_model_proj', 'per_layer_proj_norm'})
+OUTPUT_TENSORS = frozenset({'output', 'output_norm', 'token_embd_norm', 'cls', 'cls.norm', 'cls.output',
+                            'dense_2', 'dense_3', 'altup_proj', 'altup_unembd_proj',
+                            'conf_proj', 'd2t', 'fc', 'markov_w1', 'markov_w2',
+                            'nextn.pre_projection', 'nextn.post_projection', 'output_res_score', 'hrm.z_l_init'})
+# llama.cpp's own sliding-window pattern for architectures whose files carry a
+# window but no per-layer list (load_swa_pattern() in src/models/*.cpp):
+# (period, dense_first). A layer keeps only the window unless it is the last of
+# its period, or the first when dense_first is set; NextN blocks never do.
+DEFAULT_SWA_PATTERNS = {'gpt-oss': (2, False), 'gemma2': (2, False), 'gemma3': (6, False), 'gemma3n': (5, False),
+                        'gemma-embedding': (6, False), 'cohere2': (4, False), 'cohere2moe': (4, True),
+                        'exaone4': (4, False), 'exaone-moe': (4, False), 'olmo2': (4, False),
+                        'muse-glimmer': (4, False), 'afmoe': (4, False), 'mellum': (4, False),
+                        'plamo3': (8, False), 'smallthinker': (4, True), 'laguna': (4, True)}
+OUTPUT_PREFIXES = ('decision.', 'output_hc_', 'selector_')
+# Layouts that are not one stack of decoder blocks (encoder-decoder, audio
+# codecs): a layer split cannot be reasoned about from the block tensors.
+UNSPLITTABLE_PREFIXES = ('enc.', 'dec.', 'posnet.', 'convnext.', 'lilicorr.', 'conv1d')
+# Recurrent layers keep a fixed f32 state instead of a KV cache. Which layers
+# are recurrent, per the pinned llama.cpp:
+#   - qwen3next/qwen35/qwen35moe: attention at a fixed interval (4 unless the
+#     file says otherwise), Gated DeltaNet in between (src/models/qwen35.cpp);
+#   - mamba/mamba2: every layer;
+#   - the hybrids below: layers whose attention.head_count_kv is 0.
+# Other recurrent and hybrid layouts (RWKV, KDA, linear attention, MLA caches,
+# parallel attention+SSM) are not modeled, so those models fail closed.
+INTERVAL_HYBRIDS = frozenset({'qwen3next', 'qwen35', 'qwen35moe'})
+ALL_RECURRENT = frozenset({'mamba', 'mamba2'})
+KV_ZERO_HYBRIDS = frozenset({'granitehybrid', 'nemotron_h', 'nemotron_h_moe', 'jamba', 'lfm2', 'lfm2moe'})
+UNMODELED_ARCHITECTURES = frozenset({'rwkv6', 'rwkv6qwen2', 'rwkv7', 'arwkv7', 'kimi-linear', 'kimi-k3',
+                                     'minimax-01', 'falcon-h1', 'plamo2', 'qwen4exp', 'deepseek4',
+                                     'glm5-next', 'bailingmoe3'})
+_UNMODELED_KEYS = ('.wkv.', '.kda.', '.ple.', '.attention.kv_lora_rank')
 
 
 def _align(value, alignment):
@@ -147,11 +209,143 @@ def _positive_int(value, name, maximum=2**31 - 1):
 
 
 def _per_layer(metadata, key, layers, default=None):
+    """A metadata value given once or once per block, as one entry per block.
+
+    Entries are non-negative integers (booleans count as 0/1), or None when the
+    key is absent and there is no default.
+    """
     value = metadata.get(key, default)
+    if isinstance(value, dict):
+        raise ModelError(f'{key} is an array too long to hold one entry per layer')
     values = value if isinstance(value, list) else [value] * layers
     if len(values) != layers:
         raise ModelError(f'{key} must have exactly {layers} layer entries')
-    return [_positive_int(v, key) for v in values]
+    result = []
+    for item in values:
+        if isinstance(item, bool):
+            item = int(item)
+        if item is not None and (type(item) is not int or not 0 <= item <= 2**31 - 1):
+            raise ModelError(f'{key} must hold non-negative bounded integers')
+        result.append(item)
+    return result
+
+
+def _count(metadata, key, default=0, maximum=2**31 - 1):
+    value = metadata.get(key, default)
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise ModelError(f'{key} must be a non-negative bounded integer')
+    return value
+
+
+def _layer_cache(metadata, arch, layers, main_layers, hidden, unsupported):
+    """Per-layer cache memory the pinned llama.cpp allocates for one sequence.
+
+    Returns full-context KV bytes per token, sliding-window KV bytes per token
+    (those layers keep only the window), and fixed recurrent-state bytes, for
+    every block, with an FP16 KV cache. Returns None after recording why the
+    layout is not modeled. Attention layers listed in llama.cpp's has_kv() but
+    sharing another layer's cache (Gemma's shared_kv_layers) keep none.
+    """
+    prefix = arch + '.'
+    if arch in UNMODELED_ARCHITECTURES or any(
+            marker in key for key in metadata if key.startswith(prefix) for marker in _UNMODELED_KEYS):
+        unsupported.append(f'The {arch!r} cache layout (RWKV, KDA, linear or latent attention) is not modeled')
+        return None
+    heads = _per_layer(metadata, prefix + 'attention.head_count', layers, 0)
+    kv_heads = [h if k is None else k for h, k in
+                zip(heads, _per_layer(metadata, prefix + 'attention.head_count_kv', layers))]
+    key_len = _per_layer(metadata, prefix + 'attention.key_length', layers)
+    value_len = _per_layer(metadata, prefix + 'attention.value_length', layers)
+    key_swa = _per_layer(metadata, prefix + 'attention.key_length_swa', layers)
+    value_swa = _per_layer(metadata, prefix + 'attention.value_length_swa', layers)
+    ssm = {name: _count(metadata, f'{prefix}ssm.{name}') for name in
+           ('conv_kernel', 'inner_size', 'state_size', 'group_count')}
+    shortconv = _count(metadata, prefix + 'shortconv.l_cache')
+    notes = []
+
+    if arch in INTERVAL_HYBRIDS:
+        if prefix + 'attention.recurrent_layers' in metadata:
+            recurrent = [bool(v) for v in _per_layer(metadata, prefix + 'attention.recurrent_layers', layers)]
+        else:
+            interval = _count(metadata, prefix + 'full_attention_interval', 4)
+            if not interval:
+                raise ModelError('full_attention_interval must be positive')
+            # NextN blocks are full-attention layers (src/models/qwen35.cpp).
+            recurrent = [il < main_layers and (il + 1) % interval != 0 for il in range(layers)]
+    elif arch in ALL_RECURRENT:
+        recurrent = [il < main_layers for il in range(layers)]
+    elif arch in KV_ZERO_HYBRIDS:
+        recurrent = [il < main_layers and kv_heads[il] == 0 for il in range(layers)]
+    elif ssm['inner_size'] or shortconv or prefix + 'attention.recurrent_layers' in metadata:
+        unsupported.append(f'The {arch!r} recurrent layer layout is not modeled')
+        return None
+    else:
+        recurrent = [False] * layers
+
+    state_bytes = 0
+    if any(recurrent):
+        # llama_hparams::n_embd_r() and n_embd_s(), stored as f32, one row each.
+        if shortconv:
+            conv_state = hidden * (shortconv - 1)
+        else:
+            conv_state = (ssm['conv_kernel'] - 1) * (ssm['inner_size'] + 2 * ssm['group_count'] * ssm['state_size']) \
+                if ssm['conv_kernel'] else 0
+        state_bytes = (conv_state + ssm['state_size'] * ssm['inner_size']) * 4
+        if not state_bytes:
+            unsupported.append('Recurrent layers without ssm/shortconv state sizes in the metadata')
+            return None
+
+    window = _count(metadata, prefix + 'attention.sliding_window')
+    swa = [False] * layers
+    if window:
+        pattern = metadata.get(prefix + 'attention.sliding_window_pattern')
+        if isinstance(pattern, list):
+            swa = [bool(v) for v in _per_layer(metadata, prefix + 'attention.sliding_window_pattern', layers)]
+        elif arch in DEFAULT_SWA_PATTERNS:
+            period, dense_first = DEFAULT_SWA_PATTERNS[arch]
+            if type(pattern) is int:   # a period in the file replaces the default one
+                period = pattern
+            swa = [il < main_layers and (period == 0 or (il % period != 0 if dense_first else il % period < period - 1))
+                   for il in range(layers)]
+        else:
+            # Count every attention layer at full context, which over-reserves.
+            notes.append('sliding-window layers are counted at full context: the file does not list them')
+    shared = _count(metadata, prefix + 'attention.shared_kv_layers', 0, layers - 1)
+    kv_from = layers - shared if shared else layers
+
+    def head_sizes(il):
+        implicit = hidden // heads[il] if heads[il] and not hidden % heads[il] else None
+        if swa[il]:
+            return key_swa[il] or key_len[il] or implicit, value_swa[il] or value_len[il] or implicit
+        return key_len[il] or implicit, value_len[il] or implicit
+
+    # The fleet runs with flash attention off, so the V cache is transposed and
+    # every layer's V rows take the model's widest V (n_embd_v_gqa_max(), over
+    # all blocks; llama-kv-cache.cpp).
+    v_widest = max((kv_heads[il] * (head_sizes(il)[1] or 0) for il in range(layers)), default=0)
+    kv_full, kv_window, state = [0] * layers, [0] * layers, [0] * layers
+    # Element counts per token, for any cache type: K and V per layer, and
+    # whether the layer keeps only the window. FP16 bytes above are kept for
+    # older callers; the planner prices these for the cache type it runs.
+    k_elements, v_elements, window_layer = [0] * layers, [0] * layers, [False] * layers
+    for il in range(layers):
+        if recurrent[il]:
+            state[il] = state_bytes
+            continue
+        # NextN blocks are outside the main context's cache (il < n_layer()).
+        if il >= main_layers or il >= kv_from or not kv_heads[il]:
+            continue
+        if heads[il] and heads[il] % kv_heads[il]:
+            raise ModelError('attention.head_count must be divisible by head_count_kv')
+        key, value = head_sizes(il)
+        if not key or not value:
+            raise ModelError(f'Layer {il} has no attention head size (key_length/value_length, '
+                             'or embedding_length divisible by head_count)')
+        (kv_window if swa[il] else kv_full)[il] = (kv_heads[il] * key + v_widest) * 2
+        k_elements[il], v_elements[il], window_layer[il] = kv_heads[il] * key, kv_heads[il] * value, swa[il]
+    return dict(kv_full=kv_full, kv_window=kv_window, state=state,
+                window=window if any(kv_window) else 0, recurrent=sum(recurrent), notes=notes,
+                k_elements=k_elements, v_elements=v_elements, window_layer=window_layer, v_widest=v_widest)
 
 
 def inspect_file(path) -> dict:
@@ -159,9 +353,13 @@ def inspect_file(path) -> dict:
 
     Invalid structure raises ModelError. Unsupported, well-formed models return
     supported=False and explanatory unsupported_reasons; never plan those models.
-    layer_bytes/input_bytes/output_bytes include actual tensor storage spans and
-    padding. Tied embeddings are additionally charged to the output stage. The
-    file header is reported separately, not presented as resident tensor memory.
+    layer_bytes/input_bytes/output_bytes/per_worker_bytes include actual tensor
+    storage spans and padding, for any architecture: memory follows where the
+    pinned llama.cpp places each tensor, not its name. Tied embeddings are
+    additionally charged to the output stage; NextN blocks' weights (mtp_bytes)
+    are not resident. Per block, the cache is full-context KV bytes per token,
+    sliding-window KV bytes per token, or a fixed recurrent state. The file
+    header is reported separately, not presented as resident tensor memory.
     """
     path = Path(path)
     try:
@@ -190,7 +388,9 @@ def inspect_file(path) -> dict:
                 if not key or key in metadata:
                     raise ModelError('Empty or duplicate GGUF metadata key')
                 kind = reader.unpack('I')
-                metadata[key] = reader.value(kind, retain=key in _ARRAY_KEYS)
+                # Keep per-layer arrays (head counts, window and recurrent
+                # flags); vocabularies are validated but not retained.
+                metadata[key] = reader.value(kind, retain=not key.startswith('tokenizer.'))
             alignment = metadata.get('general.alignment', 32)
             if type(alignment) is not int or alignment < 1 or alignment > 1024**2 or alignment & (alignment - 1):
                 raise ModelError('GGUF alignment must be a bounded power of two')
@@ -246,119 +446,100 @@ def inspect_file(path) -> dict:
     architecture = metadata.get('general.architecture', '')
     if not isinstance(architecture, str) or not architecture:
         raise ModelError('Missing general.architecture string')
-    if architecture not in ('llama', 'qwen2'):
-        unsupported.append(f'Unsupported architecture {architecture!r}; only standard dense llama/qwen2 are supported. Hybrid/recurrent KV layouts are not inferred.')
     if any(key.startswith('split.') for key in metadata) or re.search(r'-\d{5}-of-\d{5}\.gguf$', path.name):
         unsupported.append('Split GGUF files are unsupported; supply a complete merged single-file model')
     if metadata.get('general.type', 'model') != 'model':
         unsupported.append('Only complete model GGUF files are supported (not adapters or vocabularies)')
     layers = _positive_int(metadata.get(f'{architecture}.block_count'), 'block_count', MAX_LAYERS)
     hidden = _positive_int(metadata.get(f'{architecture}.embedding_length'), 'embedding_length')
-    for suffix in ('expert_count', 'expert_used_count'):
-        if metadata.get(f'{architecture}.{suffix}', 0) != 0:
-            unsupported.append('Mixture-of-experts models are unsupported')
-            break
-    if any('.ssm.' in k or '.recurrent.' in k for k in metadata):
-        unsupported.append('Hybrid/recurrent model state is unsupported')
+    # Multi-token-prediction (NextN) blocks follow the main stack. llama-server
+    # loads their weights only with load_mtp, off by default, so they are not
+    # resident; the blocks still take a tensor-split slot and a KV cache.
+    nextn = _count(metadata, f'{architecture}.nextn_predict_layers', 0, layers - 1)
+    main_layers = layers - nextn
     layer_bytes = [0] * layers
     input_bytes = tensors[0]['offset']
-    output_bytes = 0
-    block_names = [set() for _ in range(layers)]
+    output_bytes = per_worker_bytes = first_worker_bytes = mtp_bytes = 0
     by_name = {t['name']: t for t in tensors}
-    shared = []
+    unplaced, unsplittable = [], []
     for tensor in tensors:
-        name = tensor['name']
+        name, span = tensor['name'], tensor['span_bytes']
         match = _BLOCK.fullmatch(name)
         if match:
             layer = int(match.group(1))
             if layer >= layers:
                 raise ModelError('Tensor block index exceeds declared block_count')
-            layer_bytes[layer] += tensor['span_bytes']
-            block_names[layer].add(match.group(2))
-            if any(marker in name for marker in ('_exps.', '_shexp.', 'ssm_', 'recurrent')):
-                unsupported.append('Expert/hybrid tensor layout is unsupported')
-        elif name.startswith('blk.'):
+            if layer >= main_layers:
+                mtp_bytes += span
+            else:
+                layer_bytes[layer] += span
+            continue
+        if name.startswith('blk.'):
             raise ModelError(f'Malformed block tensor name {name}')
-        elif name.startswith(('output.', 'output_norm.')):
-            output_bytes += tensor['span_bytes']
+        base = name.rsplit('.', 1)[0] if name.endswith(('.weight', '.bias')) else name
+        if base in INPUT_TENSORS:
+            input_bytes += span
+        elif base in PER_WORKER_TENSORS:
+            per_worker_bytes += span
+        elif base in FIRST_WORKER_TENSORS:
+            first_worker_bytes += span
         else:
-            input_bytes += tensor['span_bytes']
-            shared.append(name)
-    # Unknown shared tensors still consume memory. They also prevent declaring
-    # an unfamiliar graph to be a supported dense transformer.
-    # The pinned llama loader may duplicate RoPE weight tensors across devices.
-    # Refuse those layouts until replication is modeled, rather than charge a
-    # single host copy and undercount each remote stage.
-    if any('rope_freqs' in name or 'rope_factors' in name for name in by_name):
-        unsupported.append('RoPE weight-tensor replication across RPC devices is not yet modeled')
-    known_shared = {'token_embd.weight'}
-    unfamiliar = sorted(set(shared) - known_shared)
-    if unfamiliar:
-        unsupported.append('Unrecognized shared tensors: ' + ', '.join(unfamiliar[:8]))
-    for required in ('token_embd.weight', 'output_norm.weight'):
-        if required not in by_name:
-            unsupported.append(f'Missing required shared tensor {required}')
-    allowed_block = set(_REQUIRED) | {name.replace('.weight', '.bias') for name in _REQUIRED}
-    allowed_block |= {'rope_freqs.weight'}
-    for layer, available in enumerate(block_names):
-        unfamiliar_block = available - allowed_block
-        if unfamiliar_block:
-            unsupported.append(f'Block {layer} has unrecognized tensors: ' + ', '.join(sorted(unfamiliar_block)[:8]))
-        missing = set(_REQUIRED) - available
-        if missing:
-            unsupported.append(f'Block {layer} is incomplete: missing ' + ', '.join(sorted(missing)))
-    tied = 'output.weight' not in by_name and 'token_embd.weight' in by_name
-    replicated = by_name['token_embd.weight']['span_bytes'] if tied else 0
+            # Charged to the output worker in every case; unknown names are
+            # also refused, since llama.cpp would not know where to put them.
+            output_bytes += span
+            if name.startswith(UNSPLITTABLE_PREFIXES):
+                unsplittable.append(name)
+            elif base not in OUTPUT_TENSORS and not base.startswith(OUTPUT_PREFIXES):
+                unplaced.append(name)
+    if unsplittable:
+        unsupported.append('Encoder-decoder and audio-codec layouts are not split by layer: ' + ', '.join(unsplittable[:4]))
+    if unplaced:
+        unsupported.append('Tensors outside the blocks that the pinned llama.cpp does not place: ' + ', '.join(unplaced[:8]))
+    embedding = by_name.get('token_embd.weight')
+    if embedding is None:
+        unsupported.append('Missing token_embd.weight')
+    elif len(embedding['shape']) != 2 or embedding['shape'][0] != hidden:
+        raise ModelError('token_embd.weight shape disagrees with embedding_length')
+    if 'output_norm.weight' in by_name and by_name['output_norm.weight']['shape'] != [hidden]:
+        raise ModelError('output_norm.weight shape disagrees with embedding_length')
+    if 'output.weight' in by_name and by_name['output.weight']['shape'][0] != hidden:
+        raise ModelError('output.weight shape disagrees with embedding_length')
+    # A model without output.weight reuses token_embd as its output head;
+    # llama.cpp duplicates it onto the output device.
+    tied = 'output.weight' not in by_name and embedding is not None
+    replicated = embedding['span_bytes'] if tied else 0
     output_bytes += replicated
-    kv = []
-    # Only compute KV for a supported architecture with a complete known graph.
+    cache = None
     if not unsupported:
-        heads = _per_layer(metadata, f'{architecture}.attention.head_count', layers)
-        kv_heads = _per_layer(metadata, f'{architecture}.attention.head_count_kv', layers, heads)
-        key_lengths = metadata.get(f'{architecture}.attention.key_length')
-        value_lengths = metadata.get(f'{architecture}.attention.value_length')
-        for layer in range(layers):
-            if heads[layer] % kv_heads[layer]:
-                raise ModelError('attention.head_count must be divisible by head_count_kv')
-            if hidden % heads[layer] and (key_lengths is None or value_lengths is None):
-                raise ModelError('embedding_length must be divisible by head_count for implicit head sizes')
-        default_dims = [hidden // count for count in heads]
-        key_dims = _per_layer(metadata, f'{architecture}.attention.key_length', layers, default_dims)
-        value_dims = _per_layer(metadata, f'{architecture}.attention.value_length', layers, default_dims)
-        embedding = by_name['token_embd.weight']['shape']
-        if len(embedding) != 2 or embedding[0] != hidden:
-            raise ModelError('token_embd.weight shape disagrees with embedding_length')
-        if by_name['output_norm.weight']['shape'] != [hidden]:
-            raise ModelError('output_norm.weight shape disagrees with embedding_length')
-        if not tied and by_name['output.weight']['shape'] != embedding:
-            raise ModelError('output.weight shape disagrees with token embedding')
-        for layer in range(layers):
-            prefix = f'blk.{layer}.'
-            expected = {'attn_norm.weight': [hidden], 'ffn_norm.weight': [hidden],
-                        'attn_q.weight': [hidden, heads[layer] * key_dims[layer]],
-                        'attn_k.weight': [hidden, kv_heads[layer] * key_dims[layer]],
-                        'attn_v.weight': [hidden, kv_heads[layer] * value_dims[layer]],
-                        'attn_output.weight': [heads[layer] * value_dims[layer], hidden]}
-            for suffix, shape in expected.items():
-                if by_name[prefix + suffix]['shape'] != shape:
-                    raise ModelError(f'{prefix + suffix} shape disagrees with attention metadata')
-            gate = by_name[prefix + 'ffn_gate.weight']['shape']
-            if len(gate) != 2 or gate[0] != hidden or by_name[prefix + 'ffn_up.weight']['shape'] != gate or by_name[prefix + 'ffn_down.weight']['shape'] != [gate[1], hidden]:
-                raise ModelError(f'Block {layer} feed-forward shapes are inconsistent')
-            kv.append(kv_heads[layer] * (key_dims[layer] + value_dims[layer]) * 2)
+        cache = _layer_cache(metadata, architecture, layers, main_layers, hidden, unsupported)
+    if cache is None:
+        cache = dict(kv_full=[], kv_window=[], state=[], window=0, recurrent=0, notes=[],
+                     k_elements=[], v_elements=[], window_layer=[], v_widest=0)
     unsupported = list(dict.fromkeys(unsupported))
     identity = hashlib.sha256((header_hash + ':' + str(size)).encode('ascii')).hexdigest()
+    has_cache = not unsupported
     return {
         'model_id': 'gguf-meta-sha256:' + identity,
         'identity_kind': 'metadata-only-sha256',
         'format': 'gguf', 'gguf_version': 3, 'architecture': architecture,
         'name': metadata.get('general.name', path.name),
         'supported': not unsupported, 'unsupported_reasons': unsupported,
+        'notes': cache['notes'],
         'layer_count': layers, 'layer_bytes': layer_bytes,
-        'input_bytes': input_bytes, 'output_bytes': output_bytes,
-        'kv_bytes_per_layer_per_token': kv, 'kv_cache_dtype': 'fp16' if kv else None,
-        'kv_element_bytes': 2 if kv else None,
-        'kv_elements_per_layer_per_token': [value // 2 for value in kv],
+        'mtp_layers': nextn, 'mtp_bytes': mtp_bytes,
+        'input_bytes': input_bytes, 'output_bytes': output_bytes, 'per_worker_bytes': per_worker_bytes,
+        'first_worker_bytes': first_worker_bytes,
+        'kv_bytes_per_layer_per_token': cache['kv_full'],
+        'swa_kv_bytes_per_layer_per_token': cache['kv_window'],
+        'sliding_window': cache['window'],
+        'state_bytes_per_layer': cache['state'],
+        'recurrent_layer_count': cache['recurrent'],
+        'kv_cache_dtype': 'fp16' if has_cache else None,
+        'kv_element_bytes': 2 if has_cache else None,
+        'kv_elements_per_layer_per_token': [value // 2 for value in cache['kv_full']],
+        'k_elements_per_layer': cache['k_elements'], 'v_elements_per_layer': cache['v_elements'],
+        'window_layer_flags': cache['window_layer'], 'v_widest_elements': cache['v_widest'],
+        'expert_count': metadata.get(f'{architecture}.expert_count', 0),
         'context_length': _positive_int(metadata[f'{architecture}.context_length'], 'context_length') if f'{architecture}.context_length' in metadata else None,
         'hidden_size': hidden, 'file_size_bytes': size, 'tensor_count': len(tensors),
         'header_bytes': data_offset, 'tensor_storage_bytes': size - data_offset,
