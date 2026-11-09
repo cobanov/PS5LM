@@ -1,13 +1,17 @@
 # Driver patches
 
-Three patches to PS5_Mesa's RADV, from [PS5CEMU-HAR](https://github.com/premohq/PS5CEMU-HAR)
-(`patches/mesa`, GPL-3.0), applied on top of the Mesa revision PS5_Vulkan pins (`1ba9874`):
+Four patches to PS5_Mesa's RADV, from [PS5CEMU-HAR](https://github.com/premohq/PS5CEMU-HAR)
+(`patches/mesa`, GPL-3.0), applied on top of the Mesa revision PS5_Vulkan pins (`1ba9874`), and one of PS5LM's own:
 
 - `0007`: a destroyed buffer's memory waits until the GPU is done with it, so freed memory
   still in use cannot fault the GPU and stop the console. Always on.
 - `0008`: submissions handed to a thread of the driver's own (`RADV_PS5_SUBMIT_THREAD=1`).
 - `0009`: how long a wait for the GPU spins and sleeps (`RADV_PS5_WAIT_SPIN_US`,
   `RADV_PS5_WAIT_SLEEP_US`).
+
+- `0010` (PS5LM): the submission statistics line only with `RADV_PS5_SUBMIT_STATS=1`. It was
+  printed with the submit lock held, and a blocked write to `app.log` stopped generation until
+  the app restarted.
 
 0008 and 0009 change nothing unless asked. On the console neither made generation faster
 (2026-10-16, Qwen3.5 0.8B and 9B), so the app does not ask. Put the switches in
