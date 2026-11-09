@@ -5,6 +5,14 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
+  makes it delete `fleet-worker.txt` and restart as the app, the way a model change
+  restarts it. Before, a worker could only quit, and someone had to open PS5LM again
+  on the console.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
