@@ -883,6 +883,8 @@ int main(int, char **) {
     fonts.pixel = fonts.mono;
     fonts.hand = fonts.regular;
     ps5lm::log_line("dashboard %s\n", ui_ok ? "ready" : "failed");
+    // What the screen and the dashboard took, apart from the GPU's own start-up.
+    log_memory("after the screen", false);
 
     Dashboard dash(fonts);
     DashboardFrame frame;
@@ -967,6 +969,12 @@ int main(int, char **) {
                 display.swap();
             } else {
                 sceKernelUsleep(16667);
+            }
+            if (n == 120 || (n % 60 == 30 && !take_request_file("/data/PS5LM/memory").empty())) {
+                // What the worker holds: once it has started, and when asked
+                // (fleet's memory request, with a model loaded by the host).
+                // The pool figures only; asking ggml here could race the worker.
+                log_memory(n == 120 ? "worker started" : "worker asked", false);
             }
             if (n % 60 == 0) {
                 quit_if_asked();  // Existing safe title-close path; not cancellation in a GPU call.
