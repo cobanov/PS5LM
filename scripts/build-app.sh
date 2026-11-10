@@ -31,6 +31,12 @@ param="$sce_sys/param.json"
 for f in "$archive" "$tool" "$vk/runtime/libc.prx" "$sdk/bin/prospero-lld" "$glsdk/lib/libPS5OpenGL.a"; do
     [ -e "$f" ] || { echo "build-app: missing $f" >&2; exit 2; }
 done
+# patches/mesa is applied by hand, not here. Without 0010 a blocked write of the
+# driver's statistics line stops generation, so refuse an archive built without it.
+if ! grep -aq RADV_PS5_SUBMIT_STATS "$archive"; then
+    echo "build-app: $archive lacks patches/mesa/0010; rebuild RADV as patches/mesa/README.md says" >&2
+    exit 2
+fi
 export PS5_PAYLOAD_SDK="$sdk" PS5_VULKAN_ROOT="$vk"
 
 # radv-link.sh takes Clang's builtins from <resource dir>/lib/linux/, where

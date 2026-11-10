@@ -1,7 +1,8 @@
 # Driver patches
 
-Four patches to PS5_Mesa's RADV, from [PS5CEMU-HAR](https://github.com/premohq/PS5CEMU-HAR)
-(`patches/mesa`, GPL-3.0), applied on top of the Mesa revision PS5_Vulkan pins (`1ba9874`), and one of PS5LM's own:
+Four patches to PS5_Mesa's RADV, applied on top of the Mesa revision PS5_Vulkan pins (`1ba9874`):
+three from [PS5CEMU-HAR](https://github.com/premohq/PS5CEMU-HAR) (`patches/mesa`, GPL-3.0) and one
+of PS5LM's own. `scripts/build-app.sh` does not apply them; it stops if the RADV archive lacks `0010`.
 
 - `0007`: a destroyed buffer's memory waits until the GPU is done with it, so freed memory
   still in use cannot fault the GPU and stop the console. Always on.
