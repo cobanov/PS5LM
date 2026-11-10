@@ -849,12 +849,13 @@ int main(int, char **) {
     setenv("HOME", data_root().c_str(), 0);
     setenv("LLAMA_CACHE", data_path("cache").c_str(), 0);
     // Driver and backend switches to measure with, one NAME=value a line in
-    // env.txt, set before the GPU opens; only the driver's, ggml's and llama's.
+    // env.txt, set before the GPU opens; only the driver's, ggml's, llama's and
+    // the app's own (PS5LM_WORKER_SCREEN, below).
     for (const auto & line : read_lines(g_files.env)) {
         const size_t eq = line.find('=');
         const std::string name = line.substr(0, eq == std::string::npos ? 0 : eq);
         bool known = false;
-        for (const char * prefix : { "RADV_", "MESA_", "ACO_", "GGML_", "LLAMA_" }) {
+        for (const char * prefix : { "RADV_", "MESA_", "ACO_", "GGML_", "LLAMA_", "PS5LM_" }) {
             known = known || name.rfind(prefix, 0) == 0;
         }
         if (known) {
@@ -868,15 +869,26 @@ int main(int, char **) {
     // of it: the pool size follows sce_sys/param.json.
     log_memory("at start", false);
 
+    // Fleet worker or not, before the screen: a worker started with
+    // PS5LM_WORKER_SCREEN=off in env.txt opens no screen at all. The screen and
+    // the dashboard take about 350 MiB of the pool (measured), which a console
+    // that is only a worker can give to the model instead.
+    const FleetWorkerConfig fleet = read_fleet_worker_config(kFleetWorker);
+    const char * worker_screen = getenv("PS5LM_WORKER_SCREEN");
+    const bool headless = fleet.state == FleetWorkerConfig::enabled && worker_screen &&
+                          std::strcmp(worker_screen, "off") == 0;
+
     // The screen first: it takes from the same memory as the model.
     Display display;
-    if (!display.open(1920, 1080)) {
+    if (headless) {
+        ps5lm::log_line("fleet worker without a screen (PS5LM_WORKER_SCREEN=off)\n");
+    } else if (!display.open(1920, 1080)) {
         ps5lm::log_line("no display\n");
     }
     hui::gfx::Renderer renderer;
     hui::gfx::Font regular, semibold, headline, mono;
     hui::ui::Fonts fonts;
-    const bool ui_ok = renderer.init() && load_font(renderer, "manrope-500.huifont", &regular, &fonts.regular) &&
+    const bool ui_ok = !headless && renderer.init() && load_font(renderer, "manrope-500.huifont", &regular, &fonts.regular) &&
                        load_font(renderer, "manrope-600.huifont", &semibold, &fonts.semibold) &&
                        load_font(renderer, "manrope-200.huifont", &headline, &fonts.display) &&
                        load_font(renderer, "dejavu-sans-mono.huifont", &mono, &fonts.mono);
@@ -910,14 +922,17 @@ int main(int, char **) {
         render();
         display.swap();
     }
-    sceSystemServiceHideSplashScreen();
+    // A worker without a screen leaves the system's splash up: something on
+    // the TV, drawn by the system, from none of the app's memory.
+    if (!headless) {
+        sceSystemServiceHideSplashScreen();
+    }
 
     // Fleet is a mutually exclusive startup mode, not another local model.
     // In particular, do not start StatsCollector (its HTTP probes), model
     // auto-load, downloads, or controller/file commands that could restart or
     // allocate memory behind the remote controller's back. Malformed config
     // stays here, with no listener and no fallback into normal model mode.
-    const FleetWorkerConfig fleet = read_fleet_worker_config(kFleetWorker);
     if (fleet.state != FleetWorkerConfig::disabled) {
         std::atomic<bool> stopped{ false };
         std::string worker_error = fleet.error;
@@ -955,13 +970,17 @@ int main(int, char **) {
         hui::ui::Feedback quiet;
         // Upstream's blocking API has no readiness callback: do not label this
         // as Ready. The host's successful RPC handshake verifies availability.
+        if (headless) {
+            ps5lm::log_line("fleet worker on %s, no screen: no authentication, isolated LAN only\n",
+                            fleet.endpoint.c_str());
+        }
         for (uint64_t n = 0;; ++n) {
             const bool failed = stopped.load(std::memory_order_acquire);
-            dash.set_busy(failed ? "Fleet worker stopped" : "Experimental fleet RPC worker",
-                failed ? worker_error : fleet.endpoint + " - no authentication; isolated LAN only");
-            quiet.clear();
-            dash.update(hui::InputFrame{}, 1.0f / 60.0f, quiet);
             if (ui_ok) {
+                dash.set_busy(failed ? "Fleet worker stopped" : "Experimental fleet RPC worker",
+                    failed ? worker_error : fleet.endpoint + " - no authentication; isolated LAN only");
+                quiet.clear();
+                dash.update(hui::InputFrame{}, 1.0f / 60.0f, quiet);
                 render();
                 if (n % 60 == 45 && !take_request_file("/data/PS5LM/screenshot").empty()) {
                     save_screen("/data/PS5LM/screen.bmp", display.width(), display.height());
