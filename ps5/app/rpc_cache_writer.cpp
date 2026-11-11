@@ -1,7 +1,7 @@
 // The fleet worker's weight cache files (patches/fleet/0005), written
 // through ftpsrv. The console slows a title's own writes to /data to about
 // 1.2 MB/s after the first 2 GB (#41, docs/CONSOLE.md): the first load of a
-// model through the cache took most of an hour that way. ftpsrv, a payload,
+// model through the cache would have taken about half an hour that way. ftpsrv, a payload,
 // writes at 80 MB/s and more, as it does for downloads (ftp_writer.hpp).
 // Only the RPC server's thread calls this, one tensor at a time.
 //

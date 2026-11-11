@@ -8,14 +8,17 @@ a temporary name and renamed once whole, and a file is used only when its
 FNV-1a hash is the one the client sent and it fits the tensor's buffer;
 anything else is a miss, dropped, and sent again. A used file gets the time of
 its use, so a cache kept to a size can drop the least recently used first.
+Files are read through an 8 MiB buffer: a PS5 title's every read call takes
+about 1.4 ms, so the stream's small reads came to about 120 MB/s, slower than
+gigabit Ethernet; 8 MiB reads run at 2 GB/s.
 
 On a PS5, the console slows a title's own writes to /data to about 1.2 MB/s
 after the first 2 GB (PS5LM #41), while ftpsrv, a payload, writes at 80 MB/s
-and more: the first load of a model through the worker's cache took most of an
-hour. A title that defines ps5lm_rpc_cache_write (PS5LM does) writes each file
-with it; -1 is "not cached this time", for a title without ftpsrv, which says
-why once instead of an error for every tensor. Other builds do not define it
-and write the files themselves.
+and more: the first load of a model through the worker's cache would have
+taken about half an hour. A title that defines ps5lm_rpc_cache_write (PS5LM
+does) writes each file with it; -1 is "not cached this time", for a title
+without ftpsrv, which says why once instead of an error for every tensor. Other
+builds do not define it and write the files themselves.
 
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
@@ -94,7 +97,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      if (!cache_dir) {
          return false;
      }
-@@ -1826,12 +1859,24 @@
+@@ -1826,12 +1859,31 @@
      if (!fs::exists(cache_file, ec)) {
          return false;
      }
@@ -108,12 +111,19 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +    // or bigger than the room in the tensor's buffer is a miss and is dropped
 +    // (the client then sends the data, and it is saved again)
 +    const uintmax_t size = fs::file_size(cache_file, ec);
++    FILE * f = std::fopen(cache_file.string().c_str(), "rb");
++    if (f == nullptr) {
++        return false;   // gone since (a cache kept to a size dropped it): a miss
++    }
++    // in 8 MiB reads: a PS5 title's every read call takes about 1.4 ms, so a
++    // stream's small reads came to about 120 MB/s, and 8 MiB ones read 2 GB/s
++    std::setvbuf(f, nullptr, _IOFBF, 8u << 20);
 +    bool ok = !ec && size > 0 && size <= max_size;
 +    if (ok) {
-+        std::ifstream ifs(cache_file, std::ios::binary);
 +        data.resize((size_t) size);
-+        ok = ifs.read((char *)data.data(), (std::streamsize) size) && fnv_hash(data.data(), data.size()) == hash;
++        ok = std::fread(data.data(), 1, data.size(), f) == data.size() && fnv_hash(data.data(), data.size()) == hash;
 +    }
++    std::fclose(f);
 +    if (!ok) {
 +        LOG_ERROR("[%s] '%s' does not hold the tensor it names; dropped\n", __func__, cache_file.string().c_str());
 +        data.clear();
@@ -125,7 +135,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      return true;
  }
  
-@@ -1852,8 +1897,13 @@
+@@ -1852,8 +1904,13 @@
          return false;
      }
  
