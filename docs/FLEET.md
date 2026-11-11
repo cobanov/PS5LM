@@ -33,7 +33,9 @@ GPU host build (`PS5LM_FLEET_GPU`), its GPU.
    nodes.json` shows which layers go where; `python3 -m fleet serve ...
    --ack-insecure-rpc` starts one llama-server on `127.0.0.1:8081` of the PC
    ([Plan and serve](#plan-and-serve-from-the-controller)).
-5. **Back to normal:** delete `fleet-worker.txt` and restart PS5LM.
+5. **Back to normal:** delete `fleet-worker.txt` and restart PS5LM, or put a
+   `/data/PS5LM/leave-worker` file on it: a worker takes it within a second and
+   restarts as the app (PS5LM after v0.11.0).
 
 Dense `llama` and `qwen2` GGUFs only; Qwen 3.5/3.8 (`qwen35`) is refused. RPC
 has no authentication: keep workers on a network you trust. On macOS, the app
@@ -210,6 +212,41 @@ has no ready callback, so the host must successfully handshake. A malformed,
 unreadable, non-regular or oversized config fails closed without starting the
 normal model server. No config keeps ordinary PS5LM behaviour. Remove this file
 and restart to return to single-console serving.
+
+A worker takes three request files, checked once a second:
+
+- `/data/PS5LM/quit` closes the title.
+- `/data/PS5LM/leave-worker` (PS5LM after v0.11.0) deletes `fleet-worker.txt` and
+  restarts the title the way a model change does, so it comes back as the app
+  without anyone at the console.
+- `/data/PS5LM/unload` (after v0.11.0 too), which restarts the app, restarts a
+  worker as a worker. It reads `env.txt` again, so its settings change without
+  anyone at the console.
+
+On the 2026-11-09 console run (one PS5 on firmware 11.60), worker mode took 3 s to
+start, and the app was back and taking requests 6 s after `leave-worker`. On
+2026-11-11 the same console's worker answered again 4 s after `unload`.
+
+### A worker without its screen
+
+`PS5LM_WORKER_SCREEN=off` in `/data/PS5LM/env.txt` (PS5LM after v0.11.0) starts a
+worker without its screen. The screen and the dashboard take about 350 MiB of the
+title's memory pool, which the model can have instead. The TV keeps the system's
+splash screen, the notification about unauthenticated RPC still shows, and
+`app.log` says what the worker does. A worker logs its memory once it has started
+(`memory worker started`), and again when `/data/PS5LM/memory` is there.
+
+The free memory the worker reports to the host, on one PS5 on 11.60:
+
+| Worker | Free |
+|---|---|
+| With its screen | 11,854 MiB |
+| Without it | 12,217 MiB |
+| Without it, with the 256 MiB flexible pool ([CONSOLE.md](CONSOLE.md#the-native-app-on-the-gpu)) | 12,409 MiB |
+
+For Qwen3.8-27B-UD-Q4_K_XL split over that PS5 and an RTX 3080, llama.cpp's own
+projection (`llama-fit-params`) then fits a 192k context with a q4_0 cache, where
+160k fit before.
 
 **Restart the worker title between different model runs and after errors.**
 PS5LM documents retained Vulkan memory after in-process unload; this increment
