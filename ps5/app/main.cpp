@@ -1020,6 +1020,15 @@ int main(int, char **) {
                     log_sink_flush(1000);
                     sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
                 }
+                // `unload`, as it restarts the app: here it restarts the worker,
+                // which reads env.txt again (PS5LM_WORKER_SCREEN, say) and
+                // gives back everything a host left allocated.
+                if (!take_request_file("/data/PS5LM/unload").empty()) {
+                    ps5lm::log_line("fleet: restarting the worker\n");
+                    std::fflush(nullptr);
+                    log_sink_flush(1000);
+                    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+                }
             }
         }
     }
