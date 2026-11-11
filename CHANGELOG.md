@@ -12,6 +12,19 @@ v0.1.x are the upstream payload releases by cobanov.
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
   on the console.
+- **A fleet worker without its screen**: `PS5LM_WORKER_SCREEN=off` in `env.txt`
+  starts a worker without its screen and dashboard. That leaves about 350 MiB more
+  for the model: on a console the worker reported 12,217 MiB free instead of 11,854.
+- **A fleet worker restarts on request**: `/data/PS5LM/unload`, which restarts the
+  app, restarts a worker as a worker. It reads `env.txt` again, so its settings
+  change without anyone at the console.
+- A worker logs its memory once it has started, and when `/data/PS5LM/memory` is there.
+
+### Changed
+- **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
+  (the system's default is 448 MiB), so the direct pool, where models go, is
+  12.1875 GiB instead of 12. It applies when the app starts from the home screen,
+  not when it restarts for a model.
 
 ## [0.11.0] - 2026-11-02
 
