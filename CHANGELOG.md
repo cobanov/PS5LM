@@ -44,6 +44,15 @@ v0.1.x are the upstream payload releases by cobanov.
   - **`python3 -m fleet ctl`**: the same from a shell or an agent, as JSON:
     `status`, `pool add --auto`, `pool start --wait`, `device leave`, and
     `config` / `apply` for the whole configuration.
+  - **A console's worker settings**, on the page or with `ctl device set`:
+    `screen` (off by default, about 350 MiB more for the model) and `cache_gib`
+    (32 by default: the weights its worker keeps, so a reload reads them on the
+    console). They go into its env.txt; a change restarts an idle worker, and one
+    in use takes it at its next restart. The page shows what each cache holds.
+    New actions: **restart** (a worker as a worker, with its settings) and
+    **clear-cache**.
+  - Consoles keep back 512 MiB for llama.cpp's compute buffers by default, GPUs
+    and RPC servers 1024.
   - A version 1 `control.json` (one list of workers) becomes devices and a stopped
     pool.
 - **Long contexts in a split**:

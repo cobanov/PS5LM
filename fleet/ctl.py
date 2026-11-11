@@ -12,11 +12,16 @@
 
   device add ID --kind ps5|gpu|rpc [--address IP] [--port N] [--device CUDA0]
              [--memory-mib N] [--reserve-mib N] [--tag T]... [--disabled]
+             [--screen] [--cache-gib N]
   device set ID KEY=VALUE...   e.g. memory_mib=null enabled=false tags='["rack1"]'
+                               a console's worker: screen=true (default false: about
+                               350 MiB more for the model), cache_gib=64 (default 32,
+                               0 for none: the weights it keeps, so a reload is local)
   device rm ID
-  device worker|leave|quit|unload ID [--wait]
+  device worker|leave|restart|quit|unload|clear-cache ID [--wait]
                                a console: into worker mode, out of it (PS5LM restarts as
-                               the app), quit PS5LM, or unload its model
+                               the app), restart it as it is (with its settings), quit
+                               PS5LM, unload its model, or delete its cached weights
   device worker|stop ID        a local GPU: start or stop its RPC worker
 
   pool add ID --model PATH|URL [--sha256 HEX] [--context N] [--slots N] [--shared-context]
@@ -161,11 +166,13 @@ def parser():
     add.add_argument('--reserve-mib', type=int)
     add.add_argument('--tag', action='append')
     add.add_argument('--disabled', action='store_true')
+    add.add_argument('--screen', action='store_true', help='a console: keep its screen as a worker')
+    add.add_argument('--cache-gib', type=int, help="a console: GiB of weights its worker keeps (default 32, 0: none)")
     edit = device.add_parser('set')
     edit.add_argument('id')
     edit.add_argument('pairs', nargs='+', metavar='KEY=VALUE')
     device.add_parser('rm').add_argument('id')
-    for action in ('worker', 'leave', 'quit', 'unload', 'stop'):
+    for action in ('worker', 'leave', 'restart', 'quit', 'unload', 'clear-cache', 'stop'):
         command = device.add_parser(action)
         command.add_argument('id')
         command.add_argument('--wait', action='store_true', help='wait for the action to finish')
@@ -232,13 +239,15 @@ def run(args):
     if command == 'device':
         if action == 'add':
             body = dict(id=args.id, kind=args.kind)
-            for key in ('address', 'port', 'device', 'memory_mib', 'reserve_mib'):
+            for key in ('address', 'port', 'device', 'memory_mib', 'reserve_mib', 'cache_gib'):
                 if getattr(args, key) is not None:
                     body[key] = getattr(args, key)
             if args.tag:
                 body['tags'] = args.tag
             if args.disabled:
                 body['enabled'] = False
+            if args.screen:
+                body['screen'] = True
             return call(url, '/api/devices/add', body)
         if action == 'set':
             return call(url, '/api/devices/update', dict(pairs(args.pairs), id=args.id))
