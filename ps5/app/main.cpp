@@ -934,10 +934,28 @@ int main(int, char **) {
     // allocate memory behind the remote controller's back. Malformed config
     // stays here, with no listener and no fallback into normal model mode.
     if (fleet.state != FleetWorkerConfig::disabled) {
+        // The weight cache, if env.txt asks for one: what cut-off writes left is
+        // removed and the rest kept to its size before the worker starts.
+        const RpcCache cache = rpc_cache_config(getenv("PS5LM_RPC_CACHE_GB"), "/data/PS5LM/rpc-cache");
+        const auto log_cache = [&](const RpcCacheUse & use, const char * when) {
+            ps5lm::log_line("fleet: weight cache %s: %.2f of %.0f GiB in %s, %llu files%s", when, use.bytes / 1073741824.0,
+                            cache.limit / 1073741824.0, cache.dir.c_str(), (unsigned long long) use.files,
+                            use.dropped ? "" : "\n");
+            if (use.dropped) {
+                std::printf(" (dropped %llu, %.2f GiB)\n", (unsigned long long) use.dropped, use.dropped_bytes / 1073741824.0);
+            }
+        };
+        if (!cache.error.empty()) {
+            ps5lm::log_line("fleet: %s\n", cache.error.c_str());
+        } else if (cache.dir.empty()) {
+            ps5lm::log_line("fleet: no weight cache (PS5LM_RPC_CACHE_GB in env.txt)\n");
+        } else if (fleet.state == FleetWorkerConfig::enabled) {
+            log_cache(prune_rpc_cache(cache, true), "at start");
+        }
         std::atomic<bool> stopped{ false };
         std::string worker_error = fleet.error;
         std::function<void()> worker = [&] {
-            worker_error = run_fleet_worker(fleet);
+            worker_error = run_fleet_worker(fleet, cache);
             std::printf("ps5lm-fleet: %s\n", worker_error.c_str());
             stopped.store(true, std::memory_order_release);
         };
@@ -995,6 +1013,13 @@ int main(int, char **) {
                 // The pool figures only; asking ggml here could race the worker.
                 log_memory(n == 120 ? "worker started" : "worker asked", false);
             }
+            // Every 30 s: what the host's loads saved goes over the limit until then.
+            if (n % 1800 == 900 && !cache.dir.empty() && !failed) {
+                const RpcCacheUse use = prune_rpc_cache(cache, false);
+                if (use.dropped) {
+                    log_cache(use, "kept to size");
+                }
+            }
             if (n % 60 == 0) {
                 quit_if_asked();  // Existing safe title-close path; not cancellation in a GPU call.
                 keep_awake(!failed);
@@ -1010,7 +1035,7 @@ int main(int, char **) {
                     sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
                 }
                 // `unload`, as it restarts the app: here it restarts the worker,
-                // which reads env.txt again (PS5LM_WORKER_SCREEN, say) and
+                // which reads env.txt again (its screen and cache settings) and
                 // gives back everything a host left allocated.
                 if (!take_request_file("/data/PS5LM/unload").empty()) {
                     ps5lm::log_line("fleet: restarting the worker\n");
