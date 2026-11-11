@@ -63,7 +63,18 @@ POOL_FIELDS = dict(model='', sha256='', context=32768, slots=1, shared_context=F
                    flash_attn=True, running=False, aliases=[], replicas=[])
 SERVING = ('model', 'sha256', 'context', 'slots', 'shared_context', 'cache_type', 'flash_attn')
 DEFAULT_PORT = dict(ps5=devices.WORKER_PORT, gpu=50052, rpc=50052)
-ACTIONS = dict(ps5=('worker', 'leave', 'quit', 'unload'), gpu=('worker', 'stop'), rpc=())
+# What a device keeps back from the planner for llama.cpp's compute buffers and
+# headroom. A console's worker reports its free memory with the app's own use
+# taken off, and llama.cpp measured 192 to 256 MiB of compute buffers on it at
+# up to 192k tokens; a PC's GPU shares its memory with the desktop.
+DEFAULT_RESERVE = dict(ps5=512, gpu=1024, rpc=1024)
+# A console's worker settings, written to its env.txt (devices.worker_env). No
+# screen by default: a console in a fleet is only a worker, and its screen takes
+# about 350 MiB the model can have. 32 GiB of the weights hosts send are kept.
+CONSOLE_FIELDS = dict(screen=False, cache_gib=32)
+CACHE_GIB_MAX = 4096
+ACTIONS = dict(ps5=('worker', 'leave', 'restart', 'quit', 'unload', 'clear-cache'), gpu=('worker', 'stop'), rpc=())
+CACHE_CHECK_SECONDS = 60   # how often a console's weight cache is listed (FTP)
 LIMITS = dict(devices=1024, pools=64, replicas=256)
 REPLICA_PORTS = range(18100, 19100)
 LOAD_TIMEOUT = dict(rpc=1800, direct=900, app=900, server=0)
@@ -132,8 +143,13 @@ def validate_device(raw):
         raise ControlError(f'{name}: tags are up to 16 words of letters, digits and . _ : -')
     device = dict(id=name, kind=kind, address=address, port=port,
                   enabled=_bool(raw, 'enabled', True, f'{name}: enabled'), memory_mib=memory,
-                  reserve_mib=_int(raw, 'reserve_mib', 1, UNBOUNDED_MIB, 1024, f'{name}: reserve_mib'),
+                  reserve_mib=_int(raw, 'reserve_mib', 1, UNBOUNDED_MIB, DEFAULT_RESERVE[kind], f'{name}: reserve_mib'),
                   tags=sorted(set(tags)))
+    if kind == 'ps5':
+        # As a worker: with its screen or without (about 350 MiB more for the
+        # model), and how many GiB of the weights it keeps (0: none).
+        device['screen'] = _bool(raw, 'screen', CONSOLE_FIELDS['screen'], f'{name}: screen')
+        device['cache_gib'] = _int(raw, 'cache_gib', 0, CACHE_GIB_MAX, CONSOLE_FIELDS['cache_gib'], f'{name}: cache_gib')
     if kind == 'gpu':
         gpu = raw.get('device', 'CUDA0')
         if not isinstance(gpu, str) or not _DEVICE.fullmatch(gpu):
@@ -428,6 +444,8 @@ class Fleet:
         self.rpc_servers = {}         # device id -> Process: a local GPU's ggml-rpc-server
         self.manual = set()           # GPU workers started by hand, kept without a replica
         self.busy = {}                # device id -> the action under way
+        self.env_pending = set()      # consoles whose env.txt changed since their worker started
+        self.cache_seen = {}          # console id -> dict(files, mib, checked) of its weight cache
         self.consoles, self.networks = {}, []
         self.jobs = collections.deque(maxlen=50)
         self.job_ids = itertools.count(1)
@@ -517,13 +535,73 @@ class Fleet:
         return self._edit(lambda config: config['devices'].append(raw), f'Added device {name}')
 
     def update_device(self, device_id, changes):
-        self.device(device_id)
+        before = dict(self.device(device_id))
         allowed = {k: v for k, v in changes.items()
-                   if k in ('address', 'port', 'memory_mib', 'reserve_mib', 'enabled', 'device', 'tags')}
+                   if k in ('address', 'port', 'memory_mib', 'reserve_mib', 'enabled', 'device', 'tags', *CONSOLE_FIELDS)}
 
         def change(config):
             config['devices'] = [dict(d, **allowed) if d['id'] == device_id else d for d in config['devices']]
-        return self._edit(change, f'Changed device {device_id}')
+        config = self._edit(change, f'Changed device {device_id}')
+        after = self.device(device_id)
+        if after['kind'] == 'ps5' and any(after[k] != before.get(k) for k in CONSOLE_FIELDS):
+            self._apply_console_settings(after)
+        return config
+
+    # -- a console's worker settings: its env.txt, read when PS5LM starts
+    @staticmethod
+    def console_env(device):
+        return devices.worker_env(device['screen'], device['cache_gib'])
+
+    def _in_running_pool(self, device_id):
+        with self.lock:
+            return any(p['running'] and any(device_id in r.get('devices', []) for r in p['replicas'])
+                       for p in self.config['pools'])
+
+    def _apply_console_settings(self, device):
+        """A console's screen or cache setting changed: write its env.txt, and restart
+        a worker no running pool uses, so the change applies now. A worker in use
+        takes it at its next restart (a pool's next start restarts it first)."""
+        device_id, address, port = device['id'], device['address'], device['port']
+        env = self.console_env(device)
+
+        def work():
+            mode = devices.ps5_mode(address, port)
+            if mode['mode'] == 'offline':
+                with self.lock:
+                    self.env_pending.add(device_id)
+                return 'the console does not answer; the settings are written when it is next made a worker'
+            if mode['mode'] != 'worker':
+                devices.write_env(address, env)
+                return 'written to env.txt; they apply when it is next a worker'
+            if mode.get('busy') or self._in_running_pool(device_id):
+                devices.write_env(address, env)
+                with self.lock:
+                    self.env_pending.add(device_id)
+                return 'written to env.txt; its worker is in use, so they apply when it next restarts'
+            return self._restart_worker(device, env)
+        try:
+            self.job(f'Settings for {device_id}', work, device=device_id)
+        except ControlError as exc:   # another action on it is under way
+            with self.lock:
+                self.env_pending.add(device_id)
+            self.note(f'{device_id}: {exc}; the settings apply at its next restart')
+
+    def _restart_worker(self, device, env, replica=None):
+        """Restart a console's worker after setting `env` in env.txt. A worker of an
+        older PS5LM does not take the restart request: it leaves worker mode, and
+        is made a worker again."""
+        name, address, port = device['id'], device['address'], device['port']
+        if not devices.restart(address, env):
+            if devices.leave_worker(address) != 'restarted':
+                raise ControlError(f'{name}: this PS5LM cannot restart by itself, so it quit; open it on the console')
+            if not devices.make_worker(address, port, env):
+                raise ControlError(f'{name}: PS5LM did not take the request to become a worker again')
+        with self.lock:
+            self.env_pending.discard(name)
+        time.sleep(2)   # the old worker can answer for a moment after it took the request
+        if not self._wait_port(address, port, 150, replica):
+            raise ControlError(f'{name} did not come back as a worker in 150 s')
+        return f'worker restarted on {address}:{port}'
 
     def remove_device(self, device_id):
         self.device(device_id)
@@ -628,7 +706,8 @@ class Fleet:
         return self.job('Searching the network', work, device='(search)')
 
     def device_action(self, device_id, action):
-        """worker / leave / quit / unload for a console; worker / stop for a local GPU."""
+        """worker / leave / restart / quit / unload / clear-cache for a console;
+        worker / stop for a local GPU."""
         device = self.device(device_id)
         if action not in ACTIONS[device['kind']]:
             raise ControlError(f"A {device['kind']} device takes " + (', '.join(ACTIONS[device['kind']]) or 'no actions'))
@@ -643,16 +722,33 @@ class Fleet:
             self._stop_rpc_server(device_id)
             return dict(result=f'{device_id}: RPC worker stopped')
         address, port = device['address'], device['port']
+        env = self.console_env(device)
 
         def work():
-            mode = devices.ps5_mode(address, port)['mode']
+            status = devices.ps5_mode(address, port)
+            mode = status['mode']
+            if action == 'clear-cache':
+                cleared = devices.clear_cache(address)
+                with self.lock:
+                    self.cache_seen[device_id] = dict(files=0, mib=0, checked=time.time())
+                return f"deleted {cleared['files']} cached tensors, {cleared['mib'] / 1024:.1f} GiB"
+            if mode == 'offline':
+                raise ControlError('the console does not answer: off, in rest mode, or not jailbroken since it started')
+            if action == 'restart':
+                if mode == 'worker':
+                    if status.get('busy'):
+                        raise ControlError('its worker is serving a split; stop that first')
+                    return self._restart_worker(device, env)
+                if not devices.restart(address):
+                    raise ControlError('PS5LM is not open; open it on the console')
+                return 'asked PS5LM to restart' + (' with its model' if mode in ('serving', 'loading') else '')
             if action == 'worker':
                 if mode == 'worker':
                     return 'already a worker'
-                if mode == 'offline':
-                    raise ControlError('the console does not answer: off, in rest mode, or not jailbroken since it started')
-                if not devices.make_worker(address, port):
+                if not devices.make_worker(address, port, env):
                     return 'PS5LM is not open; it starts as a worker when it is opened'
+                with self.lock:
+                    self.env_pending.discard(device_id)
                 if self._wait_port(address, port, 150):
                     return f'worker on {address}:{port}'
                 raise ControlError('PS5LM took the request, but no worker answers yet; look at the console')
@@ -930,14 +1026,28 @@ class Fleet:
             if not devices.port_open(device['address'], device['port'], 2):
                 raise ControlError(f"{name}: nothing answers on {device['address']}:{device['port']}")
             return
-        mode = devices.ps5_mode(device['address'], device['port'])['mode']
+        status = devices.ps5_mode(device['address'], device['port'])
+        mode, env = status['mode'], self.console_env(device)
         if mode == 'worker':
+            if status.get('busy'):
+                return
+            # A worker started before its settings changed, or with other ones by
+            # hand: restart it first, so the split gets the memory and the cache
+            # it is set up for.
+            stale = devices.write_env(device['address'], env)
+            with self.lock:
+                stale = stale or name in self.env_pending
+            if stale:
+                replica.detail = f'restarting {name} with its settings'
+                self._restart_worker(device, env, replica)
             return
         if mode == 'offline':
             raise ControlError(f'{name} does not answer: off, in rest mode, or not jailbroken since it started')
         replica.detail = f'making {name} a worker'
-        if not devices.make_worker(device['address'], device['port']):
+        if not devices.make_worker(device['address'], device['port'], env):
             raise ControlError(f'PS5LM is not open on {name}; open it and it starts as a worker')
+        with self.lock:
+            self.env_pending.discard(name)
         replica.detail = f'waiting for {name} to restart as a worker'
         if not self._wait_port(device['address'], device['port'], 150, replica):
             raise ControlError(f'{name} did not come back as a worker in 150 s')
@@ -1071,6 +1181,12 @@ class Fleet:
         try:
             if device['kind'] == 'ps5':
                 status = devices.ps5_mode(device['address'], device['port'])
+                with self.lock:
+                    seen = self.cache_seen.get(device['id'], {})
+                if status['mode'] != 'offline' and time.time() - seen.get('checked', 0) >= CACHE_CHECK_SECONDS:
+                    use = devices.cache_use(device['address'])
+                    with self.lock:
+                        self.cache_seen[device['id']] = dict(use or dict(files=0, mib=0), checked=time.time())
             elif device['kind'] == 'rpc':
                 port = devices.port_probe(device['address'], device['port'])
                 status = (dict(mode='worker') if port == 'open' else dict(mode='worker', busy=True)
@@ -1283,10 +1399,15 @@ class Fleet:
             for device in config['devices']:
                 status = dict(self.status.get(device['id'], {'mode': 'checking'}))
                 status['age'] = round(time.time() - status.pop('checked', time.time()))
-                device_views.append(dict(device, status=status, replica=used.get(device['id']),
-                                         busy=self.busy.get(device['id']), actions=list(ACTIONS[device['kind']]),
-                                         console=self.consoles.get(device['address']) if device['kind'] == 'ps5' else None,
-                                         rpc_worker=device['id'] in self.rpc_servers))
+                view = dict(device, status=status, replica=used.get(device['id']),
+                            busy=self.busy.get(device['id']), actions=list(ACTIONS[device['kind']]),
+                            console=self.consoles.get(device['address']) if device['kind'] == 'ps5' else None,
+                            rpc_worker=device['id'] in self.rpc_servers)
+                if device['kind'] == 'ps5':
+                    cache = self.cache_seen.get(device['id'])
+                    view.update(cache={k: cache[k] for k in ('files', 'mib')} if cache else None,
+                                settings_pending=device['id'] in self.env_pending)
+                device_views.append(view)
             pool_views = []
             for pool in config['pools']:
                 views = [r.view(0 if r.state == 'ready' else 8) for r in self.replicas if r.pool_id == pool['id']]

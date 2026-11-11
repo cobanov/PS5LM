@@ -333,7 +333,25 @@ The control server runs a fleet of any size from one JSON document,
   - `rpc`: a `ggml-rpc-server` elsewhere.
 
   Each device has a memory budget (or `null` for the free memory it reports), a
-  reserve, and tags for picking groups.
+  reserve, and tags for picking groups. The reserve is what the planner leaves
+  for llama.cpp's compute buffers: 512 MiB on a console by default (a worker
+  reports its free memory with the app's own use taken off, and llama.cpp
+  measured 192 to 256 MiB of compute buffers on one at up to 192k tokens), 1024
+  MiB on a GPU or an RPC server.
+
+  A console also has its worker's settings, which go into its
+  `/data/PS5LM/env.txt` (PS5LM after v0.11.0 reads them; older builds ignore them):
+
+  | Setting | Default | In env.txt |
+  |---|---|---|
+  | `screen` | `false`: about 350 MiB more for the model, and the TV shows the system's splash | `PS5LM_WORKER_SCREEN=on` or `off` |
+  | `cache_gib` | `32`: up to 32 GiB of the weights hosts send are kept on the console, so loading them again reads them there instead of sending them; `0` for none | `PS5LM_RPC_CACHE_GB=32` |
+
+  They are written whenever the control server makes the console a worker. A
+  change restarts the console's worker when nothing uses it; a worker in use
+  takes it at its next restart, and a pool's start restarts a worker whose
+  env.txt it had to change first. The page shows each console's settings and
+  what its cache holds.
 - **Pools** are one model and how to serve it:
   - `context`: tokens per request.
   - `slots`: requests at once per replica. With `shared_context` the slots share
@@ -397,12 +415,18 @@ PS5LM's request files, so no one has to be at the console:
   which network that is.
 - **worker** writes `/data/PS5LM/fleet-worker.txt` (its own address, port 30052
   and the acknowledgement) and sends `unload`: a running PS5LM restarts as a
-  worker. When PS5LM is closed, the request is not taken within 6 s and is
+  worker. When PS5LM is closed, the request is not taken within 20 s and is
   removed. The console then becomes a worker when PS5LM is next opened.
 - **leave** sends `leave-worker`. PS5LM restarts as the app
   ([Configure workers](#configure-workers-only-after-building-and-validating-the-title)).
   An older PS5LM can only quit; the worker file is then removed, and it opens as
   the app from the home screen.
+- **restart** sets the console's env.txt lines and sends `unload`: a worker
+  restarts as a worker and reads them again; the app restarts with the model it
+  serves. A worker of an older PS5LM does not take the request; it leaves worker
+  mode and is made a worker again (25 s on a console).
+- **clear-cache** deletes the weights the worker keeps
+  (`/data/PS5LM/rpc-cache`).
 - **quit** closes PS5LM, and **unload** stops a model it serves.
 - A device's mode comes from the network:
   - `worker`: its RPC port answers.
@@ -427,6 +451,7 @@ ctl pool plan qwen27 --wait                   # blocks and memory per device, wi
 ctl pool start qwen27 --wait 900              # exits 0 when every replica is ready
 ctl pool set qwen27 context=81920 cache_type=q8_0
 ctl device leave ps5-a --wait               # after `ctl pool stop qwen27`
+ctl device set ps5-a screen=true cache_gib=64 # restarts its worker if nothing uses it
 ctl config > fleet.json; ctl apply fleet.json # the whole configuration; keys stay "set"
 ```
 

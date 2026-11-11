@@ -1,6 +1,7 @@
 """Control server: the configuration, consoles over FTP, discovery replies, replicas,
 the page's API and its guards, and the ctl client."""
 import contextlib
+import ftplib
 import http.client
 import http.server
 import io
@@ -120,6 +121,18 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, 'need 4 free devices; 3 match'):
             control.assign(config, 2, per=2)
 
+    def test_console_settings_and_a_reserve_per_kind(self):
+        config = control.validate_config(dict(devices=[
+            dict(id='ps5-a', kind='ps5', address='192.168.50.21'), dict(id='pc-gpu', kind='gpu'),
+            dict(id='box', kind='rpc', address='10.0.0.5')]))
+        console, card, box = config['devices']
+        self.assertEqual((console['reserve_mib'], card['reserve_mib'], box['reserve_mib']), (512, 1024, 1024))
+        self.assertEqual((console['screen'], console['cache_gib']), (False, 32))   # a fleet console is only a worker
+        self.assertNotIn('screen', card)
+        for bad in (dict(cache_gib=-1), dict(cache_gib=4097), dict(cache_gib='32'), dict(screen='off')):
+            with self.assertRaises(control.ControlError):
+                control.validate_device(dict(id='ps5-a', kind='ps5', address='192.168.50.21', **bad))
+
     def test_cache_tokens(self):
         self.assertEqual(control.cache_tokens(dict(context=32768, slots=4, shared_context=False)), 131072)
         self.assertEqual(control.cache_tokens(dict(context=32768, slots=4, shared_context=True)), 32768)
@@ -140,9 +153,12 @@ class DiscoveryTests(unittest.TestCase):
 
 class FakeFTP:
     """Records what the console is told. Files listed in `waiting` stay put when
-    the app is asked to take them; anything else the app takes at once."""
+    the app is asked to take them; anything else the app takes at once. `files`
+    are what RETR reads (STOR writes them), `folders` what LIST shows of a folder."""
     log = []
     waiting = set()
+    files = {}
+    folders = {}
 
     def connect(self, host, port, timeout=None):
         self.log.append(('connect', host, port))
@@ -151,9 +167,24 @@ class FakeFTP:
         pass
 
     def storbinary(self, command, stream, blocksize=8192, callback=None):
-        self.log.append(('STOR', command.split(' ', 1)[1], stream.read().decode()))
+        path, text = command.split(' ', 1)[1], stream.read().decode()
+        self.log.append(('STOR', path, text))
+        self.files[path] = text
+
+    def retrbinary(self, command, callback):
+        path = command.split(' ', 1)[1]
+        if path not in self.files:
+            raise ftplib.error_perm('550 No such file')
+        callback(self.files[path].encode())
 
     def retrlines(self, command, callback):
+        folder = command.split(' ', 1)[1]
+        if folder in self.folders:
+            for name, size in self.folders[folder].items():
+                callback(f'-rw-r--r-- 1 root root {size} Nov 9 12:00 {name}')
+            return
+        if folder == devices.CACHE_DIR:
+            raise ftplib.error_perm('550 No such folder')
         for name in self.waiting:
             callback(f'-rw-r--r-- 1 root root 2 Nov 9 12:00 {name}')
 
@@ -170,7 +201,7 @@ class FakeFTP:
 
 class ConsoleTests(unittest.TestCase):
     def setUp(self):
-        FakeFTP.log, FakeFTP.waiting = [], set()
+        FakeFTP.log, FakeFTP.waiting, FakeFTP.files, FakeFTP.folders = [], set(), {}, {}
         patcher = patch.object(devices.ftplib, 'FTP', FakeFTP)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -221,6 +252,41 @@ class ConsoleTests(unittest.TestCase):
         with patch.object(devices, 'request_consumed', return_value=False):
             self.assertFalse(devices.make_worker('192.168.50.21'))
         self.assertEqual(FakeFTP.log[-1], ('DELE', '/data/PS5LM/unload'))
+
+    def test_worker_settings_are_set_in_env_txt_and_the_rest_kept(self):
+        text = 'RADV_DEBUG=nocache\nPS5LM_WORKER_SCREEN=on\nnot a setting\n'
+        merged = devices.merged_env(text, devices.worker_env(screen=False, cache_gib=32))
+        self.assertEqual(merged, 'RADV_DEBUG=nocache\nnot a setting\nPS5LM_WORKER_SCREEN=off\nPS5LM_RPC_CACHE_GB=32\n')
+        self.assertEqual(devices.merged_env(merged, devices.worker_env(False, 32)), merged)
+        self.assertEqual(devices.merged_env('', devices.worker_env(True, 0)),
+                         'PS5LM_WORKER_SCREEN=on\nPS5LM_RPC_CACHE_GB=0\n')
+
+    def test_make_worker_sets_its_settings_first(self):
+        FakeFTP.files[devices.ENV_FILE] = 'GGML_VK_X=1\n'
+        self.assertTrue(devices.make_worker('192.168.50.21', env=devices.worker_env(False, 16)))
+        self.assertEqual([p for _, p, _ in self.stored()], [devices.ENV_FILE, devices.WORKER_FILE, '/data/PS5LM/unload'])
+        self.assertEqual(FakeFTP.files[devices.ENV_FILE],
+                         'GGML_VK_X=1\nPS5LM_WORKER_SCREEN=off\nPS5LM_RPC_CACHE_GB=16\n')
+
+    def test_restart_with_settings(self):
+        env = devices.worker_env(True, 0)
+        self.assertTrue(devices.restart('192.168.50.21', env))
+        self.assertEqual([p for _, p, _ in self.stored()], [devices.ENV_FILE, '/data/PS5LM/unload'])
+        FakeFTP.log = []
+        with patch.object(devices, 'request_consumed', return_value=False):   # closed, or an older worker
+            self.assertFalse(devices.restart('192.168.50.21', env))
+        self.assertEqual([p for _, p, _ in self.stored()], ['/data/PS5LM/unload'])   # env.txt was already so
+        self.assertEqual(FakeFTP.log[-1], ('DELE', '/data/PS5LM/unload'))
+
+    def test_the_weight_cache_is_listed_and_cleared(self):
+        self.assertIsNone(devices.cache_use('192.168.50.21'))       # no folder: no cache yet
+        FakeFTP.folders[devices.CACHE_DIR] = {'00000000000000a1': 3 << 20, '00000000000000a2': 1 << 20,
+                                               '00000000000000a3.00000000000000ff.part': 5, 'notes.txt': 9}
+        self.assertEqual(devices.cache_use('192.168.50.21'), dict(files=3, mib=4))
+        self.assertEqual(devices.clear_cache('192.168.50.21'), dict(files=3, mib=4))
+        deleted = sorted(entry[1] for entry in FakeFTP.log if entry[0] == 'DELE')
+        self.assertEqual(deleted, [f'{devices.CACHE_DIR}/{name}' for name in
+                                   ('00000000000000a1', '00000000000000a2', '00000000000000a3.00000000000000ff.part')])
 
     def test_leave_worker_restarts_as_the_app(self):
         self.assertEqual(devices.leave_worker('192.168.50.21'), 'restarted')
@@ -367,6 +433,77 @@ class FleetTests(unittest.TestCase):
         replica.deadline = time.time() - 1
         self.fleet._check(replica, idle)
         self.assertEqual(replica.state, 'failed')
+
+    def finished(self):
+        """Wait for the device jobs started so far."""
+        for _ in range(250):
+            if all(job['state'] != 'running' for job in self.fleet.jobs):
+                return list(self.fleet.jobs)
+            threading.Event().wait(0.02)
+        raise AssertionError(f'jobs still running: {list(self.fleet.jobs)}')
+
+    def test_new_settings_restart_an_idle_worker(self):
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'restart', return_value=True) as restart, \
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+            self.fleet.update_device('ps5-a', dict(screen=True))
+            (job,) = self.finished()
+        self.assertEqual(job['state'], 'done', job)
+        restart.assert_called_once_with('192.168.50.21', devices.worker_env(True, 32))
+        self.assertNotIn('ps5-a', self.fleet.env_pending)
+
+    def test_new_settings_wait_for_a_worker_in_use(self):
+        self.fleet.apply(dict(devices=[ps5()], pools=[pool(running=True, replicas=[dict(devices=['ps5-a'])])]))
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker', busy=True)), \
+                patch.object(devices, 'write_env', return_value=True) as write, \
+                patch.object(devices, 'restart') as restart:
+            self.fleet.update_device('ps5-a', dict(cache_gib=64))
+            self.finished()
+            self.fleet.update_device('ps5-a', dict(enabled=True))     # not a worker setting: nothing to do
+            self.assertEqual(len(self.finished()), 1)
+        restart.assert_not_called()
+        write.assert_called_once_with('192.168.50.21', devices.worker_env(False, 64))
+        (view,) = self.fleet.snapshot()['devices']
+        self.assertTrue(view['settings_pending'])
+
+    def test_a_pool_start_restarts_a_worker_with_other_settings(self):
+        self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[pool(replicas=[dict(devices=['ps5-a', 'pc-gpu'])])]))
+        (replica,) = self.fleet.replicas
+        device = self.fleet.device('ps5-a')
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'write_env', return_value=True), \
+                patch.object(devices, 'restart', return_value=True) as restart, \
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+            self.fleet._ensure_worker(device, replica)
+        restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 32))
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'write_env', return_value=False), patch.object(devices, 'restart') as restart:
+            self.fleet._ensure_worker(device, replica)                 # its settings already: used as it is
+        restart.assert_not_called()
+
+    def test_an_older_worker_is_restarted_by_leaving_worker_mode(self):
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'restart', return_value=False), \
+                patch.object(devices, 'leave_worker', return_value='restarted') as leave, \
+                patch.object(devices, 'make_worker', return_value=True) as make, \
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+            answer = self.fleet.device_action('ps5-a', 'restart')
+            (job,) = self.finished()
+        self.assertEqual((job['id'], job['state']), (answer['job']['id'], 'done'))
+        leave.assert_called_once_with('192.168.50.21')
+        make.assert_called_once_with('192.168.50.21', 30052, devices.worker_env(False, 32))
+
+    def test_clear_cache(self):
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'clear_cache', return_value=dict(files=280, mib=10240)):
+            self.fleet.device_action('ps5-a', 'clear-cache')
+            (job,) = self.finished()
+        self.assertEqual(job['result'], 'deleted 280 cached tensors, 10.0 GiB')
+        (view,) = self.fleet.snapshot()['devices']
+        self.assertEqual(view['cache'], dict(files=0, mib=0))
 
     def test_pools_share_devices_but_run_one_at_a_time(self):
         self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[

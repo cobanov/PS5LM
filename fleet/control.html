@@ -135,8 +135,10 @@ details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
           <label>Port<input id="d-port" type="number" placeholder="30052"></label>
           <label class="d-gpu" hidden>GPU<input id="d-device" value="CUDA0"></label>
           <label>Memory MiB<input id="d-memory" type="number" placeholder="what it reports"></label>
-          <label>Reserve MiB<input id="d-reserve" type="number" value="1024"></label>
+          <label>Reserve MiB<input id="d-reserve" type="number" value="512"></label>
           <label>Tags<input id="d-tags" placeholder="rack1 lounge" autocomplete="off"></label>
+          <label class="d-ps5">Weight cache GiB<input id="d-cache" type="number" min="0" max="4096" value="32"></label>
+          <label class="check d-ps5"><input id="d-screen" type="checkbox"> Screen as a worker (about 350 MiB less for the model)</label>
         </div>
         <div class="row"><button id="d-save" class="primary">Add device</button><button id="d-cancel">Cancel</button></div>
       </div>
@@ -263,6 +265,13 @@ function memory(d) {
   return d.memory_mib ? `${d.memory_mib} budget` : "reported";
 }
 
+function consoleSettings(d) {
+  const cache = d.cache_gib === 0 ? "no weight cache" : d.cache && d.cache.files ?
+    `weights kept: ${(d.cache.mib / 1024).toFixed(1)} of ${d.cache_gib} GiB` : `weight cache up to ${d.cache_gib} GiB`;
+  return `${d.screen ? "screen" : "no screen"} as a worker · ${cache}` +
+    (d.settings_pending ? " · settings apply at its next restart" : "");
+}
+
 function renderDevices(s) {
   const rows = s.devices.map((d) => {
     const mode = d.status.mode;
@@ -270,26 +279,32 @@ function renderDevices(s) {
       mode === "worker" && d.status.busy ? "worker, in use" : mode;
     const actions = [];
     const label = { worker: d.kind === "gpu" ? "Start worker" : "Make worker", leave: "Leave worker mode", quit: "Quit app",
-      unload: "Unload model", stop: "Stop worker" };
+      unload: "Unload model", stop: "Stop worker", restart: "Restart", "clear-cache": "Clear cache" };
     const owner = s.pools.find((p) => p.running && p.replicas.some((r) => r.devices.includes(d.id)));
     for (const action of owner ? [] : d.actions) {
       if (d.kind === "ps5" && action === "worker" && mode === "worker") continue;
       if (d.kind === "ps5" && action === "leave" && mode !== "worker") continue;
       if (d.kind === "ps5" && action === "unload" && !["serving", "loading"].includes(mode)) continue;
-      if (d.kind === "ps5" && action === "quit" && mode === "offline") continue;
+      if (d.kind === "ps5" && ["quit", "restart"].includes(action) && ["offline", "idle"].includes(mode)) continue;
+      if (d.kind === "ps5" && action === "restart" && d.status.busy) continue;
+      if (d.kind === "ps5" && action === "clear-cache" && !(d.cache && d.cache.files)) continue;
       if (d.kind === "gpu" && action === "worker" && d.rpc_worker) continue;
       if (d.kind === "gpu" && action === "stop" && !d.rpc_worker) continue;
-      actions.push(button(label[action], () => post("/api/devices/action", { id: d.id, action })));
+      actions.push(button(label[action], () => (action !== "clear-cache" || confirm(`Delete the weights ${d.id} keeps?`)) &&
+        post("/api/devices/action", { id: d.id, action })));
     }
     if (owner) {
       actions.push(el("span", { class: "meta" }, `in use by ${owner.id}; stop it to change this device`));
-    } else {
+    }
+    actions.push(button("Edit", () => editDevice(d)));
+    if (!owner) {
       actions.push(button(d.enabled ? "Disable" : "Enable", () => post("/api/devices/update", { id: d.id, enabled: !d.enabled })));
       actions.push(button("Remove", () => confirm(`Remove ${d.id}?`) && post("/api/devices/remove", { id: d.id }), "small danger"));
     }
     const where = d.kind === "gpu" ? `${d.device}, worker port ${d.port}` : `${d.address}:${d.port}`;
     return el("tr", {},
       el("td", {}, el("div", {}, el("strong", {}, d.id)), el("span", { class: "kind" }, d.kind + (d.enabled ? "" : " · disabled")),
+        d.kind === "ps5" ? el("div", { class: "meta" }, consoleSettings(d)) : null,
         d.tags.length ? el("div", { class: "meta" }, d.tags.join(" ")) : null),
       el("td", { class: "num" }, where),
       el("td", {}, pill(d.busy ? d.busy + "…" : now, d.busy ? "warn" : TONE[mode] ?? "")),
@@ -385,23 +400,46 @@ $("p-save").addEventListener("click", async () => {
   if (result.ok) $("pool-form").hidden = true;
 });
 
+let editingDevice = null;
+const RESERVE = { ps5: 512, gpu: 1024, rpc: 1024 };
+
 function deviceKind() {
   const kind = $("d-kind").value;
   for (const node of document.querySelectorAll(".d-net")) node.hidden = kind === "gpu";
   for (const node of document.querySelectorAll(".d-gpu")) node.hidden = kind !== "gpu";
+  for (const node of document.querySelectorAll(".d-ps5")) node.hidden = kind !== "ps5";
   $("d-port").placeholder = kind === "ps5" ? "30052" : "50052";
+  if (!editingDevice) $("d-reserve").value = RESERVE[kind];
 }
+
+function editDevice(d) {
+  editingDevice = d ? d.id : null;
+  $("device-form").hidden = false;
+  $("d-kind").value = d ? d.kind : "ps5"; $("d-kind").disabled = !!d;
+  $("d-id").value = d ? d.id : ""; $("d-id").disabled = !!d;
+  $("d-address").value = d && d.kind !== "gpu" ? d.address : ""; $("d-port").value = d ? d.port : "";
+  $("d-device").value = d && d.device ? d.device : "CUDA0";
+  $("d-memory").value = d && d.memory_mib ? d.memory_mib : "";
+  $("d-tags").value = d ? d.tags.join(" ") : "";
+  $("d-cache").value = d && d.kind === "ps5" ? d.cache_gib : 32; $("d-screen").checked = !!(d && d.screen);
+  deviceKind();
+  if (d) $("d-reserve").value = d.reserve_mib;
+  $("d-save").textContent = d ? "Save device" : "Add device";
+  (d ? $("d-memory") : $("d-id")).focus();
+}
+
 $("d-kind").addEventListener("change", deviceKind);
-$("new-device").addEventListener("click", () => { $("device-form").hidden = false; deviceKind(); $("d-id").focus(); });
+$("new-device").addEventListener("click", () => editDevice(null));
 $("d-cancel").addEventListener("click", () => { $("device-form").hidden = true; });
 $("d-save").addEventListener("click", async () => {
   const kind = $("d-kind").value;
-  const body = { id: $("d-id").value.trim(), kind, reserve_mib: Number($("d-reserve").value) || 1024,
-    tags: $("d-tags").value.split(/\s+/).filter(Boolean) };
+  const body = { id: $("d-id").value.trim(), reserve_mib: Number($("d-reserve").value) || RESERVE[kind],
+    tags: $("d-tags").value.split(/\s+/).filter(Boolean), memory_mib: $("d-memory").value ? Number($("d-memory").value) : null };
+  if (!editingDevice) body.kind = kind;
   if (kind === "gpu") body.device = $("d-device").value.trim(); else body.address = $("d-address").value.trim();
   if ($("d-port").value) body.port = Number($("d-port").value);
-  if ($("d-memory").value) body.memory_mib = Number($("d-memory").value);
-  const result = await post("/api/devices/add", body);
+  if (kind === "ps5") { body.screen = $("d-screen").checked; body.cache_gib = Number($("d-cache").value); }
+  const result = await post(editingDevice ? "/api/devices/update" : "/api/devices/add", body);
   if (result.ok) $("device-form").hidden = true;
 });
 $("search").addEventListener("click", () => post("/api/search"));

@@ -21,6 +21,9 @@ Moving between them, all over FTP:
     idle/serving -> serving  write app-args.txt (or request `load`), request
                              `unload`: the app restarts with that model
     serving -> idle          remove app-args.txt, request `unload`
+    worker -> worker         request `unload`: the worker restarts and reads env.txt
+                             again, its screen and weight cache settings (PS5LM
+                             after v0.11.0)
 
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -53,8 +56,12 @@ WORKER_PORT = 30052          # a PS5 title cannot bind 40000 and up
 DATA = '/data/PS5LM'
 WORKER_FILE = f'{DATA}/fleet-worker.txt'
 ARGS_FILE = f'{DATA}/app-args.txt'
+ENV_FILE = f'{DATA}/env.txt'       # switches PS5LM sets at start, one NAME=value a line
+CACHE_DIR = f'{DATA}/rpc-cache'    # the worker's weight cache (PS5LM_RPC_CACHE_GB)
 ACK = 'I_UNDERSTAND_RPC_IS_UNAUTHENTICATED'
 PS5_MODELS = f'{DATA}/models'
+MIB = 1 << 20
+_CACHE_NAME = re.compile(r'[0-9a-f]{16}(\.[0-9a-f]{16}\.part)?')
 # How long a running PS5LM gets to take a request file. It looks once a second,
 # but an app short of memory under load was measured taking longer than 6 s.
 TAKE_SECONDS = 20
@@ -237,15 +244,79 @@ def put_text(ftp, path, text):
     ftp.storbinary(f'STOR {path}', io.BytesIO(text.encode('utf-8')))
 
 
+def get_text(ftp, path, limit=1 << 20):
+    """A small text file over an open connection, or '' when it is not there."""
+    buffer = io.BytesIO()
+    try:
+        ftp.retrbinary(f'RETR {path}', lambda chunk: buffer.write(chunk) if buffer.tell() < limit else None)
+    except ftplib.error_perm:
+        return ''
+    return buffer.getvalue()[:limit].decode('utf-8', 'replace')
+
+
 def read_text(address, path, limit=1 << 20):
     """A small text file from the console, or '' when it is not there."""
-    buffer = io.BytesIO()
     with console_ftp(address) as ftp:
-        try:
-            ftp.retrbinary(f'RETR {path}', lambda chunk: buffer.write(chunk) if buffer.tell() < limit else None)
-        except ftplib.error_perm:
-            return ''
-    return buffer.getvalue()[:limit].decode('utf-8', 'replace')
+        return get_text(ftp, path, limit)
+
+
+def worker_env(screen=True, cache_gib=0):
+    """The env.txt lines a console's settings give its worker (PS5LM after v0.11.0):
+    PS5LM_WORKER_SCREEN=off starts it without its screen, which leaves about 350 MiB
+    more for the model; PS5LM_RPC_CACHE_GB keeps up to that many GiB of the weights
+    hosts send on the console, so loading them again comes from its storage."""
+    return {'PS5LM_WORKER_SCREEN': 'on' if screen else 'off', 'PS5LM_RPC_CACHE_GB': str(cache_gib)}
+
+
+def merged_env(text, settings):
+    """env.txt with `settings` set, its other lines kept as they were."""
+    kept = [line for line in text.splitlines() if line.split('=', 1)[0].strip() not in settings]
+    return '\n'.join(kept + [f'{name}={value}' for name, value in settings.items()]) + '\n'
+
+
+def set_env(ftp, settings):
+    """Set lines of env.txt over an open connection. True when the file changed:
+    PS5LM reads it when it starts, so a running app or worker needs a restart."""
+    current = get_text(ftp, ENV_FILE)
+    wanted = merged_env(current, settings)
+    if wanted == current:
+        return False
+    put_text(ftp, ENV_FILE, wanted)
+    return True
+
+
+def cache_files(ftp):
+    """The worker's cache files as name -> bytes, or None when it has no cache folder."""
+    lines = []
+    try:
+        ftp.retrlines(f'LIST {CACHE_DIR}', lines.append)
+    except ftplib.error_perm:
+        return None
+    found = {}
+    for line in lines:
+        parts = line.split(None, 8)
+        if len(parts) == 9 and parts[4].isdigit() and _CACHE_NAME.fullmatch(parts[8]):
+            found[parts[8]] = int(parts[4])
+    return found
+
+
+def cache_use(address):
+    """What a console's weight cache holds: dict(files, mib), or None without one."""
+    with console_ftp(address) as ftp:
+        found = cache_files(ftp)
+    if found is None:
+        return None
+    return dict(files=len(found), mib=round(sum(found.values()) / MIB))
+
+
+def clear_cache(address):
+    """Delete the worker's cache files (only the names its cache writes). Returns
+    dict(files, mib) deleted. A worker loading as they go only sends them again."""
+    with console_ftp(address) as ftp:
+        found = cache_files(ftp) or {}
+        for name in found:
+            delete(ftp, f'{CACHE_DIR}/{name}')
+    return dict(files=len(found), mib=round(sum(found.values()) / MIB))
 
 
 def delete(ftp, path):
@@ -284,14 +355,17 @@ def worker_file(address, port):
     return f'{address}:{port}\n{ACK}\n'
 
 
-def make_worker(address, port=WORKER_PORT):
-    """Write fleet-worker.txt and ask a running PS5LM to restart (unload) into worker
-    mode. Returns True when the app took the request; False when PS5LM is not
-    open, in which case it starts as a worker when it is next opened."""
+def make_worker(address, port=WORKER_PORT, env=None):
+    """Write fleet-worker.txt (and `env`'s lines of env.txt) and ask a running PS5LM
+    to restart (unload) into worker mode. Returns True when the app took the
+    request; False when PS5LM is not open, in which case it starts as a worker
+    when it is next opened."""
     with console_ftp(address) as ftp:
         delete(ftp, ARGS_FILE)            # a model replica's arguments would not apply to a worker
         for stale in ('leave-worker', 'quit', 'load'):   # left behind, they would undo this at once
             delete(ftp, f'{DATA}/{stale}')
+        if env:
+            set_env(ftp, env)
         put_text(ftp, WORKER_FILE, worker_file(address, port))
         put_text(ftp, f'{DATA}/unload', '-\n')
         if request_consumed(ftp, 'unload', TAKE_SECONDS):
@@ -314,6 +388,29 @@ def leave_worker(address):
         delete(ftp, WORKER_FILE)
         put_text(ftp, f'{DATA}/quit', 'quit\n')
         return 'quit'
+
+
+def restart(address, env=None):
+    """Ask a running PS5LM to restart as it is, after setting `env`'s lines of
+    env.txt: a worker as a worker (PS5LM after v0.11.0), the app with the model
+    app-args.txt names. False when the app did not take the request (closed, or a
+    worker of an older build)."""
+    with console_ftp(address) as ftp:
+        for stale in ('quit', 'load', 'leave-worker'):
+            delete(ftp, f'{DATA}/{stale}')
+        if env:
+            set_env(ftp, env)
+        put_text(ftp, f'{DATA}/unload', '-\n')
+        if request_consumed(ftp, 'unload', TAKE_SECONDS):
+            return True
+        delete(ftp, f'{DATA}/unload')
+        return False
+
+
+def write_env(address, env):
+    """Set `env`'s lines of env.txt now; True when it changed (they apply at the next start)."""
+    with console_ftp(address) as ftp:
+        return set_env(ftp, env)
 
 
 def quit_app(address):
