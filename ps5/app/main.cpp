@@ -47,6 +47,7 @@
 
 #include "dashboard.hpp"
 #include "log.hpp"
+#include "log_sink.hpp"
 #include "fetch.hpp"
 #include "fleet_worker.hpp"
 #include "market.hpp"
@@ -227,6 +228,7 @@ void quit_if_asked() {
     unlink(g_files.quit.c_str());
     ps5lm::log_line("quit requested\n");
     std::fflush(nullptr);
+    log_sink_flush(1000);
     sceSystemServiceLoadExec("exit", nullptr);
 }
 
@@ -299,6 +301,13 @@ void log_memory(const char * when, bool devices = true) {
     ps5lm::log_line("memory %s: pool %.4f GiB, pool free %.2f GiB, flexible %zu MiB (%zu free), cpu heap %.2f GiB "
                     "(peak %.2f)", when, pool / 1073741824.0, avail / 1073741824.0, flex >> 20, flex_free >> 20,
                     heap.mapped_bytes / 1073741824.0, heap.peak_bytes / 1073741824.0);
+    // The log sink's own figures: how far behind /data fell.
+    const LogSinkStats sink = log_sink_stats();
+    if (sink.running) {
+        std::printf(", log %llu KiB written, %llu KiB dropped, slowest write %llu ms",
+                    (unsigned long long) (sink.bytes_written >> 10), (unsigned long long) (sink.bytes_dropped >> 10),
+                    (unsigned long long) sink.slowest_write_ms);
+    }
     for (size_t i = 0; devices && i < ggml_backend_dev_count(); i++) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(ggml_backend_dev_get(i), &free, &total);
@@ -817,19 +826,17 @@ int main(int, char **) {
     set_data_root(full ? kFullRoot : kAppRoot);
     g_files = Files(data_root());
     mkdir(data_root().c_str(), 0777);
-    // stdout and stderr to a file the PC can fetch over FTP. Both append: with
-    // stdout at its own offset ("w"), each of its lines overwrote the stderr
-    // lines appended before it, so nothing from stderr survived in app.log.
-    if (std::FILE * f = std::fopen(g_files.log.c_str(), "w")) {
-        std::fclose(f);
-    }
-    if (std::freopen(g_files.log.c_str(), "a", stdout) != nullptr) {
-        setvbuf(stdout, nullptr, _IOLBF, 0);
-    }
-    if (std::freopen(g_files.log.c_str(), "a", stderr) != nullptr) {
-        setvbuf(stderr, nullptr, _IONBF, 0);
-    }
+    // stdout and stderr to a file the PC can fetch over FTP, through the log
+    // sink (log_sink.hpp): a print never waits for /data. If the sink cannot
+    // start, both streams append to the file directly, as before.
+    std::string sink_why;
+    const bool  sink = log_sink_start(g_files.log, &sink_why);
     ps5lm::log_line("version " PS5LM_VERSION "\n");
+    if (sink) {
+        ps5lm::log_line("log sink on: prints go through memory to %s\n", g_files.log.c_str());
+    } else {
+        ps5lm::log_line("log sink off (%s): prints go to %s directly\n", sink_why.c_str(), g_files.log.c_str());
+    }
     ps5lm::log_line("/data %s\n", data.c_str());
     ps5lm::log_line("files in %s\n", storage_line(data).c_str());
     if (!sandbox_path("").empty()) {
@@ -1260,6 +1267,7 @@ int main(int, char **) {
         if (restart_at != 0 && n >= restart_at) {
             std::fflush(nullptr);
             models.stop();
+            log_sink_flush(1000);
             sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
         }
 

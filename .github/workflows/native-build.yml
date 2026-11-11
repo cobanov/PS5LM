@@ -28,6 +28,12 @@ jobs:
           mkdir -p build
           c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
           build/model_plan_test
+      - name: Log sink regression test (prints never wait for the log file)
+        run: |
+          mkdir -p build
+          wraps=-Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite
+          c++ -std=c++17 -O1 -U_FORTIFY_SOURCE -pthread ps5/app/log_sink_test.cpp ps5/app/log_sink.cpp "$wraps" -o build/log_sink_test
+          build/log_sink_test
 
   ps5-title:
     name: Full PS5 title cross-build and static package checks
