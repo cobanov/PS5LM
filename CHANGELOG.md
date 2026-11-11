@@ -19,6 +19,17 @@ v0.1.x are the upstream payload releases by cobanov.
   app, restarts a worker as a worker. It reads `env.txt` again, so its settings
   change without anyone at the console.
 - A worker logs its memory once it has started, and when `/data/PS5LM/memory` is there.
+- **A fleet worker can keep the weights hosts send** (`PS5LM_RPC_CACHE_GB` in
+  `env.txt`, off by default): up to that many GiB in `/data/PS5LM/rpc-cache`, the
+  least recently used dropped first. A host loading the same weights again sends
+  only their hashes. On a console, Ornith 1.5 9B loaded in 17.6 s from the
+  cache against 48.9 s without it (its first load, saving the cache, took
+  113 s).
+  - `patches/fleet/0005`: a cache file is written whole under a temporary name,
+    used only when it hashes to what the host sent, and read in 8 MiB reads.
+    Before, a write cut short left a file that later loaded as the weights.
+  - The files are written through ftpsrv: a title's own writes slow to about
+    1.2 MB/s after 2 GB.
 
 ### Changed
 - **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool

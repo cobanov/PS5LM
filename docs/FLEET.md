@@ -248,6 +248,43 @@ For Qwen3.8-27B-UD-Q4_K_XL split over that PS5 and an RTX 3080, llama.cpp's own
 projection (`llama-fit-params`) then fits a 192k context with a q4_0 cache, where
 160k fit before.
 
+### The weight cache
+
+`PS5LM_RPC_CACHE_GB=N` in env.txt (whole GiB, 1 to 4096; off when 0 or not set,
+PS5LM after v0.11.0) keeps up to N GiB of the weights hosts send, in
+`/data/PS5LM/rpc-cache`. llama.cpp's RPC client offers a tensor of more than 10
+MiB by its hash first; when the worker has it, it reads the tensor from the
+console's storage instead of getting it over the network. That helps when a
+model loads again on the same console: at another context, after a restart or a
+crash, or in another split that gives the console the same blocks. It helps
+most where the network is the limit: many consoles loading from one host at
+once, or a console on Wi-Fi.
+
+- Each file is one tensor under its FNV-1a hash. `patches/fleet/0005` writes it
+  under a temporary name and renames it once whole, and uses it only when it
+  hashes to what the host sent and fits the tensor's buffer. Anything else is
+  dropped, and the host sends the tensor again.
+- The files are written through ftpsrv, as downloads are: the console slows a
+  title's own writes to /data to about 1.2 MB/s after 2 GB. Without an ftpsrv
+  the worker keeps nothing and says so once in `app.log`. They are read in 8 MiB
+  reads: every read call of a title takes about 1.4 ms, so small reads are slow.
+- The worker keeps the folder to N GiB: at start and every 30 s, the least
+  recently used files go first. At start it also removes what a cut-off write
+  left.
+- The fleet control server sets it per console (`cache_gib`, 32 by default) and
+  deletes the files with its `clear-cache` action.
+
+On 2026-11-11, one PS5 on 11.60 over gigabit Ethernet, loading Ornith 1.5 9B
+Q4_K_M (5.4 GiB; 4.2 GiB of it in tensors the cache keeps) from a PC's CPU:
+
+| Load | Seconds |
+|---|---|
+| No cache | 48.9 |
+| First load, saving the cache | 113 |
+| From the cache | 17.6 |
+
+Every load gave the same answer at temperature 0.
+
 **Restart the worker title between different model runs and after errors.**
 PS5LM documents retained Vulkan memory after in-process unload; this increment
 does not promise safe hot reload. Stop through the normal title-close / existing
