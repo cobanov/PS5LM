@@ -4,16 +4,96 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace ps5lm {
+
+namespace {
+
+bool hex16(const std::string & s, size_t at) {
+    return s.size() >= at + 16 && std::all_of(s.begin() + at, s.begin() + at + 16, [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+// The names llama.cpp's RPC cache writes (patches/fleet/0005): a tensor's FNV-1a
+// hash as 16 hex digits, and <hash>.<16 hex digits>.part while one is written.
+bool cache_file_name(const std::string & name) {
+    return name.size() == 16 && hex16(name, 0);
+}
+
+bool part_file_name(const std::string & name) {
+    return name.size() == 38 && hex16(name, 0) && name[16] == '.' && hex16(name, 17) && name.compare(33, 5, ".part") == 0;
+}
+
+}  // namespace
+
+RpcCacheUse prune_rpc_cache(const RpcCache & cache, bool at_start) {
+    namespace fs = std::filesystem;
+    RpcCacheUse use;
+    if (cache.dir.empty()) {
+        return use;
+    }
+    std::error_code ec;
+    if (at_start) {
+        fs::create_directories(cache.dir, ec);
+    }
+    struct File {
+        fs::file_time_type time;
+        uint64_t           size;
+        fs::path           path;
+    };
+    std::vector<File> files, parts;
+    for (fs::directory_iterator it(cache.dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        const bool part = part_file_name(name);
+        std::error_code e;
+        if ((!part && !cache_file_name(name)) || !it->is_regular_file(e)) {
+            continue;
+        }
+        const uint64_t size = it->file_size(e);
+        const fs::file_time_type time = e ? fs::file_time_type{} : it->last_write_time(e);
+        if (!e) {
+            (part ? parts : files).push_back({ time, size, it->path() });
+        }
+    }
+    // A .part is a write in progress, or one cut off: only before the worker runs is it the latter.
+    for (const File & f : parts) {
+        std::error_code e;
+        if (at_start && fs::remove(f.path, e)) {
+            ++use.dropped;
+            use.dropped_bytes += f.size;
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const File & a, const File & b) { return a.time < b.time; });
+    use.files = files.size();
+    for (const File & f : files) {
+        use.bytes += f.size;
+    }
+    // Oldest first: patches/fleet/0005 gives a file the time of its last use.
+    for (const File & f : files) {
+        if (use.bytes <= cache.limit) {
+            break;
+        }
+        std::error_code e;
+        if (fs::remove(f.path, e)) {
+            use.bytes -= f.size;
+            --use.files;
+            ++use.dropped;
+            use.dropped_bytes += f.size;
+        }
+    }
+    return use;
+}
 
 FleetWorkerConfig read_fleet_worker_config(const char * path) {
     // No lstat: a PS5 title gets EPERM from it (seen on a console). Opening with
@@ -59,7 +139,7 @@ FleetWorkerConfig read_fleet_worker_config(const char * path) {
     return parse_fleet_worker_config(std::string(data, size));
 }
 
-std::string run_fleet_worker(const FleetWorkerConfig & config) {
+std::string run_fleet_worker(const FleetWorkerConfig & config, const RpcCache & cache) {
     // Revalidate at the listener boundary, even if a caller bypassed the file reader.
     if (config.state != FleetWorkerConfig::enabled ||
         parse_fleet_worker_config(config.endpoint + "\nI_UNDERSTAND_RPC_IS_UNAUTHENTICATED\n").state != FleetWorkerConfig::enabled) {
@@ -100,9 +180,11 @@ std::string run_fleet_worker(const FleetWorkerConfig & config) {
             "ps5lm-fleet: exporting only %s; local model server/downloads are disabled\n",
             RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, RPC_PROTO_PATCH_VERSION,
             config.endpoint.c_str(), ggml_backend_dev_name(device));
-        // No cache: avoids unbounded disk growth and HOME dependence. TCP only
-        // (GGML_RPC_RDMA=OFF). The host sends the assigned weights over this socket.
-        ggml_backend_rpc_start_server(config.endpoint.c_str(), nullptr, 6, 1, &device);
+        // TCP only (GGML_RPC_RDMA=OFF). The host sends the assigned weights over
+        // this socket, or, with a cache, the hashes of those the console kept:
+        // in a fixed folder (no HOME), and kept to its size by prune_rpc_cache.
+        ggml_backend_rpc_start_server(config.endpoint.c_str(), cache.dir.empty() ? nullptr : cache.dir.c_str(),
+                                      6, 1, &device);
         return "RPC stopped or failed to bind; inspect /data/PS5LM/app.log and restart the title";
     } catch (const std::exception & ex) {
         return std::string("RPC worker failed: ") + ex.what();

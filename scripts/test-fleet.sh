@@ -26,6 +26,7 @@ if [[ ${1:-} == --rpc ]]; then
         "$(dirname "$(command -v "${CMAKE:-cmake}")")/ctest" --test-dir "$out" -R '^test-rpc-multi-server$'
     python3 tests/fleet_rpc_no_comm_test.py --binary "$out/bin/ggml-rpc-server"
     python3 tests/fleet_rpc_smoke.py --build "$out"
+    python3 tests/fleet_rpc_cache_test.py --build "$out"
     python3 tests/server_system_messages_test.py --build "$out"
 elif [[ $# != 0 ]]; then
     echo 'usage: scripts/test-fleet.sh [--rpc]' >&2
