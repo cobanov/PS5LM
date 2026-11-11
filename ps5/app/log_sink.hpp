@@ -37,6 +37,7 @@ struct LogSinkStats {
     bool     running       = false;
     uint64_t bytes_in      = 0;  // printed to stdout and stderr
     uint64_t bytes_written = 0;  // written to the file
+    uint64_t bytes_failed  = 0;  // refused by storage (disk full, I/O error)
     uint64_t bytes_dropped = 0;  // the ring was full
     uint64_t slowest_write_ms = 0;  // the longest single write to the file
 };

@@ -91,19 +91,26 @@ void note_drops_locked(size_t room_needed_after) {
     }
 }
 
-// Text into the ring. Waits only for the ring's lock, held for a copy.
-void push(const char * p, size_t n) {
-    if (n == 0) {
+// Text into the ring: what one print call writes (puts: the text and its
+// newline) goes in under one lock, so another thread's text cannot land in
+// between. Waits only for the ring's lock, held for a copy.
+void push(const char * p, size_t n, const char * p2 = nullptr, size_t n2 = 0) {
+    const size_t total = n + n2;
+    if (total == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(g.mtx);
-    g.stats.bytes_in += n;
-    note_drops_locked(n);
-    const size_t take = std::min(n, g.ring.size() - g.held);
+    g.stats.bytes_in += total;
+    note_drops_locked(total);
+    size_t       room  = g.ring.size() - g.held;
+    const size_t take  = std::min(n, room);
     put_locked(p, take);
-    if (take < n) {
-        g.stats.bytes_dropped += n - take;
-        g.unreported += n - take;
+    room -= take;
+    const size_t take2 = std::min(n2, room);
+    put_locked(p2, take2);
+    if (take + take2 < total) {
+        g.stats.bytes_dropped += total - take - take2;
+        g.unreported += total - take - take2;
     }
     g.has_text.notify_one();
 }
@@ -128,18 +135,21 @@ int push_vformat(const char * fmt, va_list ap) {
     return n;
 }
 
-void write_all(int fd, const char * p, size_t n) {
-    while (n > 0) {
-        const ssize_t w = write(fd, p, n);
+// The bytes storage took; fewer when it refuses (disk full, I/O error): the
+// rest is lost and the app goes on.
+size_t write_all(int fd, const char * p, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t w = write(fd, p + done, n - done);
         if (w < 0 && errno == EINTR) {
             continue;
         }
         if (w <= 0) {
-            return;  // storage refused it: the text is lost, the app goes on
+            break;
         }
-        p += w;
-        n -= (size_t) w;
+        done += (size_t) w;
     }
+    return done;
 }
 
 // Ring to file, in large writes. The only thread that waits for storage.
@@ -159,15 +169,19 @@ void writer() {
         lock.unlock();
 
         const Clock::time_point t0 = Clock::now();
-        write_all(g.out_fd, chunk.data(), n);
+        const size_t done = write_all(g.out_fd, chunk.data(), n);
         const uint64_t ms =
             (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
 
         lock.lock();
         g.writing = false;
-        g.stats.bytes_written += n;
+        g.stats.bytes_written += done;
+        g.stats.bytes_failed += n - done;
         g.stats.slowest_write_ms = std::max(g.stats.slowest_write_ms, ms);
-        if (g.held == 0) {
+        // A drop not yet noted (the ring was full) is noted now there is room,
+        // and written on the next pass.
+        note_drops_locked(0);
+        if (g.held == 0 && g.unreported == 0) {
             g.written.notify_all();
         }
     }
@@ -231,7 +245,7 @@ void log_sink_flush(int ms) {
     if (g.held > 0) {
         g.has_text.notify_one();
     }
-    g.written.wait_until(lock, deadline, [] { return g.held == 0 && !g.writing; });
+    g.written.wait_until(lock, deadline, [] { return g.held == 0 && !g.writing && g.unreported == 0; });
 }
 
 LogSinkStats log_sink_stats() {
@@ -280,8 +294,7 @@ int __wrap_puts(const char * s) {
     if (!ps5lm::ours(stdout)) {
         return __real_puts(s);
     }
-    ps5lm::push(s, std::strlen(s));
-    ps5lm::push("\n", 1);
+    ps5lm::push(s, std::strlen(s), "\n", 1);
     return 1;
 }
 

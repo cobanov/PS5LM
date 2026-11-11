@@ -307,6 +307,9 @@ void log_memory(const char * when, bool devices = true) {
         std::printf(", log %llu KiB written, %llu KiB dropped, slowest write %llu ms",
                     (unsigned long long) (sink.bytes_written >> 10), (unsigned long long) (sink.bytes_dropped >> 10),
                     (unsigned long long) sink.slowest_write_ms);
+        if (sink.bytes_failed > 0) {
+            std::printf(", %llu KiB refused by storage", (unsigned long long) (sink.bytes_failed >> 10));
+        }
     }
     for (size_t i = 0; devices && i < ggml_backend_dev_count(); i++) {
         size_t free = 0, total = 0;
