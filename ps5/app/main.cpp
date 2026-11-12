@@ -971,6 +971,17 @@ int main(int, char **) {
             if (n % 60 == 0) {
                 quit_if_asked();  // Existing safe title-close path; not cancellation in a GPU call.
                 keep_awake(!failed);
+                // The control server (python3 -m fleet control) takes a console
+                // out of worker mode with its own request: forget the worker
+                // config and restart as the normal app, the way a model change
+                // restarts it (LoadExec on our own eboot.bin), so no one has to
+                // open PS5LM on the console again.
+                if (!take_request_file("/data/PS5LM/leave-worker").empty()) {
+                    unlink(kFleetWorker);
+                    ps5lm::log_line("fleet: leaving worker mode, restarting as the app\n");
+                    std::fflush(nullptr);
+                    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+                }
             }
         }
     }

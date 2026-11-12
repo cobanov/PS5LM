@@ -46,7 +46,7 @@ fi
     -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
     -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
 "$cmake_bin" --build "$out" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}" \
-    --target llama-server llama-cli ggml-rpc-server test-rpc-multi-server
+    --target llama-server llama-cli ggml-rpc-server llama-fit-params test-rpc-multi-server
 python3 - "$out" "$actual" "$(git -C "$root" rev-parse HEAD)" "$root" "$gpu" <<'PY_MANIFEST'
 import hashlib
 import json
