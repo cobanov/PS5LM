@@ -467,20 +467,38 @@ class FleetTests(unittest.TestCase):
         (view,) = self.fleet.snapshot()['devices']
         self.assertTrue(view['settings_pending'])
 
-    def test_a_pool_start_restarts_a_worker_with_other_settings(self):
+    def test_a_split_starts_on_a_freshly_started_worker(self):
+        # The console's driver keeps memory an earlier host allocated: every split
+        # restarts its consoles' workers first, with their settings.
         self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[pool(replicas=[dict(devices=['ps5-a', 'pc-gpu'])])]))
         (replica,) = self.fleet.replicas
         device = self.fleet.device('ps5-a')
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
-                patch.object(devices, 'write_env', return_value=True), \
                 patch.object(devices, 'restart', return_value=True) as restart, \
                 patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
             self.fleet._ensure_worker(device, replica)
         restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 32))
-        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
-                patch.object(devices, 'write_env', return_value=False), patch.object(devices, 'restart') as restart:
-            self.fleet._ensure_worker(device, replica)                 # its settings already: used as it is
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker', busy=True)), \
+                patch.object(devices, 'restart') as restart:
+            self.fleet._ensure_worker(device, replica)                 # in use by someone: left alone
         restart.assert_not_called()
+
+    def test_a_starting_split_is_not_probed(self):
+        # Probing a console's one-client RPC server while a split connects to it
+        # several times in a row could take the slot llama-server needs.
+        self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[pool(replicas=[dict(devices=['ps5-a', 'pc-gpu'])])]))
+        (replica,) = self.fleet.replicas
+        self.fleet.status['ps5-a'] = dict(mode='worker', checked=0)
+        replica.state = 'starting'
+        with patch.object(devices, 'ps5_mode') as mode:
+            self.fleet._probe(self.fleet.device('ps5-a'))
+        mode.assert_not_called()
+        self.assertEqual(self.fleet.status['ps5-a']['mode'], 'worker')
+        replica.state = 'ready'
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker', busy=True)) as mode, \
+                patch.object(devices, 'cache_use', return_value=None):
+            self.fleet._probe(self.fleet.device('ps5-a'))
+        mode.assert_called_once()
 
     def test_an_older_worker_is_restarted_by_leaving_worker_mode(self):
         self.fleet.add_device(ps5())

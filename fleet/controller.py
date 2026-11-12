@@ -61,6 +61,12 @@ def command(binary, model_path, placement, port=8081, host='127.0.0.1', api_key=
             '--fit', 'off', *cache_args(placement),
             '--load-mode', 'mmap', '--lazy-mode', 'off', '--no-op-offload',
             '--batch-size', str(UBATCH), '--ubatch-size', str(UBATCH), '--no-warmup',
+            # Sampling where the logits are, on the worker with the output layer:
+            # one token id comes back instead of the logits (about 1 MB a token
+            # for a 248k vocabulary). On a PS5 alone, 16.0 -> 18.4 tok/s for
+            # Qwen3.8-27B, with the same greedy output (2026-11-11). Requests
+            # that ask for log-probabilities are sampled on the host as before.
+            '--backend-sampling',
             # Saving a prompt cache or a checkpoint reads the KV cache or
             # recurrent state back from every worker over the network; keep one
             # checkpoint (what hybrid models need to reuse a prompt) and no RAM

@@ -1031,15 +1031,14 @@ class Fleet:
         if mode == 'worker':
             if status.get('busy'):
                 return
-            # A worker started before its settings changed, or with other ones by
-            # hand: restart it first, so the split gets the memory and the cache
-            # it is set up for.
-            stale = devices.write_env(device['address'], env)
-            with self.lock:
-                stale = stale or name in self.env_pending
-            if stale:
-                replica.detail = f'restarting {name} with its settings'
-                self._restart_worker(device, env, replica)
+            # Every split starts on a freshly started worker. The console's driver
+            # keeps much of what an earlier host allocated after it disconnects
+            # (12.12 GiB free at start, 7.08 GiB after one 27B session, measured
+            # 2026-11-11), so a second load can run out of memory. The restart also
+            # applies the console's settings; it takes 4 s, and the weights come
+            # back from the console's cache.
+            replica.detail = f'restarting {name} for a clean start'
+            self._restart_worker(device, env, replica)
             return
         if mode == 'offline':
             raise ControlError(f'{name} does not answer: off, in rest mode, or not jailbroken since it started')
@@ -1178,8 +1177,18 @@ class Fleet:
             process = self.rpc_servers.get(device['id'])
             direct = any(r.via == 'direct' and device['id'] in r.spec['devices']
                          and r.state in ('starting', 'ready') for r in self.replicas)
+            # A split being started connects to its consoles' RPC servers several
+            # times in a row (memory probe, llama.cpp's check, llama-server). Each
+            # serves one client with a listen queue of one, and a probe between
+            # two of those connections made llama-server's single attempt fail.
+            starting = device['kind'] == 'ps5' and any(
+                device['id'] in r.spec.get('devices', []) and r.via == 'rpc' and r.state == 'starting'
+                for r in self.replicas)
+            previous = dict(self.status.get(device['id'], {}))
         try:
-            if device['kind'] == 'ps5':
+            if starting:
+                status = {k: v for k, v in previous.items() if k != 'checked'} or dict(mode='worker')
+            elif device['kind'] == 'ps5':
                 status = devices.ps5_mode(device['address'], device['port'])
                 with self.lock:
                     seen = self.cache_seen.get(device['id'], {})

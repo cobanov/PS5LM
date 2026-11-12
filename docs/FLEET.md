@@ -398,9 +398,21 @@ context means more devices per replica. Both work at once: 100 consoles can be
 
 **Running pools are kept running.** Starting a pool (`"running": true`) starts
 its replicas:
-- A split makes its consoles workers when they are not (over FTP, as below) and
-  starts the GPU's RPC worker. It probes their free memory, plans, checks with
-  llama.cpp, and starts llama-server on a local port.
+- A split makes its consoles workers when they are not (over FTP, as below),
+  and restarts a console that already is one: the console's driver keeps much
+  of what an earlier host allocated after it disconnects (12.12 GiB free at
+  start, 7.08 GiB after one 27B session), so a second load could run out of
+  memory. The restart takes 4 s, and the weights come back from the console's
+  cache. It starts the GPU's RPC worker, probes the free memory, plans, checks
+  with llama.cpp, and starts llama-server on a local port. The watcher leaves a
+  console's port alone while a split on it starts: its RPC server takes one
+  client at a time, and a probe between those connections made llama-server's
+  one attempt fail.
+- llama-server samples on the worker that has the output layer
+  (`--backend-sampling`), so a token comes back instead of the logits, about
+  1 MB a token for a 248k vocabulary. On a PS5 alone, Qwen3.8-27B went from 16.0
+  to 18.4 tokens/s with the same greedy output. Requests that ask for
+  log-probabilities are sampled on the host, as before.
 - The control server watches every device and replica. A replica that fails,
   loses a device (a console that stops answering or leaves worker mode) or stops
   answering is marked failed. It starts again after 15 s, then 30 s, and so on
