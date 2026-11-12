@@ -53,6 +53,11 @@ v0.1.x are the upstream payload releases by cobanov.
     **clear-cache**.
   - Consoles keep back 512 MiB for llama.cpp's compute buffers by default, GPUs
     and RPC servers 1024.
+  - A split restarts its consoles' workers before it loads: the console's driver
+    keeps memory an earlier host allocated, and a second load ran out of it. The
+    watcher does not probe a console while a split on it starts.
+  - Splits sample on the worker with the output layer (`--backend-sampling`):
+    18.4 instead of 16.0 tokens/s for Qwen3.8-27B on a PS5 alone.
   - A version 1 `control.json` (one list of workers) becomes devices and a stopped
     pool.
 - **Long contexts in a split**:

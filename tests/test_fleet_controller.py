@@ -176,6 +176,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args[args.index('--ubatch-size')+1], str(planner.UBATCH))
         self.assertEqual(args[args.index('--ctx-checkpoints')+1], '1')
         self.assertEqual(args[args.index('--cache-ram')+1], '0')
+        self.assertIn('--backend-sampling', args)   # the token comes back from the worker, not the logits
 
     def test_check_margin_scales_down_for_small_budgets(self):
         self.assertEqual(controller.check_margin(12000), controller.CHECK_MARGIN_MIB)
