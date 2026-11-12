@@ -439,6 +439,19 @@ PS5LM's request files, so no one has to be at the console:
   mode and is made a worker again (25 s on a console).
 - **clear-cache** deletes the weights the worker keeps
   (`/data/PS5LM/rpc-cache`).
+- **launch** opens a closed (or crashed) PS5LM: it sends PS5LM's launch payload
+  (`ps5/app/launch_app.c`, built as `build/app-ps5/launch-PPSA99575.elf`; the
+  `launcher` setting points at another copy) to an ELF loader on the console's
+  port 9021, which runs it. The title opens as a worker when `fleet-worker.txt`
+  is there, as the app otherwise. A split, `worker` and `restart` do the same
+  when they find PS5LM closed, so a console whose title crashed comes back by
+  itself on the replica's next retry. Without a loader on 9021 they say so, as
+  before. On a PS5 on 11.60 the worker answered 2 s after the payload was sent.
+
+  OnionHEN does not expose an ELF loader of its own (it keeps a private one on
+  9020). One way to have one on 9021 every boot is ps5-payload-dev's elfldr as
+  an OnionHEN plugin: OnionHEN starts a plugin only when it starts, and only
+  with a `<id>.elf.auto_start` marker next to it, or from Toolbox, Plugins.
 - **quit** closes PS5LM, and **unload** stops a model it serves.
 - A device's mode comes from the network:
   - `worker`: its RPC port answers.

@@ -18,10 +18,12 @@
                                350 MiB more for the model), cache_gib=64 (default 32,
                                0 for none: the weights it keeps, so a reload is local)
   device rm ID
-  device worker|leave|restart|quit|unload|clear-cache ID [--wait]
+  device worker|leave|restart|launch|quit|unload|clear-cache ID [--wait]
                                a console: into worker mode, out of it (PS5LM restarts as
-                               the app), restart it as it is (with its settings), quit
-                               PS5LM, unload its model, or delete its cached weights
+                               the app), restart it as it is (with its settings), open a
+                               closed PS5LM (needs an ELF loader on the console's port
+                               9021), quit PS5LM, unload its model, or delete its cached
+                               weights
   device worker|stop ID        a local GPU: start or stop its RPC worker
 
   pool add ID --model PATH|URL [--sha256 HEX] [--context N] [--slots N] [--shared-context]
@@ -172,7 +174,7 @@ def parser():
     edit.add_argument('id')
     edit.add_argument('pairs', nargs='+', metavar='KEY=VALUE')
     device.add_parser('rm').add_argument('id')
-    for action in ('worker', 'leave', 'restart', 'quit', 'unload', 'clear-cache', 'stop'):
+    for action in ('worker', 'leave', 'restart', 'launch', 'quit', 'unload', 'clear-cache', 'stop'):
         command = device.add_parser(action)
         command.add_argument('id')
         command.add_argument('--wait', action='store_true', help='wait for the action to finish')

@@ -58,7 +58,12 @@ CONFIG_PATH = controller.ROOT / 'fleet' / 'control.json'
 PAGE = Path(__file__).with_name('control.html')
 BIN = controller.ROOT / 'build' / 'fleet-host' / 'bin'
 UNBOUNDED_MIB = 1 << 20    # a device without a budget: capped by the free memory it reports
-SETTINGS = dict(api_port=8081, api_lan=False, api_key='', host_memory_mib=8192, host_reserve_mib=2048, lan='')
+# launcher: PS5LM's launch payload (ps5/app/launch_app.c), which an ELF loader on the
+# console's port 9021 runs to open PS5LM, so a closed or crashed console comes back
+# without anyone there. Empty: the app build's own copy, when there is one.
+SETTINGS = dict(api_port=8081, api_lan=False, api_key='', host_memory_mib=8192, host_reserve_mib=2048, lan='',
+                launcher='')
+DEFAULT_LAUNCHER = controller.ROOT / 'build' / 'app-ps5' / 'launch-PPSA99575.elf'
 POOL_FIELDS = dict(model='', sha256='', context=32768, slots=1, shared_context=False, cache_type='q8_0',
                    flash_attn=True, running=False, aliases=[], replicas=[])
 SERVING = ('model', 'sha256', 'context', 'slots', 'shared_context', 'cache_type', 'flash_attn')
@@ -73,7 +78,8 @@ DEFAULT_RESERVE = dict(ps5=512, gpu=1024, rpc=1024)
 # about 350 MiB the model can have. 32 GiB of the weights hosts send are kept.
 CONSOLE_FIELDS = dict(screen=False, cache_gib=32)
 CACHE_GIB_MAX = 4096
-ACTIONS = dict(ps5=('worker', 'leave', 'restart', 'quit', 'unload', 'clear-cache'), gpu=('worker', 'stop'), rpc=())
+ACTIONS = dict(ps5=('worker', 'leave', 'restart', 'launch', 'quit', 'unload', 'clear-cache'), gpu=('worker', 'stop'),
+               rpc=())
 CACHE_CHECK_SECONDS = 60   # how often a console's weight cache is listed (FTP)
 LIMITS = dict(devices=1024, pools=64, replicas=256)
 REPLICA_PORTS = range(18100, 19100)
@@ -258,6 +264,8 @@ def validate_config(raw):
     _secret(config['api_key'], 'The API key')
     _int(config, 'host_memory_mib', 256, UNBOUNDED_MIB)
     _int(config, 'host_reserve_mib', 1, UNBOUNDED_MIB)
+    if not isinstance(config['launcher'], str) or len(config['launcher']) > 4096:
+        raise ControlError('launcher is the path of launch-PPSA99575.elf on this computer, or empty')
     if not isinstance(config['lan'], str):
         raise ControlError('lan is a network such as 192.168.1.0/24, or empty')
     if config['lan']:
@@ -586,6 +594,20 @@ class Fleet:
                 self.env_pending.add(device_id)
             self.note(f'{device_id}: {exc}; the settings apply at its next restart')
 
+    def launcher(self):
+        with self.lock:
+            return Path(self.config['launcher']) if self.config['launcher'] else DEFAULT_LAUNCHER
+
+    def _open_console(self, device, replica=None):
+        """Open PS5LM on a console where it is closed (or crashed): send the launch
+        payload to its ELF loader on 9021. False when it cannot be opened from here
+        (no loader, or no launcher file). It opens as a worker when fleet-worker.txt
+        is there, as the app otherwise; the caller waits for what it expects."""
+        if not devices.launch_app(device['address'], self.launcher()):
+            return False
+        self.note(f"{device['id']}: opening PS5LM through the ELF loader on {devices.ELF_LOADER_PORT}")
+        return True
+
     def _restart_worker(self, device, env, replica=None):
         """Restart a console's worker after setting `env` in env.txt. A worker of an
         older PS5LM does not take the restart request: it leaves worker mode, and
@@ -593,8 +615,13 @@ class Fleet:
         name, address, port = device['id'], device['address'], device['port']
         if not devices.restart(address, env):
             if devices.leave_worker(address) != 'restarted':
-                raise ControlError(f'{name}: this PS5LM cannot restart by itself, so it quit; open it on the console')
-            if not devices.make_worker(address, port, env):
+                # An older build can only quit, and leave_worker removed its
+                # fleet-worker.txt. Write it again (the app is closed, so nothing
+                # takes the request), then open PS5LM, which starts as a worker.
+                devices.make_worker(address, port, env)
+                if not self._open_console(device, replica):
+                    raise ControlError(f'{name}: this PS5LM cannot restart by itself, so it quit; open it on the console')
+            elif not devices.make_worker(address, port, env):
                 raise ControlError(f'{name}: PS5LM did not take the request to become a worker again')
         with self.lock:
             self.env_pending.discard(name)
@@ -734,19 +761,30 @@ class Fleet:
                 return f"deleted {cleared['files']} cached tensors, {cleared['mib'] / 1024:.1f} GiB"
             if mode == 'offline':
                 raise ControlError('the console does not answer: off, in rest mode, or not jailbroken since it started')
+            if action == 'launch':
+                if mode != 'idle':
+                    return f'PS5LM is already open ({mode})'
+                if not self._open_console(device):
+                    raise ControlError('cannot open PS5LM from here: no ELF loader on port 9021, or no launcher '
+                                       f'at {self.launcher()}')
+                return 'asked the console to open PS5LM'
             if action == 'restart':
                 if mode == 'worker':
                     if status.get('busy'):
                         raise ControlError('its worker is serving a split; stop that first')
                     return self._restart_worker(device, env)
                 if not devices.restart(address):
-                    raise ControlError('PS5LM is not open; open it on the console')
+                    if not self._open_console(device):
+                        raise ControlError('PS5LM is not open; open it on the console')
+                    return 'PS5LM was closed; asked the console to open it'
                 return 'asked PS5LM to restart' + (' with its model' if mode in ('serving', 'loading') else '')
             if action == 'worker':
                 if mode == 'worker':
                     return 'already a worker'
                 if not devices.make_worker(address, port, env):
-                    return 'PS5LM is not open; it starts as a worker when it is opened'
+                    # Closed: fleet-worker.txt is written, so it opens as a worker.
+                    if not self._open_console(device):
+                        return 'PS5LM is not open; it starts as a worker when it is opened'
                 with self.lock:
                     self.env_pending.discard(device_id)
                 if self._wait_port(address, port, 150):
@@ -1044,7 +1082,10 @@ class Fleet:
             raise ControlError(f'{name} does not answer: off, in rest mode, or not jailbroken since it started')
         replica.detail = f'making {name} a worker'
         if not devices.make_worker(device['address'], device['port'], env):
-            raise ControlError(f'PS5LM is not open on {name}; open it and it starts as a worker')
+            # Closed or crashed: fleet-worker.txt is written, so it opens as a worker.
+            replica.detail = f'opening PS5LM on {name}'
+            if not self._open_console(device, replica):
+                raise ControlError(f'PS5LM is not open on {name}; open it and it starts as a worker')
         with self.lock:
             self.env_pending.discard(name)
         replica.detail = f'waiting for {name} to restart as a worker'

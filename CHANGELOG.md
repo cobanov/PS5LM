@@ -58,6 +58,9 @@ v0.1.x are the upstream payload releases by cobanov.
     watcher does not probe a console while a split on it starts.
   - Splits sample on the worker with the output layer (`--backend-sampling`):
     18.4 instead of 16.0 tokens/s for Qwen3.8-27B on a PS5 alone.
+  - A closed or crashed PS5LM is opened from the control server (`launch`, and
+    automatically by splits, `worker` and `restart`), through an ELF loader on
+    the console's port 9021 and PS5LM's launch payload.
   - A version 1 `control.json` (one list of workers) becomes devices and a stopped
     pool.
 - **Long contexts in a split**:

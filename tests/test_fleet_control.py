@@ -278,6 +278,37 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual([p for _, p, _ in self.stored()], ['/data/PS5LM/unload'])   # env.txt was already so
         self.assertEqual(FakeFTP.log[-1], ('DELE', '/data/PS5LM/unload'))
 
+    def test_launch_sends_the_payload_to_the_elf_loader(self):
+        import socket
+        with tempfile.TemporaryDirectory() as folder:
+            launcher = Path(folder) / 'launch-PPSA99575.elf'
+            launcher.write_bytes(b'\x7fELF payload')
+            with socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen(1)
+                port = listener.getsockname()[1]
+                received = []
+
+                def accept():
+                    # Like elfldr: one connection after another (launch_app probes
+                    # the port first, then sends the payload on a new connection).
+                    while not received or not received[-1]:
+                        conn, _ = listener.accept()
+                        with conn:
+                            chunks = []
+                            while chunk := conn.recv(1 << 16):
+                                chunks.append(chunk)
+                            received.append(b''.join(chunks))
+                server = threading.Thread(target=accept)
+                server.start()
+                with patch.object(devices, 'ELF_LOADER_PORT', port):
+                    self.assertTrue(devices.launch_app('127.0.0.1', launcher))
+                server.join(5)
+            self.assertEqual(received[-1], b'\x7fELF payload')
+            self.assertFalse(devices.launch_app('127.0.0.1', Path(folder) / 'missing.elf'))
+        with patch.object(devices, 'port_probe', return_value='refused'):
+            self.assertFalse(devices.launch_app('192.168.50.21', launcher))   # no loader on the console
+
     def test_the_weight_cache_is_listed_and_cleared(self):
         self.assertIsNone(devices.cache_use('192.168.50.21'))       # no folder: no cache yet
         FakeFTP.folders[devices.CACHE_DIR] = {'00000000000000a1': 3 << 20, '00000000000000a2': 1 << 20,
@@ -499,6 +530,36 @@ class FleetTests(unittest.TestCase):
                 patch.object(devices, 'cache_use', return_value=None):
             self.fleet._probe(self.fleet.device('ps5-a'))
         mode.assert_called_once()
+
+    def test_a_closed_console_is_opened_through_its_elf_loader(self):
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')), \
+                patch.object(devices, 'launch_app', return_value=True) as launch:
+            self.fleet.device_action('ps5-a', 'launch')
+            (job,) = self.finished()
+        self.assertEqual(job['result'], 'asked the console to open PS5LM')
+        launch.assert_called_once_with('192.168.50.21', control.DEFAULT_LAUNCHER)
+        # Without a loader it says so, instead of claiming it opened.
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')), \
+                patch.object(devices, 'launch_app', return_value=False):
+            self.fleet.device_action('ps5-a', 'launch')
+            job = self.finished()[-1]
+        self.assertEqual(job['state'], 'failed')
+        self.assertIn('no ELF loader on port 9021', job['result'])
+
+    def test_a_split_reopens_a_crashed_console_as_a_worker(self):
+        # PS5LM gone (ftpsrv still answers): fleet-worker.txt is written, then the
+        # console is opened through its ELF loader and comes back as a worker.
+        self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[pool(replicas=[dict(devices=['ps5-a', 'pc-gpu'])])],
+                              launcher='/opt/launch.elf'))
+        (replica,) = self.fleet.replicas
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')), \
+                patch.object(devices, 'make_worker', return_value=False) as make, \
+                patch.object(devices, 'launch_app', return_value=True) as launch, \
+                patch.object(self.fleet, '_wait_port', return_value=True):
+            self.fleet._ensure_worker(self.fleet.device('ps5-a'), replica)
+        make.assert_called_once()
+        launch.assert_called_once_with('192.168.50.21', Path('/opt/launch.elf'))
 
     def test_an_older_worker_is_restarted_by_leaving_worker_mode(self):
         self.fleet.add_device(ps5())

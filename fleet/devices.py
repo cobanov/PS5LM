@@ -418,6 +418,22 @@ def quit_app(address):
         put_text(ftp, f'{DATA}/quit', 'quit\n')
 
 
+ELF_LOADER_PORT = 9021      # elfldr (ps5-payload-dev), or an OnionHEN plugin of it
+
+
+def launch_app(address, launcher, timeout=10):
+    """Open PS5LM on a console from here: send the launcher payload (PS5LM's
+    ps5/app/launch_app.c, built as build/app-ps5/launch-PPSA99575.elf) to the
+    console's ELF loader, which runs it; it asks the system to start the title
+    for the foreground user. False when no loader listens or the file is missing."""
+    launcher = Path(launcher)
+    if not launcher.is_file() or port_probe(address, ELF_LOADER_PORT) != 'open':
+        return False
+    with socket.create_connection((address, ELF_LOADER_PORT), timeout=timeout) as sock:
+        sock.sendall(launcher.read_bytes())
+    return True
+
+
 def replica_args(ps5_path, context, slots, cache_type, flash_attn, unified=False):
     """llama-server arguments for a console serving a model by itself, one per line
     in app-args.txt. The planner's settings for the console (ubatch 64, one
