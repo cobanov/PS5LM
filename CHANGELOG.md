@@ -5,6 +5,21 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Changed
+- **Hybrid models start answering sooner**: with one context checkpoint a slot (`-ctxcp 1`,
+  which the app's plan and the fleet use), llama-server made three checkpoints for every prompt
+  (at the last user message, one batch before the end and 4 tokens before it) and evicted two of
+  them before the prompt was done. Each reads the model's recurrent state back from the GPU,
+  150 MiB for Qwen3.8-27B, and for a fleet split that read crosses the network.
+  `patches/0010` makes only the checkpoint a prompt keeps, so the next turn rolls back to the
+  same place as before. On a PS5 serving Qwen3.8-27B (IQ3_XXS, 128k context) to a PC over RPC,
+  LocalMaxxing's 348-token `reasoning-v1` prompt took 7.6 s to its first token and now takes
+  4.5 s, and a follow-up turn 6.6 s and now 3.3 s; generation stays at 18.1 tokens a second.
+  On the console the read stays in memory, and that gain is not measured.
+  `tests/server_checkpoints_test.py` checks it on a host build with an untrained Mamba fixture.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
