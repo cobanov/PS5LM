@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "third_party/llama.cpp/gguf-py"))
 
 
-def make_fixture(path: Path) -> Path:
+def make_fixture(path: Path, head_dim: int = 8) -> Path:
+    """4 query and 2 KV heads of head_dim. A head_dim of 64 or more lets llama.cpp rotate a
+    quantized KV cache (Hadamard), which the default of 8 does not."""
     import numpy as np
     import gguf
 
@@ -20,13 +22,14 @@ def make_fixture(path: Path) -> Path:
     writer = gguf.GGUFWriter(path, "llama")
     writer.add_name("PS5LM deterministic fleet test fixture; untrained")
     writer.add_context_length(256)
-    writer.add_embedding_length(32)
+    embd, kv, ff = 4 * head_dim, 2 * head_dim, 8 * head_dim
+    writer.add_embedding_length(embd)
     writer.add_block_count(4)
-    writer.add_feed_forward_length(64)
+    writer.add_feed_forward_length(ff)
     writer.add_head_count(4)
     writer.add_head_count_kv(2)
     writer.add_layer_norm_rms_eps(1e-5)
-    writer.add_rope_dimension_count(8)
+    writer.add_rope_dimension_count(head_dim)
     writer.add_rope_freq_base(10000.0)
     writer.add_tokenizer_model("llama")
     tokens = ["<unk>", "<s>", "</s>"] + [f"<0x{i:02X}>" for i in range(256)]
@@ -43,21 +46,21 @@ def make_fixture(path: Path) -> Path:
     def weight(name, shape):
         writer.add_tensor(name, (rng.standard_normal(shape) * 0.08).astype(np.float32))
 
-    weight("token_embd.weight", (len(tokens), 32))
-    writer.add_tensor("output_norm.weight", np.ones(32, dtype=np.float32))
-    weight("output.weight", (len(tokens), 32))
+    weight("token_embd.weight", (len(tokens), embd))
+    writer.add_tensor("output_norm.weight", np.ones(embd, dtype=np.float32))
+    weight("output.weight", (len(tokens), embd))
     for layer in range(4):
         prefix = f"blk.{layer}."
-        writer.add_tensor(prefix + "attn_norm.weight", np.ones(32, dtype=np.float32))
-        writer.add_tensor(prefix + "ffn_norm.weight", np.ones(32, dtype=np.float32))
+        writer.add_tensor(prefix + "attn_norm.weight", np.ones(embd, dtype=np.float32))
+        writer.add_tensor(prefix + "ffn_norm.weight", np.ones(embd, dtype=np.float32))
         for name, shape in (
-            ("attn_q.weight", (32, 32)),
-            ("attn_k.weight", (16, 32)),
-            ("attn_v.weight", (16, 32)),
-            ("attn_output.weight", (32, 32)),
-            ("ffn_gate.weight", (64, 32)),
-            ("ffn_down.weight", (32, 64)),
-            ("ffn_up.weight", (64, 32)),
+            ("attn_q.weight", (embd, embd)),
+            ("attn_k.weight", (kv, embd)),
+            ("attn_v.weight", (kv, embd)),
+            ("attn_output.weight", (embd, embd)),
+            ("ffn_gate.weight", (ff, embd)),
+            ("ffn_down.weight", (embd, ff)),
+            ("ffn_up.weight", (ff, embd)),
         ):
             weight(prefix + name, shape)
     writer.write_header_to_file()

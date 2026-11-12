@@ -5,6 +5,20 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Changed
+- **Faster generation with a quantized KV cache on another device**: llama.cpp rotates a
+  quantized KV cache with Hadamard matrices, and it kept them in PC memory and uploaded them
+  to the device as inputs to every graph. For a fleet split those 272 KiB (Qwen3.8-27B's 256- and
+  64-wide heads) crossed the network on each token, about 2.3 ms a graph at gigabit.
+  `patches/0011` keeps one copy in the cache's device buffer when the whole cache is on one
+  device, so they are sent once at load. A PS5 serving Qwen3.8-27B (IQ3_XXS, q4_0 cache) to a
+  PC over RPC on LocalMaxxing's `reasoning-v1` test: 18.1 to 18.7 tokens a second at 128k
+  context, and with MTP self-speculation (2 drafts, 104k context) 20.1 to 21.9. Greedy output is
+  unchanged. A cache split over devices keeps the old inputs. `tests/server_kv_rotation_test.py`
+  checks it on a host build against one CPU RPC worker.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added

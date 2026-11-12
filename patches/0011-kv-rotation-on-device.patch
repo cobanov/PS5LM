@@ -1,0 +1,148 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -384,6 +384,8 @@ llama_kv_cache::llama_kv_cache(
+         }
+     }
+ 
++    init_attn_rot_dev();
++
+     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
+     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+ }
+@@ -1469,7 +1471,81 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
+     return v_idxs;
+ }
+ 
++void llama_kv_cache::init_attn_rot_dev() {
++    if (hparams.no_alloc || (!n_rot_k && !n_rot_v) || layers.empty()) {
++        return;
++    }
++
++    ggml_backend_buffer_type_t buft = nullptr;
++    for (const auto & layer : layers) {
++        for (const ggml_tensor * t : { layer.k, layer.v }) {
++            if (!t) {
++                continue;
++            }
++            if (!t->buffer) {
++                return;
++            }
++            ggml_backend_buffer_type_t layer_buft = ggml_backend_buffer_get_type(t->buffer);
++            if (buft && layer_buft != buft) {
++                return; // split over devices: keep the matrices as graph inputs
++            }
++            buft = layer_buft;
++        }
++    }
++    if (!buft || ggml_backend_buft_is_host(buft)) {
++        return;
++    }
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx { ggml_init(params) };
++    if (!ctx) {
++        return;
++    }
++
++    ggml_tensor * k_rot = nullptr;
++    ggml_tensor * v_rot = nullptr;
++    if (n_rot_k) {
++        k_rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot_k, n_rot_k);
++        ggml_set_name(k_rot, "attn_k_rot_dev");
++    }
++    if (n_rot_v) {
++        v_rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot_v, n_rot_v);
++        ggml_set_name(v_rot, "attn_v_rot_dev");
++    }
++
++    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
++    if (!buf) {
++        LLAMA_LOG_WARN("%s: could not allocate the rotation matrices on %s; uploading them per graph\n",
++                __func__, ggml_backend_buft_name(buft));
++        return;
++    }
++    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    if (k_rot) {
++        ggml_backend_tensor_set(k_rot, attn_rot_hadamard.at(n_rot_k).data(), 0, ggml_nbytes(k_rot));
++    }
++    if (v_rot) {
++        ggml_backend_tensor_set(v_rot, attn_rot_hadamard.at(n_rot_v).data(), 0, ggml_nbytes(v_rot));
++    }
++
++    LLAMA_LOG_INFO("%s: rotation matrices kept on %s (%.2f KiB)\n", __func__,
++            ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0);
++
++    attn_rot_k_dev = k_rot;
++    attn_rot_v_dev = v_rot;
++    attn_rot_ctx   = std::move(ctx);
++    attn_rot_buf   = std::move(buf);
++}
++
+ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
++    if (attn_rot_k_dev) {
++        return attn_rot_k_dev;
++    }
++
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_k) {
+@@ -1482,6 +1558,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+ }
+ 
+ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
++    if (attn_rot_v_dev) {
++        return attn_rot_v_dev;
++    }
++
+     ggml_tensor * res = nullptr;
+ 
+     if (n_rot_v) {
+@@ -1831,6 +1911,10 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+ }
+ 
+ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
++    if (dst == attn_rot_k_dev) {
++        return; // already on the device
++    }
++
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+@@ -1840,6 +1924,10 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+ }
+ 
+ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
++    if (dst == attn_rot_v_dev) {
++        return; // already on the device
++    }
++
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -289,6 +289,17 @@ private:
+     // pre-computed hadamard martrices
+     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+ 
++    // PS5LM: copies of the rotation matrices in the cache's device buffer, made when every layer
++    // of the cache is on one non-host buffer type. Graphs use them instead of uploading them as
++    // inputs each time: 272 KiB for n_rot 256 and 64, about 2.3 ms a graph over gigabit RPC.
++    ggml_tensor * attn_rot_k_dev = nullptr;
++    ggml_tensor * attn_rot_v_dev = nullptr;
++
++    ggml_context_ptr        attn_rot_ctx;
++    ggml_backend_buffer_ptr attn_rot_buf;
++
++    void init_attn_rot_dev();
++
+     // env: LLAMA_KV_CACHE_DEBUG
+     int debug = 0;
+ 
