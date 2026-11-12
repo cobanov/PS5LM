@@ -279,13 +279,14 @@ function renderDevices(s) {
       mode === "worker" && d.status.busy ? "worker, in use" : mode;
     const actions = [];
     const label = { worker: d.kind === "gpu" ? "Start worker" : "Make worker", leave: "Leave worker mode", quit: "Quit app",
-      unload: "Unload model", stop: "Stop worker", restart: "Restart", "clear-cache": "Clear cache" };
+      unload: "Unload model", stop: "Stop worker", restart: "Restart", "clear-cache": "Clear cache", launch: "Open PS5LM" };
     const owner = s.pools.find((p) => p.running && p.replicas.some((r) => r.devices.includes(d.id)));
     for (const action of owner ? [] : d.actions) {
       if (d.kind === "ps5" && action === "worker" && mode === "worker") continue;
       if (d.kind === "ps5" && action === "leave" && mode !== "worker") continue;
       if (d.kind === "ps5" && action === "unload" && !["serving", "loading"].includes(mode)) continue;
       if (d.kind === "ps5" && ["quit", "restart"].includes(action) && ["offline", "idle"].includes(mode)) continue;
+      if (d.kind === "ps5" && action === "launch" && mode !== "idle") continue;
       if (d.kind === "ps5" && action === "restart" && d.status.busy) continue;
       if (d.kind === "ps5" && action === "clear-cache" && !(d.cache && d.cache.files)) continue;
       if (d.kind === "gpu" && action === "worker" && d.rpc_worker) continue;
