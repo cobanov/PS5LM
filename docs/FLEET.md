@@ -267,6 +267,47 @@ successful fleet deployment. A snapshot/printed plan does not mean inference
 has started. Input and unsupported-operation work can still occur on the host;
 backend behaviour and memory must be checked on real consoles.
 
+### Serving many agents
+
+`scripts/bench-swarm.py` loads a running llama-server the way an agent swarm
+does. Agents share a system prompt, histories grow each turn and compact, and a
+few hot agents come back more often than the rest. The default sizes are half
+of a measured swarm task. In the runs below that came to about 11k prompt
+tokens a call, 4k of them not cached, and 360 generated. It reports turns per
+hour, time per turn, and the share of the prompt served from cache.
+
+```sh
+scripts/bench-swarm.py --url http://127.0.0.1:18330 --concurrency 2 --tag np2 --out np2.json
+```
+
+The table shows one PS5 (11.60) on RPC from a CPU host, with q4_0 KV and
+`--reasoning-budget 256`. The values are turns per hour, with the mean turn
+time in brackets.
+
+| Server | Ornith-1.5-9B Q4_K_M | Qwen3.8-27B IQ3_XXS |
+|---|---|---|
+| `--parallel 1` | 123 (29 s) | 48.5 (74 s) |
+| `--parallel 2 -no-kvu` | **140 (51 s)** | **53.9 (134 s)** |
+| `--parallel 2 -kvu` | 110 (66 s) | 49.1 (147 s) |
+| `--parallel 3 -no-kvu` | 144 (75 s) | worker out of memory |
+| `--parallel 2 -no-kvu`, MTP n=2 | 118 (61 s) | worker out of memory |
+| `--parallel 1`, MTP n=2 | 110 (33 s) | 44.8 (80 s) |
+
+For a swarm on one console, use `--parallel 2 -no-kvu` and let two requests in
+at a time:
+- A unified KV cache (`-kvu`, which the server also turns on when `--parallel` is
+  left on auto) makes every ubatch's attention mask cover every slot's cells.
+  That mask goes over RPC on every ubatch, and costs 9–22% of turns here (the
+  Ornith `-kvu` run had a 131k pool, the rest 32k a slot).
+- More slots than requests in flight doesn't help. Only slots with consecutive
+  ids decode in one batch.
+- When an agent lands on a slot that holds another agent's history, the server
+  saves and restores the prompt cache over RPC. That stalls everything for
+  about 4 s.
+- MTP doesn't help this load. The drafts were accepted about 90% of the time,
+  and it was still slower.
+- `-ub` 256 to 1024 are within 2% of each other.
+
 ## Tests / CI
 
 ```sh
