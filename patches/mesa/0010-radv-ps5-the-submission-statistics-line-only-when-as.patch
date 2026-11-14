@@ -1,0 +1,36 @@
+From fab3afaff415d991eaa42ff3ae5c1dcee80ba854 Mon Sep 17 00:00:00 2001
+From: Meticulus <thejswaggart@gmail.com>
+Date: Mon, 9 Nov 2026 15:15:06 -0600
+Subject: [PATCH] radv/ps5: the submission statistics line only when asked
+ (RADV_PS5_SUBMIT_STATS)
+
+A write to the log file can block for many seconds on the console, and this
+line is printed from the submission path with the submit lock held.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/winsys/ps5/radv_ps5_cs.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+index e4d6b18..7dfe52b 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+@@ -683,6 +683,14 @@ static struct {
+ static void
+ radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns)
+ {
++   /* Printed from here with the submit lock held, and a write to the log file
++    * can block for many seconds on the console: each blocked print made the next
++    * one due, and generation stayed stopped until the title restarted. */
++   static int stats = -1;
++   if (stats < 0)
++      stats = debug_get_bool_option("RADV_PS5_SUBMIT_STATS", false);
++   if (!stats)
++      return;
+    const uint64_t now = os_time_get_nano();
+    if (!radv_ps5_submit_window.window_start)
+       radv_ps5_submit_window.window_start = now;
+-- 
+2.53.0
+

@@ -72,7 +72,7 @@ timeout 180 make -C "$vk" libc
 
 mesa="$PS5LM_NATIVE_SOURCES/PS5_Mesa"
 mesa_base=1ba9874f478657ccf6da72ce55f0260164cc0bd0
-mesa_patched=9e0a7c63bc6d4b6bcb60831163bb3fe9f46e91ea
+mesa_patched=97859a72269931a8e03df0de999c6960dc21eed0
 if [[ ! -d "$mesa/.git" ]]; then
     [[ ! -e "$mesa" ]] || { echo "title-check: refusing existing non-repo $mesa" >&2; exit 2; }
     mkdir -p "$mesa"
