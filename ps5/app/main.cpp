@@ -990,6 +990,7 @@ int main(int, char **) {
                     unlink(kFleetWorker);
                     ps5lm::log_line("fleet: leaving worker mode, restarting as the app\n");
                     std::fflush(nullptr);
+                    log_sink_flush(1000);
                     sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
                 }
             }
