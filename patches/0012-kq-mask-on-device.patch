@@ -37,7 +37,7 @@ diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 +    // p1 - p0 + 1 (or about -1e30 for empty and foreign cells), clamped to {0, 1}, log -> {-inf, 0}
 +    ggml_tensor * res = ggml_repeat_4d(ctx, *pos_kv, n_kv, n_tps, 1, n_stream);
 +    res = ggml_add_inplace(ctx, res, *pos_tok);
-+    res = ggml_clamp(ctx, res, 0.0f, 1.0f);
++    res = ggml_clamp_inplace(ctx, res, 0.0f, 1.0f);
 +    res = ggml_log_inplace(ctx, res);
 +
 +    if (cparams.flash_attn) {
