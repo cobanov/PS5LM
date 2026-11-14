@@ -21,6 +21,13 @@ v0.1.x are the upstream payload releases by cobanov.
   F16 projector had 0.90 GiB free when ready at `-ub 1024` and 1.47 GiB at `-ub 256`, at the
   same speed (median 11.1 s a photo) and with the same answers.
 
+### Fixed
+- **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
+  submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
+  lock held; each blocked print made the next one due, so generation stayed stopped until the app
+  restarted. `patches/mesa/0010` turns that line off unless `RADV_PS5_SUBMIT_STATS=1` is set in
+  `env.txt`.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
