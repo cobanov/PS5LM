@@ -31,6 +31,16 @@ v0.1.x are the upstream payload releases by cobanov.
   4.5 s, and a follow-up turn 6.6 s and now 3.3 s; generation stays at 18.1 tokens a second.
   On the console the read stays in memory, and that gain is not measured.
   `tests/server_checkpoints_test.py` checks it on a host build with an untrained Mamba fixture.
+- **Faster generation with a quantized KV cache on another device**: llama.cpp rotates a
+  quantized KV cache with Hadamard matrices, and it kept them in PC memory and uploaded them
+  to the device as inputs to every graph. For a fleet split those 272 KiB (Qwen3.8-27B's 256- and
+  64-wide heads) crossed the network on each token, about 2.3 ms a graph at gigabit.
+  `patches/0011` keeps one copy in the cache's device buffer when the whole cache is on one
+  device, so they are sent once at load. A PS5 serving Qwen3.8-27B (IQ3_XXS, q4_0 cache) to a
+  PC over RPC on LocalMaxxing's `reasoning-v1` test: 18.1 to 18.7 tokens a second at 128k
+  context, and with MTP self-speculation (2 drafts, 104k context) 20.1 to 21.9. Greedy output is
+  unchanged. A cache split over devices keeps the old inputs. `tests/server_kv_rotation_test.py`
+  checks it on a host build against one CPU RPC worker.
 
 ### Fixed
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
