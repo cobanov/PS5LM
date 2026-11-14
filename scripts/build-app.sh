@@ -31,6 +31,12 @@ param="$sce_sys/param.json"
 for f in "$archive" "$tool" "$vk/runtime/libc.prx" "$sdk/bin/prospero-lld" "$glsdk/lib/libPS5OpenGL.a"; do
     [ -e "$f" ] || { echo "build-app: missing $f" >&2; exit 2; }
 done
+# patches/mesa is applied by hand, not here. Without 0010 a blocked write of the
+# driver's statistics line stops generation, so refuse an archive built without it.
+if ! grep -aq RADV_PS5_SUBMIT_STATS "$archive"; then
+    echo "build-app: $archive lacks patches/mesa/0010; rebuild RADV as patches/mesa/README.md says" >&2
+    exit 2
+fi
 export PS5_PAYLOAD_SDK="$sdk" PS5_VULKAN_ROOT="$vk"
 
 # radv-link.sh takes Clang's builtins from <resource dir>/lib/linux/, where
@@ -112,6 +118,7 @@ cxx -fexceptions -fcxx-exceptions -I "$llama/ggml/include" \
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/settings.cpp" -o "$obj/settings.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/report.cpp" -o "$obj/report.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/storage.cpp" -o "$obj/storage.o"
+cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/log_sink.cpp" -o "$obj/log_sink.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/probes.cpp" -o "$obj/probes.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/fetch.cpp" -o "$obj/fetch.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/app/market.cpp" -o "$obj/market.o"
@@ -210,12 +217,17 @@ flags=()
 for f in "${radv_link_flags[@]}"; do
     case $f in --defsym=getaddrinfo=*|--defsym=freeaddrinfo=*) ;; *) flags+=("$f") ;; esac
 done
-radv_link_flags=("${flags[@]}" --wrap=sceAgcInit)
+# Prints to stdout and stderr go to ps5/app/log_sink.cpp, which never waits
+# for storage (a title may not dup2 over its streams, and the console's libc
+# has no funopen). abort() writes the ring out first, so a crash keeps its reason.
+log_wraps=()
+for f in printf fprintf vprintf vfprintf puts fputs fputc putc putchar fwrite abort; do log_wraps+=("--wrap=$f"); done
+radv_link_flags=("${flags[@]}" --wrap=sceAgcInit "${log_wraps[@]}")
 mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/log_sink.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \

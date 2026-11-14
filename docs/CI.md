@@ -6,8 +6,9 @@ runners, a read-only token, no secrets, and no console connection. Superseded ru
 are cancelled. There are two independent jobs:
 
 - **Host checks** (5-minute limit): shell/Python syntax, the existing synthetic
-  GGUF `model_plan_test.cpp`, and regressions for dashboard compiler job limits
-  and propagation of failed background compilers. No submodule or model download
+  GGUF `model_plan_test.cpp`, the log sink's `log_sink_test.cpp` (prints return at
+  once while the log file is blocked), and regressions for dashboard compiler job
+  limits and propagation of failed background compilers. No submodule or model download
   is needed for these checks.
 - **Full PS5 title cross-build** (45-minute limit, two compiler jobs), with the
   fleet RPC worker in it ([FLEET.md](FLEET.md)). It bootstraps the public SDK, reproduces
@@ -37,6 +38,9 @@ PYTHONPYCACHEPREFIX=build/pycache python3 -m unittest discover -s tests -p 'test
 mkdir -p build
 c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
 build/model_plan_test
+c++ -std=c++17 -O1 -U_FORTIFY_SOURCE -pthread ps5/app/log_sink_test.cpp ps5/app/log_sink.cpp \
+    -Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite,--wrap=abort -o build/log_sink_test
+build/log_sink_test
 ```
 
 For the full build, use the digest-pinned Debian trixie container and exact apt
@@ -53,7 +57,7 @@ The script keeps dependencies in `.deps/native-ci-src` (override with
 It uses upstream's checked SDK setup and `make libc`, which rebuilds the runtime
 twice and compares the recorded raw/signed hashes. That target also produces the
 same host packaging tool required by the app, without building an unrelated demo
-title. It applies this repository's three Mesa patches with fixed commit identity
+title. It applies this repository's four Mesa patches with fixed commit identity
 and dates. The removed OpenGL release is fetched from the mirror already
 documented in [BUILDING.md](BUILDING.md), checked against the original archive
 hash, then checked by the pinned UI fetcher's file manifest.
@@ -64,7 +68,7 @@ hash, then checked by the pinned UI fetcher's file manifest.
 | PS5_Vulkan | `f410e67a0241b3e8edcdbcd2a9b285dfc4a412ed` |
 | PS5_PayloadSDK fork | `b83202be73e930050e00de0f1b4d9ec46c0391bf` |
 | Mesa base | `1ba9874f478657ccf6da72ce55f0260164cc0bd0` |
-| Mesa after this repository's patches | `9e0a7c63bc6d4b6bcb60831163bb3fe9f46e91ea` |
+| Mesa after this repository's patches | `97859a72269931a8e03df0de999c6960dc21eed0` |
 | llama.cpp / UI | The checkout's gitlink revisions (verified before building) |
 | OpenGL SDK archive SHA-256 | `f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5` |
 
