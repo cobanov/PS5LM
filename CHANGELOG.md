@@ -31,6 +31,16 @@ v0.1.x are the upstream payload releases by cobanov.
   - The files are written through ftpsrv: a title's own writes slow to about
     1.2 MB/s after 2 GB.
 
+### Fixed
+- **A fleet worker no longer loses memory with every prompt batch**: llama.cpp's
+  RPC server kept a copy of every graph a host sent (about 4 MiB for a 27B
+  model) until 1,024 had come, and a host sends a new one for nearly every batch
+  of a prompt. A console serving Qwen3.8-27B lost 7.5 to 9 MiB per 1,000 prompt
+  tokens and died after about 175K. `patches/fleet/0006`: the host keeps the 8
+  graphs it used last on each device and tells the worker to free the others.
+  Both the host build and the title need the patch; either alone behaves as
+  before.
+
 ### Changed
 - **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
   (the system's default is 448 MiB), so the direct pool, where models go, is
