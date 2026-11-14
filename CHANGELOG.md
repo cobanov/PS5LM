@@ -41,6 +41,15 @@ v0.1.x are the upstream payload releases by cobanov.
   context, and with MTP self-speculation (2 drafts, 104k context) 20.1 to 21.9. Greedy output is
   unchanged. A cache split over devices keeps the old inputs. `tests/server_kv_rotation_test.py`
   checks it on a host build against one CPU RPC worker.
+- **Causal KQ mask built on the KV cache's device**: llama.cpp filled the attention mask in PC
+  memory and uploaded it as an `[n_kv, n_tokens]` input to every graph, about 21 MB per 512-token
+  batch at 20k context. `patches/0012` uploads only the cache cells' and the batch tokens'
+  positions and builds the mask on the device, when the whole cache is on non-host devices and
+  the batch needs a plain causal mask (no ALiBi, SWA or M-RoPE). A PS5 serving Qwen3.8-27B
+  (IQ3_XXS, q4_0 cache, `--parallel 2 -no-kvu`) to a PC over RPC: a 20k-token prompt 106.4 to
+  108.6 tokens a second, generation unchanged. Greedy output is byte-identical.
+  `LLAMA_KQ_MASK_HOST=1` keeps the old mask. `tests/server_kq_mask_test.py` checks it on a host
+  build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
