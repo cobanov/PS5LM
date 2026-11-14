@@ -1,0 +1,209 @@
+Subject: [PATCH] rpc: a client tells the server which graphs it can free
+
+An RPC server keeps every graph it is sent, so that the client can have it
+computed again by uid, and drops them only when GRAPH_CACHE_MAX (1,024) have
+come or the connection closes. Each copy holds the graph and all its tensors:
+about 4 MiB for a 27B model. A client sends a new graph for every batch whose
+shape differs from the last one, which while a prompt is read is every
+512-token batch (the padded KV size changes) and about every second 128-token
+one. A PS5 worker serving Qwen3.8-27B lost 7.5 to 9 MiB of its heap per 1,000
+prompt tokens read and died with "Failed to allocate input buffer" after about
+175K tokens; a CPU ggml-rpc-server grows the same way, up to 1,024 graphs.
+
+The server now sets a bit in the fourth byte of its HELLO answer (padding
+before, 0 from older servers) and takes RPC_CMD_GRAPH_FREE {device, uid}. A
+client that sees the bit keeps the 8 graphs it computed last on each device and
+sends GRAPH_FREE for each one that leaves that list; if it computes a freed
+graph again it sends it again, as for a new one. A client that does not see the
+bit, and a server whose client never sends the command, behave as before, so
+either side can be updated alone (the worker stops leaking once both are).
+GGML_RPC_NO_GRAPH_FREE on either side turns it off.
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -16,6 +16,7 @@
+ #include <condition_variable>
+ #include <future>
+ #include <memory>
++#include <list>
+ #include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -84,6 +85,7 @@
+     RPC_CMD_COMM_INIT,
+     RPC_CMD_COMM_ALLREDUCE,
+     RPC_CMD_COMM_FREE,
++    RPC_CMD_GRAPH_FREE,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -115,6 +117,7 @@
+         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
++        case RPC_CMD_GRAPH_FREE:        return "GRAPH_FREE";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -127,6 +130,17 @@
+ // so that both sides clear their caches at the same point in the message stream
+ const size_t GRAPH_CACHE_MAX = 1024;
+ 
++// PS5LM: a server keeps every graph it is sent (tensors and all, some MiB for a
++// large model) until GRAPH_CACHE_MAX of them have come, and a client sends a new
++// one for each prompt batch whose shape differs from the last: a worker lost
++// about 4 MiB per batch read, up to 4 GiB. A server that sets this bit in its
++// HELLO answer (the byte was padding, 0 from older servers) takes
++// RPC_CMD_GRAPH_FREE, and a client that sees it keeps only the GRAPH_CACHE_KEEP
++// graphs it used last on each device and tells the server to free the others.
++// Either side alone behaves as before.
++const uint8_t RPC_FEATURE_GRAPH_FREE = 1;
++const size_t  GRAPH_CACHE_KEEP       = 8;
++
+ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+@@ -135,7 +149,7 @@
+     uint8_t major;
+     uint8_t minor;
+     uint8_t patch;
+-    uint8_t padding;
++    uint8_t features; // RPC_FEATURE_*; padding before, so 0 from a server without any
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
+@@ -246,6 +260,11 @@
+     uint64_t uid;
+ };
+ 
++struct rpc_msg_graph_free_req {
++    uint32_t device;
++    uint64_t uid;
++};
++
+ struct rpc_msg_get_tensor_2d_req {
+     rpc_tensor tensor;
+     uint64_t offset;
+@@ -426,7 +445,7 @@
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
++static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & features) {
+     rpc_msg_hello_req request = {};
+     rpc_msg_hello_rsp response = {};
+ 
+@@ -442,6 +461,7 @@
+     }
+ 
+     sock->update_caps(response.conn_caps);
++    features = response.features;
+     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
+             __func__, response.major, response.minor, response.patch, sock->transport_name());
+     return true;
+@@ -538,6 +558,9 @@
+     };
+     std::mutex graph_mutex;
+     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
++    // with graph_free: the same uids, most recently computed first
++    std::unordered_map<uint32_t, std::list<uint64_t>> graph_lru;
++    bool             graph_free = false;
+     rpc_msg_queue    queue;
+     socket_ptr       sock;
+     std::atomic_uint busy_spin_users = 0;
+@@ -655,9 +678,11 @@
+     if (sock == nullptr) {
+         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     }
+-    if (!negotiate_hello(sock)) {
++    uint8_t features = 0;
++    if (!negotiate_hello(sock, features)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
++    graph_free = (features & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+     running = true;
+     thread = std::thread(rpc_dispatcher_trampoline, this);
+@@ -1251,6 +1276,20 @@
+     auto & device_graph_uids = graph_uids[device];
+     bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
+     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
++    if (graph_free && cgraph->uid != 0) {
++        // the graphs used last stay on the server, and it frees the one this pushes out
++        auto & lru = graph_lru[device];
++        lru.remove(cgraph->uid);
++        lru.push_front(cgraph->uid);
++        while (lru.size() > GRAPH_CACHE_KEEP) {
++            auto request = std::make_shared<rpc_msg_graph_free_req>();
++            request->device = device;
++            request->uid    = lru.back();
++            device_graph_uids.erase(lru.back());
++            lru.pop_back();
++            send_async(RPC_CMD_GRAPH_FREE, request, sizeof(*request));
++        }
++    }
+     if (reuse) {
+         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+         request->device = device;
+@@ -1262,6 +1301,7 @@
+                 LOG_DBG("[%s] clearing graph cache for device %u (%zu entries)\n",
+                         __func__, device, device_graph_uids.size());
+                 device_graph_uids.clear();
++                graph_lru[device].assign(1, cgraph->uid);
+             }
+             device_graph_uids.insert(cgraph->uid);
+         }
+@@ -1401,6 +1441,7 @@
+     ~rpc_server();
+ 
+     void hello(rpc_msg_hello_rsp & response);
++    bool graph_free(const rpc_msg_graph_free_req & request);
+     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
+     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
+     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
+@@ -1461,6 +1502,7 @@
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
++    response.features = std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr ? RPC_FEATURE_GRAPH_FREE : 0;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -2269,6 +2311,19 @@
+     return true;
+ }
+ 
++// The client will not compute this graph again (it re-sends one it does want).
++// An unknown uid is not an error: a full cache or a freed buffer may have dropped it.
++bool rpc_server::graph_free(const rpc_msg_graph_free_req & request) {
++    if (request.device >= backends.size()) {
++        return false;
++    }
++    // a compute still running may be reading the graph
++    sync_all_backends();
++    const size_t n = stored_graphs[request.device].erase(request.uid);
++    LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", %s\n", __func__, request.device, request.uid, n ? "freed" : "not held");
++    return true;
++}
++
+ // graph compute is asynchronous; commands that read or write buffer data synchronize first
+ void rpc_server::sync_all_backends() {
+     for (ggml_backend_t backend : backends) {
+@@ -2766,6 +2821,16 @@
+                     return;
+                 }
+                 break;
++            }
++            case RPC_CMD_GRAPH_FREE: {
++                rpc_msg_graph_free_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                if (!server.graph_free(request)) {
++                    return;
++                }
++                break;
+             }
+             case RPC_CMD_COMM_INIT: {
+                 rpc_msg_comm_init_req request;
