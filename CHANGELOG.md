@@ -5,6 +5,48 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
+  makes it delete `fleet-worker.txt` and restart as the app, the way a model change
+  restarts it. Before, a worker could only quit, and someone had to open PS5LM again
+  on the console.
+- **A fleet worker without its screen**: `PS5LM_WORKER_SCREEN=off` in `env.txt`
+  starts a worker without its screen and dashboard. That leaves about 350 MiB more
+  for the model: on a console the worker reported 12,217 MiB free instead of 11,854.
+- **A fleet worker restarts on request**: `/data/PS5LM/unload`, which restarts the
+  app, restarts a worker as a worker. It reads `env.txt` again, so its settings
+  change without anyone at the console.
+- A worker logs its memory once it has started, and when `/data/PS5LM/memory` is there.
+- **A fleet worker can keep the weights hosts send** (`PS5LM_RPC_CACHE_GB` in
+  `env.txt`, off by default): up to that many GiB in `/data/PS5LM/rpc-cache`, the
+  least recently used dropped first. A host loading the same weights again sends
+  only their hashes. On a console, Ornith 1.5 9B loaded in 17.6 s from the
+  cache against 48.9 s without it (its first load, saving the cache, took
+  113 s).
+  - `patches/fleet/0005`: a cache file is written whole under a temporary name,
+    used only when it hashes to what the host sent, and read in 8 MiB reads.
+    Before, a write cut short left a file that later loaded as the weights.
+  - The files are written through ftpsrv: a title's own writes slow to about
+    1.2 MB/s after 2 GB.
+
+### Fixed
+- **A fleet worker no longer loses memory with every prompt batch**: llama.cpp's
+  RPC server kept a copy of every graph a host sent (about 4 MiB for a 27B
+  model) until 1,024 had come, and a host sends a new one for nearly every batch
+  of a prompt. A console serving Qwen3.8-27B lost 7.5 to 9 MiB per 1,000 prompt
+  tokens and died after about 175K. `patches/fleet/0006`: the host keeps the 8
+  graphs it used last on each device and tells the worker to free the others.
+  Both the host build and the title need the patch; either alone behaves as
+  before.
+
+### Changed
+- **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
+  (the system's default is 448 MiB), so the direct pool, where models go, is
+  12.1875 GiB instead of 12. It applies when the app starts from the home screen,
+  not when it restarts for a model.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added

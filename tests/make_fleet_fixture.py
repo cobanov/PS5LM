@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "third_party/llama.cpp/gguf-py"))
 
 
-def make_fixture(path: Path) -> Path:
+def make_fixture(path: Path, ffn: int = 64) -> Path:
+    """`ffn` widens the feed-forward tensors: 98304 makes each 12 MiB, over the
+    10 MiB from which the RPC client offers a tensor's hash to a worker's cache."""
     import numpy as np
     import gguf
 
@@ -22,7 +24,7 @@ def make_fixture(path: Path) -> Path:
     writer.add_context_length(256)
     writer.add_embedding_length(32)
     writer.add_block_count(4)
-    writer.add_feed_forward_length(64)
+    writer.add_feed_forward_length(ffn)
     writer.add_head_count(4)
     writer.add_head_count_kv(2)
     writer.add_layer_norm_rms_eps(1e-5)
@@ -55,9 +57,9 @@ def make_fixture(path: Path) -> Path:
             ("attn_k.weight", (16, 32)),
             ("attn_v.weight", (16, 32)),
             ("attn_output.weight", (32, 32)),
-            ("ffn_gate.weight", (64, 32)),
-            ("ffn_down.weight", (32, 64)),
-            ("ffn_up.weight", (64, 32)),
+            ("ffn_gate.weight", (ffn, 32)),
+            ("ffn_down.weight", (32, ffn)),
+            ("ffn_up.weight", (ffn, 32)),
         ):
             weight(prefix + name, shape)
     writer.write_header_to_file()
