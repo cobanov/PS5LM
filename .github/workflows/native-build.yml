@@ -31,7 +31,7 @@ jobs:
       - name: Log sink regression test (prints never wait for the log file)
         run: |
           mkdir -p build
-          wraps=-Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite
+          wraps=-Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite,--wrap=abort
           c++ -std=c++17 -O1 -U_FORTIFY_SOURCE -pthread ps5/app/log_sink_test.cpp ps5/app/log_sink.cpp "$wraps" -o build/log_sink_test
           build/log_sink_test
 

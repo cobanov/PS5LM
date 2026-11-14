@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Host test for log_sink, no console needed:
 //   c++ -std=c++17 -O1 -U_FORTIFY_SOURCE -pthread ps5/app/log_sink_test.cpp ps5/app/log_sink.cpp
-//       -Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite -o build/log_sink_test
+//       -Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite,--wrap=abort -o build/log_sink_test
 //   build/log_sink_test
 // Each case runs in a child process of its own, with a sink of its own.
 // The log file is a FIFO the test reads when it chooses, so a write to it
@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <csignal>
 #include <string>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -232,6 +233,29 @@ void storage_refuses() {
     check(s.bytes_written == 0 && s.bytes_failed > 0, "bytes storage refused are counted as refused, not written");
 }
 
+
+// A crash right after a print (GGML_ABORT, an uncaught exception: a message
+// on stderr, then abort()): the message still reaches the file.
+void abort_after_print() {
+    Fifo        fifo;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        g_report = open("/dev/null", O_WRONLY);  // the parent reports for this case
+        ps5lm::log_sink_set_ring_bytes(64u << 10);
+        std::string why;
+        if (ps5lm::log_sink_start(fifo.path, &why)) {
+            std::fprintf(stderr, "last words before abort|\n");
+            std::abort();
+        }
+        _exit(3);
+    }
+    Drain drain(fifo.reader, 0);
+    int   status = 0;
+    waitpid(pid, &status, 0);
+    const std::string text = drain.finish();
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "the child aborted");
+    check(text.find("last words before abort|") != std::string::npos, "the message printed before abort() is in the file");
+}
 }  // namespace
 
 int main() {
@@ -242,7 +266,8 @@ int main() {
     } cases[] = { { "blocked file", blocked_file },
                   { "eight threads with puts", threads_puts },
                   { "flush with a full ring", flush_notes_drops },
-                  { "storage refuses", storage_refuses } };
+                  { "storage refuses", storage_refuses },
+                  { "abort after a print", abort_after_print } };
     int failed = 0;
     for (const auto & c : cases) {
         dprintf(report, "-- %s\n", c.name);

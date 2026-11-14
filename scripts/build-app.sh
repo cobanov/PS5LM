@@ -213,9 +213,9 @@ for f in "${radv_link_flags[@]}"; do
 done
 # Prints to stdout and stderr go to ps5/app/log_sink.cpp, which never waits
 # for storage (a title may not dup2 over its streams, and the console's libc
-# has no funopen).
+# has no funopen). abort() writes the ring out first, so a crash keeps its reason.
 log_wraps=()
-for f in printf fprintf vprintf vfprintf puts fputs fputc putc putchar fwrite; do log_wraps+=("--wrap=$f"); done
+for f in printf fprintf vprintf vfprintf puts fputs fputc putc putchar fwrite abort; do log_wraps+=("--wrap=$f"); done
 radv_link_flags=("${flags[@]}" --wrap=sceAgcInit "${log_wraps[@]}")
 mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \

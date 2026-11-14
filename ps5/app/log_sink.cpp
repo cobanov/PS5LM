@@ -34,6 +34,7 @@ int    __real_fputc(int c, FILE * f);
 int    __real_putc(int c, FILE * f);
 int    __real_putchar(int c);
 size_t __real_fwrite(const void * p, size_t size, size_t n, FILE * f);
+[[noreturn]] void __real_abort();
 }
 
 namespace ps5lm {
@@ -327,6 +328,14 @@ size_t __wrap_fwrite(const void * p, size_t size, size_t n, FILE * f) {
     }
     ps5lm::push(static_cast<const char *>(p), size * n);
     return n;
+}
+
+// A crash prints its reason to stderr and calls abort() right after
+// (GGML_ABORT, an uncaught exception): write the ring out first, or the
+// reason dies with the process. Bounded, so a stalled /data still aborts.
+[[noreturn]] void __wrap_abort() {
+    ps5lm::log_sink_flush(2000);
+    __real_abort();
 }
 
 }  // extern "C"

@@ -15,7 +15,8 @@ v0.1.x are the upstream payload releases by cobanov.
   to a minute. Now printf, fprintf, vprintf, vfprintf, puts, fputs, fputc, putc, putchar and fwrite
   are wrapped at link time (`scripts/build-app.sh`): a print to stdout or stderr copies its text
   into a 2 MiB ring and returns, and one thread writes the ring to `app.log`. A full ring drops
-  text and says how much in its place. The memory lines in `app.log` give the sink's figures.
+  text and says how much in its place. `abort()` is wrapped too, so a crash writes the ring out
+  (its reason included) before the process ends. The memory lines in `app.log` give the sink's figures.
   On the console at `-lv 4`, 5 minutes of ~1,800-token prompts: 16 requests, 7 over 15 s (worst 58 s)
   before; 25 requests, none stalled, after.
 
