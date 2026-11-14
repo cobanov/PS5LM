@@ -27,6 +27,17 @@ v0.1.x are the upstream payload releases by cobanov.
   lock held; each blocked print made the next one due, so generation stayed stopped until the app
   restarted. `patches/mesa/0010` turns that line off unless `RADV_PS5_SUBMIT_STATS=1` is set in
   `env.txt`.
+- **The app no longer stops while its log is written** (#70): stdout and stderr went straight to
+  `app.log` on `/data`, stderr unbuffered, and a write there can wait for seconds. Every thread that
+  printed waited with it: the GPU driver with its submit lock held (#69), the GL library on the
+  render thread, llama.cpp's log thread. With `-lv 4` the whole app, screen included, stalled for up
+  to a minute. Now printf, fprintf, vprintf, vfprintf, puts, fputs, fputc, putc, putchar and fwrite
+  are wrapped at link time (`scripts/build-app.sh`): a print to stdout or stderr copies its text
+  into a 2 MiB ring and returns, and one thread writes the ring to `app.log`. A full ring drops
+  text and says how much in its place. `abort()` is wrapped too, so a crash writes the ring out
+  (its reason included) before the process ends. The memory lines in `app.log` give the sink's figures.
+  On the console at `-lv 4`, 5 minutes of ~1,800-token prompts: 16 requests, 7 over 15 s (worst 58 s)
+  before; 25 requests, none stalled, after.
 
 ## [0.11.0] - 2026-11-02
 

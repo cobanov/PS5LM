@@ -6,8 +6,9 @@ runners, a read-only token, no secrets, and no console connection. Superseded ru
 are cancelled. There are two independent jobs:
 
 - **Host checks** (5-minute limit): shell/Python syntax, the existing synthetic
-  GGUF `model_plan_test.cpp`, and regressions for dashboard compiler job limits
-  and propagation of failed background compilers. No submodule or model download
+  GGUF `model_plan_test.cpp`, the log sink's `log_sink_test.cpp` (prints return at
+  once while the log file is blocked), and regressions for dashboard compiler job
+  limits and propagation of failed background compilers. No submodule or model download
   is needed for these checks.
 - **Full PS5 title cross-build** (45-minute limit, two compiler jobs), with the
   fleet RPC worker in it ([FLEET.md](FLEET.md)). It bootstraps the public SDK, reproduces
@@ -37,6 +38,9 @@ PYTHONPYCACHEPREFIX=build/pycache python3 -m unittest discover -s tests -p 'test
 mkdir -p build
 c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
 build/model_plan_test
+c++ -std=c++17 -O1 -U_FORTIFY_SOURCE -pthread ps5/app/log_sink_test.cpp ps5/app/log_sink.cpp \
+    -Wl,--wrap=printf,--wrap=fprintf,--wrap=vprintf,--wrap=vfprintf,--wrap=puts,--wrap=fputs,--wrap=fputc,--wrap=putc,--wrap=putchar,--wrap=fwrite,--wrap=abort -o build/log_sink_test
+build/log_sink_test
 ```
 
 For the full build, use the digest-pinned Debian trixie container and exact apt
