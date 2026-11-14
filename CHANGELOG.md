@@ -7,7 +7,26 @@ v0.1.x are the upstream payload releases by cobanov.
 
 ## [Unreleased]
 
+### Added
+- **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
+  makes it delete `fleet-worker.txt` and restart as the app, the way a model change
+  restarts it. Before, a worker could only quit, and someone had to open PS5LM again
+  on the console.
+
+### Changed
+- **Qwen vision models get a narrow ubatch**: a model with a Qwen projector (`clip.projector_type`
+  `qwen*`) plans `-ub 256`, `-b 1280` and `--image-max-tokens 1280` instead of the 2048 ubatch,
+  and keeps 0.5 GiB of headroom for photos. llama.cpp needs a whole image in one ubatch only for
+  non-causal encoders (Gemma's), which keep 2048. On the console Qwen 3.8 27B UD-IQ2_S with its
+  F16 projector had 0.90 GiB free when ready at `-ub 1024` and 1.47 GiB at `-ub 256`, at the
+  same speed (median 11.1 s a photo) and with the same answers.
+
 ### Fixed
+- **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
+  submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
+  lock held; each blocked print made the next one due, so generation stayed stopped until the app
+  restarted. `patches/mesa/0010` turns that line off unless `RADV_PS5_SUBMIT_STATS=1` is set in
+  `env.txt`.
 - **The app no longer stops while its log is written** (#70): stdout and stderr went straight to
   `app.log` on `/data`, stderr unbuffered, and a write there can wait for seconds. Every thread that
   printed waited with it: the GPU driver with its submit lock held (#69), the GL library on the

@@ -57,7 +57,7 @@ The script keeps dependencies in `.deps/native-ci-src` (override with
 It uses upstream's checked SDK setup and `make libc`, which rebuilds the runtime
 twice and compares the recorded raw/signed hashes. That target also produces the
 same host packaging tool required by the app, without building an unrelated demo
-title. It applies this repository's three Mesa patches with fixed commit identity
+title. It applies this repository's four Mesa patches with fixed commit identity
 and dates. The removed OpenGL release is fetched from the mirror already
 documented in [BUILDING.md](BUILDING.md), checked against the original archive
 hash, then checked by the pinned UI fetcher's file manifest.
@@ -68,7 +68,7 @@ hash, then checked by the pinned UI fetcher's file manifest.
 | PS5_Vulkan | `f410e67a0241b3e8edcdbcd2a9b285dfc4a412ed` |
 | PS5_PayloadSDK fork | `b83202be73e930050e00de0f1b4d9ec46c0391bf` |
 | Mesa base | `1ba9874f478657ccf6da72ce55f0260164cc0bd0` |
-| Mesa after this repository's patches | `9e0a7c63bc6d4b6bcb60831163bb3fe9f46e91ea` |
+| Mesa after this repository's patches | `97859a72269931a8e03df0de999c6960dc21eed0` |
 | llama.cpp / UI | The checkout's gitlink revisions (verified before building) |
 | OpenGL SDK archive SHA-256 | `f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5` |
 
