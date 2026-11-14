@@ -13,6 +13,14 @@ v0.1.x are the upstream payload releases by cobanov.
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
   on the console.
 
+### Changed
+- **Qwen vision models get a narrow ubatch**: a model with a Qwen projector (`clip.projector_type`
+  `qwen*`) plans `-ub 256`, `-b 1280` and `--image-max-tokens 1280` instead of the 2048 ubatch,
+  and keeps 0.5 GiB of headroom for photos. llama.cpp needs a whole image in one ubatch only for
+  non-causal encoders (Gemma's), which keep 2048. On the console Qwen 3.8 27B UD-IQ2_S with its
+  F16 projector had 0.90 GiB free when ready at `-ub 1024` and 1.47 GiB at `-ub 256`, at the
+  same speed (median 11.1 s a photo) and with the same answers.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
