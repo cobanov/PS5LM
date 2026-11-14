@@ -36,6 +36,7 @@ struct ModelInfo {
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
     std::string mmproj;                // a vision projector beside the model, or empty
     uint64_t    mmproj_bytes    = 0;
+    std::string projector_type;        // clip.projector_type: the projector's own, or the paired one's
     bool        ok              = false;
     std::string error;
 
@@ -73,6 +74,20 @@ const Preset * find_preset(const ModelInfo & m);
 // scripts/bench-ubatch.py measures the others there. Decision models and
 // image encoders take 2048 whatever this says (a whole prompt or image in one).
 constexpr uint32_t kPromptUbatch = 64;
+
+// Vision models whose image tokens go through the model causally (Qwen's
+// projectors) take an image in n_batch pieces, so they need no wide ubatch.
+// On the console Qwen 3.8 27B UD-IQ2_S with its F16 projector had 0.90 GiB
+// free when ready at -ub 1024 and 1.47 GiB at -ub 256, at the same speed and
+// with the same answers. They get this ubatch, and a 1280-token batch and
+// image cap: a 1280x1261 photo goes in whole.
+constexpr uint32_t kVisionUbatch   = 256;
+constexpr uint32_t kVisionImageCap = 1280;
+
+// Whether a projector type takes its image causally: Qwen's mergers. Others
+// (Gemma's, for one) keep the wide ubatch, as llama.cpp needs their whole
+// image in one.
+bool causal_projector(const std::string & projector_type);
 
 struct Plan {
     bool        fits = false;

@@ -213,6 +213,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     }
 
     m.arch = strs["general.architecture"];
+    m.projector_type = strs["clip.projector_type"];
     if (!strs["general.name"].empty()) {
         m.name = strs["general.name"];
     }
@@ -279,6 +280,9 @@ ModelInfo read_model_info(const std::string & path) {
     if (!m.mmproj.empty()) {
         struct stat st = {};
         m.mmproj_bytes = stat(m.mmproj.c_str(), &st) == 0 ? (uint64_t) st.st_size : 0;
+        Reader pr;
+        pr.f = std::fopen(m.mmproj.c_str(), "rb");
+        m.projector_type = parse_model_info(pr, m.mmproj, 0).projector_type;
     }
     return m;
 }
@@ -369,8 +373,11 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // Decision models (laya, clef, vllm-d3, lfm2-d1-omni) and non-causal image
     // encoders (mtmd caps an image to the ubatch) need a whole prompt or image in
     // one ubatch, so they get 2048, the size #13 ran on the console.
-    const bool wide = !m.decision.empty() || !m.mmproj.empty();
-    p.ubatch = wide ? 2048 : std::max<uint32_t>(ubatch, 1);
+    // A causal projector (Qwen's) takes the image in pieces: its model gets
+    // kVisionUbatch and is not wide.
+    const bool causal_vision = !m.mmproj.empty() && m.decision.empty() && causal_projector(m.projector_type);
+    const bool wide = !m.decision.empty() || (!m.mmproj.empty() && !causal_vision);
+    p.ubatch = wide ? 2048 : causal_vision ? kVisionUbatch : std::max<uint32_t>(ubatch, 1);
     // Compute buffers grow with the ubatch, by about 38 bytes a token for each
     // unit of feed-forward width: on Qwen 3.8 27B (17,408 wide), at 64k with a
     // q4_0 cache, ggml-vulkan's device and host compute buffers took 41 MiB
@@ -378,7 +385,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // paths. The 0.75 GiB above holds the 64 the console was calibrated at.
     const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
     // shortcut: 0.5 GiB more compute buffer for the 2048 ubatch is a guess; measure on the console.
-    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0) + ub_extra;
+    // A causal vision model keeps the 0.5 as headroom: each photo needs working
+    // memory, and free memory shrank by about 0.5 GiB over 100 photos on the
+    // console (Qwen 3.8 27B, -ub 256).
+    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
 
     // The longest context first, and at each length the best cache that fits.
     static const uint32_t ctxs[]  = { 262144, 196608, 131072, 65536, 32768, 16384, 8192, 4096 };
@@ -429,7 +439,8 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
                "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
-               "-b", std::to_string(std::max<uint32_t>(256, p.ubatch)), "-ub", std::to_string(p.ubatch), "-np", "1",
+               "-b", std::to_string(causal_vision ? kVisionImageCap : std::max<uint32_t>(256, p.ubatch)),
+               "-ub", std::to_string(p.ubatch), "-np", "1",
                // One prompt checkpoint and no RAM cache: llama-server's defaults
                // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
                "-ctxcp", "1", "-cram", "0",
@@ -437,10 +448,17 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (!m.mmproj.empty()) {
         p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
     }
+    if (causal_vision) {
+        p.args.insert(p.args.end(), { "--image-max-tokens", std::to_string(kVisionImageCap) });
+    }
     if (preset) {
         p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
     }
     return p;
+}
+
+bool causal_projector(const std::string & projector_type) {
+    return lower(projector_type).rfind("qwen", 0) == 0;
 }
 
 std::vector<std::string> find_models(const std::vector<std::string> & dirs) {

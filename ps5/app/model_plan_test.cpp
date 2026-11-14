@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <fstream>
+#include <unistd.h>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -122,6 +125,36 @@ int main(int argc, char ** argv) {
     ps5lm::ModelInfo full = s;
     full.n_swa_layers = 0;
     assert(ps5lm::plan_model(full, budget, 262144).ctx == 131072);
+
+    // A Qwen projector beside its model takes images in pieces: a narrow
+    // ubatch, a 1280 batch and image cap, and the headroom kept. Another
+    // projector type keeps the wide ubatch.
+    {
+        char dir[] = "/tmp/model_plan_test.XXXXXX";
+        assert(mkdtemp(dir));
+        const std::string at = dir;
+        const auto write = [&](const std::string & name, const Gguf & g) {
+            std::ofstream(at + "/" + name, std::ios::binary) << g.bytes();
+        };
+        Gguf projector;
+        projector.kv("general.architecture", "clip").kv("clip.projector_type", "qwen3vl_merger");
+        write("Qwen3.8-27B-UD-IQ2_S.gguf", chat);
+        write("mmproj-Qwen3.8-27B-F16.gguf", projector);
+        const ps5lm::ModelInfo m = ps5lm::read_model_info(at + "/Qwen3.8-27B-UD-IQ2_S.gguf");
+        assert(m.mmproj == at + "/mmproj-Qwen3.8-27B-F16.gguf" && m.projector_type == "qwen3vl_merger");
+        const ps5lm::Plan vp = ps5lm::plan_model(m, budget, 8192);
+        assert(has_args(vp, "-ub", "256") && has_args(vp, "-b", "1280") && has_args(vp, "--image-max-tokens", "1280"));
+        assert(vp.reserve_gib >= 0.75 + 0.25 + 0.5);
+        assert(!ps5lm::causal_projector("gemma3") && ps5lm::causal_projector("qwen2vl_merger"));
+        ps5lm::ModelInfo g = m;
+        g.projector_type = "gemma3";
+        const ps5lm::Plan gp = ps5lm::plan_model(g, budget, 8192);
+        assert(has_args(gp, "-ub", "2048") && has_args(gp, "-b", "2048"));
+        assert(std::find(gp.args.begin(), gp.args.end(), "--image-max-tokens") == gp.args.end());
+        unlink((at + "/Qwen3.8-27B-UD-IQ2_S.gguf").c_str());
+        unlink((at + "/mmproj-Qwen3.8-27B-F16.gguf").c_str());
+        rmdir(dir);
+    }
 
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
