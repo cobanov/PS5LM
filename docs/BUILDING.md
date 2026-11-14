@@ -45,7 +45,7 @@ pacman -S base-devel clang llvm lld cmake ninja meson glslang python-mako python
 ```
 
 PS5_Vulkan and its forks go in `.deps/src`, at the revisions PS5_Vulkan pins (its
-`tools/setup-native-dependencies.sh` and `tools/build-radv.sh` name them); RADV gets the three
+`tools/setup-native-dependencies.sh` and `tools/build-radv.sh` name them); RADV gets the four
 patches in [patches/mesa](../patches/mesa/README.md):
 
 ```sh

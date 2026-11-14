@@ -5,6 +5,70 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
+  makes it delete `fleet-worker.txt` and restart as the app, the way a model change
+  restarts it. Before, a worker could only quit, and someone had to open PS5LM again
+  on the console.
+
+### Changed
+- **Qwen vision models get a narrow ubatch**: a model with a Qwen projector (`clip.projector_type`
+  `qwen*`) plans `-ub 256`, `-b 1280` and `--image-max-tokens 1280` instead of the 2048 ubatch,
+  and keeps 0.5 GiB of headroom for photos. llama.cpp needs a whole image in one ubatch only for
+  non-causal encoders (Gemma's), which keep 2048. On the console Qwen 3.8 27B UD-IQ2_S with its
+  F16 projector had 0.90 GiB free when ready at `-ub 1024` and 1.47 GiB at `-ub 256`, at the
+  same speed (median 11.1 s a photo) and with the same answers.
+- **Hybrid models start answering sooner**: with one context checkpoint a slot (`-ctxcp 1`,
+  which the app's plan and the fleet use), llama-server made three checkpoints for every prompt
+  (at the last user message, one batch before the end and 4 tokens before it) and evicted two of
+  them before the prompt was done. Each reads the model's recurrent state back from the GPU,
+  150 MiB for Qwen3.8-27B, and for a fleet split that read crosses the network.
+  `patches/0010` makes only the checkpoint a prompt keeps, so the next turn rolls back to the
+  same place as before. On a PS5 serving Qwen3.8-27B (IQ3_XXS, 128k context) to a PC over RPC,
+  LocalMaxxing's 348-token `reasoning-v1` prompt took 7.6 s to its first token and now takes
+  4.5 s, and a follow-up turn 6.6 s and now 3.3 s; generation stays at 18.1 tokens a second.
+  On the console the read stays in memory, and that gain is not measured.
+  `tests/server_checkpoints_test.py` checks it on a host build with an untrained Mamba fixture.
+- **Faster generation with a quantized KV cache on another device**: llama.cpp rotates a
+  quantized KV cache with Hadamard matrices, and it kept them in PC memory and uploaded them
+  to the device as inputs to every graph. For a fleet split those 272 KiB (Qwen3.8-27B's 256- and
+  64-wide heads) crossed the network on each token, about 2.3 ms a graph at gigabit.
+  `patches/0011` keeps one copy in the cache's device buffer when the whole cache is on one
+  device, so they are sent once at load. A PS5 serving Qwen3.8-27B (IQ3_XXS, q4_0 cache) to a
+  PC over RPC on LocalMaxxing's `reasoning-v1` test: 18.1 to 18.7 tokens a second at 128k
+  context, and with MTP self-speculation (2 drafts, 104k context) 20.1 to 21.9. Greedy output is
+  unchanged. A cache split over devices keeps the old inputs. `tests/server_kv_rotation_test.py`
+  checks it on a host build against one CPU RPC worker.
+- **Causal KQ mask built on the KV cache's device**: llama.cpp filled the attention mask in PC
+  memory and uploaded it as an `[n_kv, n_tokens]` input to every graph, about 21 MB per 512-token
+  batch at 20k context. `patches/0012` uploads only the cache cells' and the batch tokens'
+  positions and builds the mask on the device, when the whole cache is on non-host devices and
+  the batch needs a plain causal mask (no ALiBi, SWA or M-RoPE). A PS5 serving Qwen3.8-27B
+  (IQ3_XXS, q4_0 cache, `--parallel 2 -no-kvu`) to a PC over RPC: a 20k-token prompt 106.4 to
+  108.6 tokens a second, generation unchanged. Greedy output is byte-identical.
+  `LLAMA_KQ_MASK_HOST=1` keeps the old mask. `tests/server_kq_mask_test.py` checks it on a host
+  build against one CPU RPC worker, with and without flash attention.
+
+### Fixed
+- **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
+  submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
+  lock held; each blocked print made the next one due, so generation stayed stopped until the app
+  restarted. `patches/mesa/0010` turns that line off unless `RADV_PS5_SUBMIT_STATS=1` is set in
+  `env.txt`.
+- **The app no longer stops while its log is written** (#70): stdout and stderr went straight to
+  `app.log` on `/data`, stderr unbuffered, and a write there can wait for seconds. Every thread that
+  printed waited with it: the GPU driver with its submit lock held (#69), the GL library on the
+  render thread, llama.cpp's log thread. With `-lv 4` the whole app, screen included, stalled for up
+  to a minute. Now printf, fprintf, vprintf, vfprintf, puts, fputs, fputc, putc, putchar and fwrite
+  are wrapped at link time (`scripts/build-app.sh`): a print to stdout or stderr copies its text
+  into a 2 MiB ring and returns, and one thread writes the ring to `app.log`. A full ring drops
+  text and says how much in its place. `abort()` is wrapped too, so a crash writes the ring out
+  (its reason included) before the process ends. The memory lines in `app.log` give the sink's figures.
+  On the console at `-lv 4`, 5 minutes of ~1,800-token prompts: 16 requests, 7 over 15 s (worst 58 s)
+  before; 25 requests, none stalled, after.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
