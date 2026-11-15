@@ -203,7 +203,7 @@ index 6dba147..3892ed8 100644
          }
 diff --git a/tools/server/server-park.h b/tools/server/server-park.h
 new file mode 100644
-index 0000000..b2cfc15
+index 0000000..d0e2ad6
 --- /dev/null
 +++ b/tools/server/server-park.h
 @@ -0,0 +1,1074 @@
@@ -754,7 +754,7 @@ index 0000000..b2cfc15
 +        return n;
 +    }
 +
-+    // keys this machine has a manifest for whose files the worker dropped: marked, and named
++    // keys this machine has a manifest for whose files the worker dropped since the last look: marked, and named
 +    json mark_pruned() {
 +        json names = json::array();
 +        std::map<std::string, bool> there;
@@ -774,8 +774,8 @@ index 0000000..b2cfc15
 +            if (!m.pruned) {
 +                m.pruned = true;
 +                store(key, m);
++                names.push_back(key);     // newly gone: the ones marked before were reported then
 +            }
-+            names.push_back(key);
 +        }
 +        return names;
 +    }
