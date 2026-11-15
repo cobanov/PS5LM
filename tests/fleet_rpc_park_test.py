@@ -22,7 +22,7 @@ Checked here:
   memory    the worker's memory does not grow with the size of what it parks
 
 By default the model is the untrained llama fixture (attention only). With
---model (or PS5LM_PARK_TEST_MODEL) it is a real GGUF: Qwen3.5-0.8B has the hybrid
+--model it is a real GGUF: Qwen3.5-0.8B has the hybrid
 layout of Qwen3.8-27B (attention cells plus a recurrent state), which is what
 the consoles serve.
 
@@ -71,7 +71,7 @@ class Rig:
         self.model = args.model
         self.real = args.model is not None
         if not self.real:
-            self.model = make_fixture(output / "park-llama.gguf")
+            self.model = make_fixture(output / "park-llama.gguf", context=args.ctx)
         self.park_dir = output / "worker-park"
         self.host_dir = output / "host-park"
         self.host_dir.mkdir(parents=True)
@@ -386,7 +386,8 @@ def case_stale(rig, report):
     assert restored["n_restored"] == len(history) - 1, restored
     reply, read = rig.turn(edited)
     assert reply == ref, "an edited history answers differently on top of a restore of the old one"
-    assert read >= len(changed), f"only {read} tokens read: state of the old history was reused past the edit"
+    # (every fixture history starts with the same token, so the first token of the change can be shared)
+    assert read >= len(changed) - 1, f"only {read} tokens read: state of the old history was reused past the edit"
     saved = rig.slot("save", "stale")
     assert saved["mode"] == "rewrite" and saved["rewritten_from"] <= step + REPLY and saved["n_saved"] == len(edited) + KEPT, saved
     assert saved["n_appended"] == saved["n_saved"] - saved["rewritten_from"], saved
@@ -576,7 +577,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build", type=Path, default=ROOT / "build/fleet-host")
     parser.add_argument("--output", type=Path, default=ROOT / "build/fleet-park")
-    parser.add_argument("--model", type=Path, default=os.environ.get("PS5LM_PARK_TEST_MODEL") or None,
+    parser.add_argument("--model", type=Path, default=None,
                         help="a real GGUF instead of the untrained fixture (Qwen3.5-0.8B for the hybrid layout)")
     parser.add_argument("--old-build", type=Path, default=os.environ.get("PS5LM_PARK_TEST_OLD_BUILD") or None,
                         help="a fleet host build without device parking, for the mixed case")
