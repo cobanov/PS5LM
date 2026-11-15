@@ -1,0 +1,1238 @@
+Subject: [PATCH] server: slots are parked on the RPC worker
+
+With --slot-park-path DIR, POST /slots/{id}?action=save and action=restore
+with {"filename": KEY} keep the slot's state on the RPC worker's own storage
+under KEY (ggml-rpc/park.h) instead of in a file here, and action=park-list,
+park-delete and park-status look after the keys. DIR holds only the
+bookkeeping: per key a manifest, the tokens (4 bytes each) and the positions
+of the parked attention cells (24 bytes each). "device": false in the body
+keeps the old file behaviour when --slot-save-path is set too.
+
+- A save writes the attention cells at positions the key does not hold yet
+  and the recurrent state as it is: bytes in proportion to the tokens added,
+  plus one recurrent state.
+- A recurrent state cannot be rewound, so a request that returns and differs
+  before the parked end needs an earlier state: the recurrent state of the
+  save before, which is kept on the worker. With "checkpoint": true, and on a
+  key's first save, the slot's own checkpoint is parked as well.
+- The slot's tokens are compared with the parked ones. If they differ before
+  the parked end, the files that end before the difference are kept and the
+  rest written again ("mode": "rewrite"): a changed history is never resumed
+  as it was.
+- The manifest names the files with their sizes and checksums and is replaced
+  only after the worker has the new files whole, so a save that dies leaves
+  the previous state loadable. A restore checks sizes and checksums and leaves
+  the slot empty, never half restored, when anything is wrong.
+- Errors carry "park_error": park_pruned (410), park_torn and
+  park_incompatible (409), park_no_space (507), park_unsupported (501),
+  park_empty and park_bad_request (400), park_io (500). A key that was never
+  parked is a 404.
+- One RPC worker only, no draft model, no media in the slot.
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 267b848..f30045f 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3665,6 +3665,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
++    add_opt(common_arg(
++        {"--slot-park-path"}, "PATH",
++        "PS5LM device parking: slot save and restore keep the state on the RPC worker's own storage, "
++        "and PATH holds only the bookkeeping, a few MB per parked slot (default: disabled)",
++        [](common_params & params, const std::string & value) {
++            params.slot_park_path = value;
++            if (!fs_is_directory(params.slot_park_path)) {
++                throw std::invalid_argument("not a directory: " + value);
++            }
++            if (!params.slot_park_path.empty() && params.slot_park_path[params.slot_park_path.size() - 1] != DIRECTORY_SEPARATOR) {
++                params.slot_park_path += DIRECTORY_SEPARATOR;
++            }
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_PARK_PATH"));
+     add_opt(common_arg(
+         {"--media-path"}, "PATH",
+         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
+diff --git a/common/common.h b/common/common.h
+index 20a6466..2bc5f4e 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -709,6 +709,7 @@ struct common_params {
+     bool log_json = false;
+ 
+     std::string slot_save_path;
++    std::string slot_park_path; // PS5LM device parking: bookkeeping of the slots parked on the RPC worker
+     std::string media_path; // path to directory for loading media files
+ 
+     float slot_prompt_similarity = 0.1f;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 6dba147..7659105 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1009,6 +1009,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+     return true;
+ }
+ 
++// PS5LM device parking
++#include "server-park.h"
++
+ //
+ // server_context_impl (private implementation)
+ //
+@@ -1016,6 +1019,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+ struct server_context_impl {
+     friend struct server_context;
+ 
++    // PS5LM device parking (--slot-park-path); made on first use
++    std::unique_ptr<server_park> park;
++
+ public:
+     // only use these pointers outside of this class:
+     //  - when not in sleeping state
+@@ -3208,6 +3214,18 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_SAVE:
+                 {
++                    // PS5LM device parking: every park action comes as this task type. Listing,
++                    // deleting and the status need no slot, so they do not wait for one.
++                    if (task.slot_action.park != SERVER_PARK_NONE && !park) {
++                        park = std::make_unique<server_park>(params_base.slot_park_path);
++                    }
++                    if (task.slot_action.park >= SERVER_PARK_LIST) {
++                        auto res = park->run(task.slot_action.park, task.slot_action.filename, nullptr);
++                        res->id = task.id;
++                        queue_results.send(std::move(res));
++                        break;
++                    }
++
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+@@ -3221,6 +3239,15 @@ private:
+                         break;
+                     }
+ 
++                    // PS5LM device parking: the state stays on the worker (save or restore)
++                    if (task.slot_action.park != SERVER_PARK_NONE) {
++                        auto res = park->run(task.slot_action.park, task.slot_action.filename, slot, task.slot_action.filepath == "checkpoint");
++                        res->id      = task.id;
++                        res->id_slot = id_slot;
++                        queue_results.send(std::move(res));
++                        break;
++                    }
++
+                     const int64_t t_start = ggml_time_us();
+ 
+                     std::string filename = task.slot_action.filename;
+@@ -5985,7 +6012,7 @@ void server_routes::init_routes() {
+ 
+     this->post_slots = [this](const server_http_req & req) {
+         auto res = create_response();
+-        if (params.slot_save_path.empty()) {
++        if (params.slot_save_path.empty() && params.slot_park_path.empty()) {
+             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+             return res;
+         }
+@@ -6002,6 +6029,52 @@ void server_routes::init_routes() {
+ 
+         std::string action = req.get_param("action");
+ 
++        // PS5LM device parking (--slot-park-path): save and restore keep the state on the RPC
++        // worker under the key in "filename", unless the request says "device": false, and
++        // park-list, park-delete and park-status look after the keys
++        const bool park_only = action == "park-list" || action == "park-delete" || action == "park-status";
++        if (!params.slot_park_path.empty() && (park_only || action == "save" || action == "restore")) {
++            json body = json::object();
++            try {
++                if (!req.body.empty()) {
++                    body = json::parse(req.body);
++                }
++            } catch (const std::exception &) {
++                res->error(format_error_response("Invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++            if (park_only || json_value(body, "device", true)) {
++                server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
++                task.id = res->rd.get_new_id();
++                task.slot_action.id_slot  = id_slot;
++                task.slot_action.filename = json_value(body, "filename", std::string());
++                // a save with "checkpoint": true also parks the slot's own checkpoint (server-park.h)
++                task.slot_action.filepath = json_value(body, "checkpoint", false) ? "checkpoint" : "";
++                task.slot_action.park     = action == "save"        ? SERVER_PARK_SAVE
++                                          : action == "restore"     ? SERVER_PARK_RESTORE
++                                          : action == "park-list"   ? SERVER_PARK_LIST
++                                          : action == "park-delete" ? SERVER_PARK_DELETE
++                                          :                           SERVER_PARK_STATUS;
++                res->rd.post_task(std::move(task));
++                auto result = res->rd.next(req.should_stop);
++                if (!result) {
++                    GGML_ASSERT(req.should_stop());
++                    return res;
++                }
++                if (result->is_error()) {
++                    res->error(result->to_json());
++                } else {
++                    res->ok(result->to_json());
++                }
++                return res;
++            }
++        }
++        if (park_only || (params.slot_save_path.empty() && action != "erase")) {
++            res->error(format_error_response(park_only ? "This server has no device parking. Start it with `--slot-park-path`"
++                                                       : "This server keeps no slot files. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++
+         if (action == "save") {
+             return handle_slots_save(req, id_slot);
+         }
+diff --git a/tools/server/server-park.h b/tools/server/server-park.h
+new file mode 100644
+index 0000000..b852cd3
+--- /dev/null
++++ b/tools/server/server-park.h
+@@ -0,0 +1,1031 @@
++// PS5LM device parking: a slot's state is kept on the RPC worker's own storage
++// instead of in a file or in the prompt cache on this machine.
++//
++// With --slot-park-path DIR, POST /slots/{id}?action=save|restore with
++// {"filename": KEY} parks and resumes the slot under KEY on the worker
++// (ggml-rpc/park.h), and action=park-list, park-delete and park-status look
++// after the keys. DIR holds only the bookkeeping, a folder per key:
++//
++//   manifest.json  which files on the worker make up the state, their sizes and
++//                  checksums, and how many tokens they cover; replaced whole
++//   tokens.bin     the tokens of the parked state (4 bytes each)
++//   meta.bin       the positions of the parked attention cells (24 bytes each)
++//
++// On the worker a key is a folder of files, each written once:
++//
++//   NNNNNN.kv      the attention cells one save added (K and V rows per layer)
++//   NNNNNN.rs      the recurrent state at the end of that save, in the form of a
++//                  context checkpoint; the newest two are kept
++//   NNNNNN.ck      a context checkpoint of the slot, sent from this machine: only
++//                  when there is no earlier .rs to fall back to, or on request
++//
++// A save writes the cells at positions the key does not hold yet, plus the
++// recurrent state, which has a fixed size and cannot be extended. A recurrent
++// state cannot be rewound either, so a request that returns and differs before
++// the parked end needs an earlier state to go back to: that is the recurrent
++// state of the save before, which is already on the worker and costs nothing to
++// keep. Such a request then reads again what the last save added. A client
++// whose requests usually stop short of the parked end asks for the slot's own
++// checkpoint, a few tokens before the end of its last prompt, to be parked too
++// ("checkpoint": true): one more block of the same size per save.
++// If the slot's tokens differ from the parked ones before the parked
++// end, the save keeps the files that end at or before the difference and
++// rewrites the rest. The manifest is replaced only after the worker has the new
++// files whole, so a save that dies leaves the previous state loadable.
++//
++// Included by server-context.cpp after server_slot.
++#pragma once
++
++#include "ggml-backend.h"
++#include "ggml-rpc.h"
++
++#include <ctime>
++#include <map>
++#include <mutex>
++
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
++enum server_park_action {
++    SERVER_PARK_NONE = 0,
++    SERVER_PARK_SAVE,
++    SERVER_PARK_RESTORE,
++    SERVER_PARK_LIST,     // this and the following need no slot
++    SERVER_PARK_DELETE,
++    SERVER_PARK_STATUS,
++};
++
++struct server_task_result_park : server_task_result {
++    json data;
++    bool err = false;
++
++    virtual bool is_error() override { return err; }
++    virtual json to_json() override { return data; }
++};
++
++struct server_park_error {
++    std::string code;     // park_missing, park_pruned, park_torn, ...
++    int         http;
++    std::string message;
++};
++
++class server_park {
++public:
++    typedef bool (*park_fn_t)(const char *, const struct ggml_tensor *, const struct ggml_rpc_park_req *, const void *, void *, struct ggml_rpc_park_rsp *);
++
++    explicit server_park(const std::string & path) : dir(path) {
++        if (!dir.empty() && dir.back() != DIRECTORY_SEPARATOR) {
++            dir += DIRECTORY_SEPARATOR;
++        }
++    }
++
++    bool enabled() const { return !dir.empty(); }
++
++    static bool key_ok(const std::string & key) {
++        if (key.empty() || key.size() > 64 || key[0] == '.') {
++            return false;
++        }
++        for (const char c : key) {
++            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
++            if (!ok) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    // ---- the four actions; each answers with the JSON of the response ----
++
++    std::unique_ptr<server_task_result_park> run(int action, const std::string & key, server_slot * slot, bool want_checkpoint = false) {
++        auto res = std::make_unique<server_task_result_park>();
++        std::lock_guard<std::mutex> lock(mutex);
++        try {
++            if (action != SERVER_PARK_LIST && action != SERVER_PARK_STATUS && !key_ok(key)) {
++                throw server_park_error{"park_bad_request", 400, "a key is 1 to 64 letters, digits, '.', '_' or '-'"};
++            }
++            connect();
++            switch (action) {
++                case SERVER_PARK_SAVE:    res->data = save(*slot, key, want_checkpoint); break;
++                case SERVER_PARK_RESTORE: res->data = restore(*slot, key); break;
++                case SERVER_PARK_LIST:    res->data = list();              break;
++                case SERVER_PARK_DELETE:  res->data = remove(key);         break;
++                case SERVER_PARK_STATUS:  res->data = status();            break;
++                default: throw server_park_error{"park_bad_request", 400, "unknown park action"};
++            }
++        } catch (const server_park_error & e) {
++            SRV_ERR("device parking: %s: %s\n", e.code.c_str(), e.message.c_str());
++            res->err  = true;
++            res->data = json {
++                {"code",       e.http},
++                {"message",    e.code + ": " + e.message},
++                {"type",       e.http == 404 || e.http == 410 ? "not_found_error" : e.http == 501 ? "not_supported_error" : e.http < 500 ? "invalid_request_error" : "server_error"},
++                {"park_error", e.code},
++            };
++        } catch (const std::exception & e) {
++            SRV_ERR("device parking: %s\n", e.what());
++            res->err  = true;
++            res->data = json {{"code", 500}, {"message", std::string("park_io: ") + e.what()}, {"type", "server_error"}, {"park_error", "park_io"}};
++        }
++        return res;
++    }
++
++private:
++    // ---- one segment of attention cells ----
++    struct segment {
++        int         seq      = 0;
++        llama_pos   kv_begin = 0;   // positions [kv_begin, kv_end)
++        llama_pos   kv_end   = 0;
++        std::string file;
++        uint64_t    bytes    = 0;
++        uint64_t    hash     = 0;
++        uint64_t    meta_off  = 0;  // in meta.bin
++        uint64_t    meta_size = 0;
++    };
++
++    struct blob {
++        std::string file;           // empty: none
++        uint64_t    bytes = 0;
++        uint64_t    hash  = 0;
++        std::string meta;           // .rs: the small part of the recurrent state (hex in the manifest); .ck: its checksum here
++        int64_t     n_tokens = 0;   // where the state stands: as a checkpoint, a request goes back to here
++        llama_pos   pos_min  = 0;
++        llama_pos   pos_max  = 0;
++    };
++
++    struct manifest {
++        bool        found = false;
++        std::string fingerprint;
++        int64_t     n_tokens    = 0;
++        uint64_t    tokens_hash = 0;
++        llama_pos   n_kv        = 0;
++        int         next_seq    = 1;
++        std::vector<segment> segments;
++        blob        rs;
++        blob        ck;
++        int64_t     saves         = 0;
++        uint64_t    written_total = 0;
++        int64_t     saved_at      = 0;
++        bool        pruned        = false;
++    };
++
++    // ---- the worker ----
++
++    void connect() {
++        if (park_fn != nullptr) {
++            return;
++        }
++        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
++        park_fn = reg ? (park_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_park") : nullptr;
++        if (park_fn == nullptr) {
++            throw server_park_error{"park_unsupported", 501, "this build has no RPC backend with device parking"};
++        }
++        // the worker: the one RPC endpoint among the devices
++        std::vector<std::string> endpoints;
++        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++            ggml_backend_reg_t dreg = ggml_backend_dev_backend_reg(dev);
++            const char * rname = dreg ? ggml_backend_reg_name(dreg) : nullptr;
++            if (rname != nullptr && strncmp(rname, "RPC", 3) == 0) {
++                const std::string ep = ggml_backend_dev_description(dev);
++                if (std::find(endpoints.begin(), endpoints.end(), ep) == endpoints.end()) {
++                    endpoints.push_back(ep);
++                }
++            }
++        }
++        if (endpoints.size() != 1) {
++            park_fn = nullptr;
++            throw server_park_error{"park_unsupported", 501, "device parking needs exactly one RPC worker, this server has " + std::to_string(endpoints.size())};
++        }
++        endpoint = endpoints[0];
++    }
++
++    // one command; throws when the worker has no parking, otherwise the worker's status is in rsp
++    void dev(uint32_t op, const std::string & key, const std::string & file, uint64_t offset, uint64_t size, uint64_t arg,
++             const void * in, void * out, ggml_rpc_park_rsp & rsp, const ggml_tensor * tensor = nullptr) {
++        ggml_rpc_park_req req;
++        memset(&req, 0, sizeof(req));
++        req.op = op;
++        snprintf(req.key, sizeof(req.key), "%s", key.c_str());
++        snprintf(req.file, sizeof(req.file), "%s", file.c_str());
++        req.offset = offset;
++        req.size   = size;
++        req.arg    = arg;
++        memset(&rsp, 0, sizeof(rsp));
++        if (!park_fn(tensor ? nullptr : endpoint.c_str(), tensor, &req, in, out, &rsp)) {
++            throw server_park_error{"park_unsupported", 501, tensor ? "part of the slot's state is not on the parking worker " + endpoint
++                                                                   : "the worker " + endpoint + " has no device parking (an older worker, or no park folder set)"};
++        }
++    }
++
++    // the same, and any status but OK is an error
++    void dev_ok(uint32_t op, const std::string & key, const std::string & file, uint64_t offset, uint64_t size, uint64_t arg,
++                const void * in, void * out, ggml_rpc_park_rsp & rsp, const ggml_tensor * tensor = nullptr) {
++        dev(op, key, file, offset, size, arg, in, out, rsp, tensor);
++        check(rsp, key + "/" + file);
++    }
++
++    static void check(const ggml_rpc_park_rsp & rsp, const std::string & what) {
++        if (rsp.status == GGML_RPC_PARK_OK) {
++            return;
++        }
++        const std::string msg = what + ": " + std::string(rsp.msg, strnlen(rsp.msg, sizeof(rsp.msg)));
++        switch (rsp.status) {
++            case GGML_RPC_PARK_NO_SPACE:  throw server_park_error{"park_no_space", 507, msg};
++            case GGML_RPC_PARK_NOT_FOUND: throw server_park_error{"park_pruned", 410, msg};
++            case GGML_RPC_PARK_BAD:       throw server_park_error{"park_io", 500, msg};
++            case GGML_RPC_PARK_SHORT:     throw server_park_error{"park_torn", 409, msg};
++            case GGML_RPC_PARK_NO_WRITER: throw server_park_error{"park_io", 500, msg + " (the console's file writer, ftpsrv, did not answer)"};
++            default:                      throw server_park_error{"park_io", 500, msg};
++        }
++    }
++
++    // file name -> size of a key on the worker; empty when the key is not there
++    std::map<std::string, uint64_t> dev_files(const std::string & key) {
++        std::map<std::string, uint64_t> out;
++        const size_t room = 256;
++        std::vector<ggml_rpc_park_file_entry> page(room);
++        for (uint64_t at = 0;;) {
++            ggml_rpc_park_rsp rsp;
++            dev_ok(GGML_RPC_PARK_LIST_FILES, key, "", 0, room * sizeof(page[0]), at, nullptr, page.data(), rsp);
++            for (uint64_t i = 0; i < rsp.v[0]; i++) {
++                out[std::string(page[i].file, strnlen(page[i].file, sizeof(page[i].file)))] = page[i].bytes;
++            }
++            at += rsp.v[0];
++            if (rsp.v[0] == 0 || at >= rsp.v[1]) {
++                break;
++            }
++        }
++        return out;
++    }
++
++    std::vector<ggml_rpc_park_key_entry> dev_keys() {
++        std::vector<ggml_rpc_park_key_entry> out;
++        const size_t room = 256;
++        std::vector<ggml_rpc_park_key_entry> page(room);
++        for (uint64_t at = 0;;) {
++            ggml_rpc_park_rsp rsp;
++            dev_ok(GGML_RPC_PARK_LIST, "", "", 0, room * sizeof(page[0]), at, nullptr, page.data(), rsp);
++            out.insert(out.end(), page.begin(), page.begin() + rsp.v[0]);
++            at += rsp.v[0];
++            if (rsp.v[0] == 0 || at >= rsp.v[1]) {
++                break;
++            }
++        }
++        return out;
++    }
++
++    // ---- tensor data: the callbacks of llama_state_seq_park_get/set ----
++
++    struct tensor_io {
++        server_park * park;
++        uint32_t      op;              // GGML_RPC_PARK_WRITE_TENSOR or READ_TENSOR
++        bool          blob = false;    // the file holds the small part too, each piece before the tensor data it describes
++        const char *  meta = nullptr;  // writing a blob: the small part, as llama fills it
++        size_t        done = 0;        // bytes of the small part written or passed over
++        bool          failed = false;
++        server_park_error error {"", 0, ""};
++
++        // the small part up to `upto`: written, or passed over when reading (this machine has it already)
++        void small(size_t upto) {
++            std::vector<uint8_t> scratch;
++            while (done < upto) {
++                const size_t n = std::min<size_t>(upto - done, GGML_RPC_PARK_MAX_DATA);
++                ggml_rpc_park_rsp rsp;
++                if (op == GGML_RPC_PARK_WRITE_TENSOR) {
++                    park->dev_ok(GGML_RPC_PARK_WRITE_DATA, "", "", 0, n, 0, meta + done, nullptr, rsp);
++                } else {
++                    scratch.resize(n);
++                    park->dev_ok(GGML_RPC_PARK_READ_DATA, "", "", 0, n, 0, nullptr, scratch.data(), rsp);
++                }
++                done += n;
++            }
++        }
++    };
++
++    static bool tensor_cb(void * user_data, struct ggml_tensor * tensor, size_t offset, size_t size, size_t meta_pos) {
++        auto * io = (tensor_io *) user_data;
++        try {
++            if (io->blob) {
++                io->small(meta_pos);
++            }
++            ggml_rpc_park_rsp rsp;
++            io->park->dev(io->op, "", "", offset, size, 0, nullptr, nullptr, rsp, tensor);
++            check(rsp, io->op == GGML_RPC_PARK_WRITE_TENSOR ? "writing tensor data" : "reading tensor data");
++            return true;
++        } catch (const server_park_error & e) {
++            io->failed = true;
++            io->error  = e;
++            return false;
++        }
++    }
++
++    // ---- this machine's bookkeeping ----
++
++    static uint64_t fnv(const void * data, size_t len, uint64_t h = 0xcbf29ce484222325ULL) {
++        const uint8_t * p = (const uint8_t *) data;
++        for (size_t i = 0; i < len; i++) {
++            h ^= p[i];
++            h *= 0x100000001b3ULL;
++        }
++        return h;
++    }
++
++    static std::string hex64(uint64_t v) {
++        char text[17];
++        snprintf(text, sizeof(text), "%016" PRIx64, v);
++        return text;
++    }
++
++    static std::string to_hex(const std::string & bytes) {
++        static const char * digits = "0123456789abcdef";
++        std::string out;
++        out.reserve(bytes.size() * 2);
++        for (const unsigned char c : bytes) {
++            out += digits[c >> 4];
++            out += digits[c & 15];
++        }
++        return out;
++    }
++
++    static std::string from_hex(const std::string & text) {
++        std::string out;
++        for (size_t i = 0; i + 1 < text.size(); i += 2) {
++            out += (char) std::stoi(text.substr(i, 2), nullptr, 16);
++        }
++        return out;
++    }
++
++    std::string key_dir(const std::string & key) const { return dir + key + DIRECTORY_SEPARATOR; }
++
++    static bool read_exact(const std::string & path, uint64_t offset, void * data, size_t size) {
++        std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
++        if (!f || !f.seekg((std::streamoff) offset)) {
++            return false;
++        }
++        f.read((char *) data, (std::streamsize) size);
++        return (size_t) f.gcount() == size;
++    }
++
++    // the file is cut to offset and data follows; on disk before this returns
++    static void write_at(const std::string & path, uint64_t offset, const void * data, size_t size) {
++        std::error_code ec;
++        const auto p = std::filesystem::u8path(path);
++        if (!std::filesystem::exists(p, ec)) {
++            std::ofstream create(p, std::ios::binary);
++        }
++        const uintmax_t have = std::filesystem::file_size(p, ec);
++        if (ec || have < offset) {
++            throw std::runtime_error("bookkeeping file " + path + " is shorter than expected");
++        }
++        std::filesystem::resize_file(p, offset, ec);
++        FILE * f = ec ? nullptr : fopen(path.c_str(), "ab");
++        if (f == nullptr) {
++            throw std::runtime_error("cannot write " + path);
++        }
++        bool ok = size == 0 || fwrite(data, 1, size, f) == size;
++        ok = fflush(f) == 0 && ok;
++#ifndef _WIN32
++        ok = fsync(fileno(f)) == 0 && ok;
++#endif
++        ok = fclose(f) == 0 && ok;
++        if (!ok) {
++            throw std::runtime_error("cannot write " + path);
++        }
++    }
++
++    static void write_whole(const std::string & path, const std::string & text) {
++        const std::string tmp = path + ".tmp";
++        write_at(tmp, 0, text.data(), text.size());
++        std::error_code ec;
++        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec);
++        if (ec) {
++            throw std::runtime_error("cannot replace " + path + ": " + ec.message());
++        }
++    }
++
++    manifest load(const std::string & key) const {
++        manifest m;
++        std::ifstream f(std::filesystem::u8path(key_dir(key) + "manifest.json"));
++        if (!f) {
++            return m;
++        }
++        try {
++            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++            const json j = json::parse(text);
++            if (j.at("version").get<int>() != 1) {
++                return m;
++            }
++            m.fingerprint   = j.at("fingerprint").get<std::string>();
++            m.n_tokens      = j.at("n_tokens").get<int64_t>();
++            m.tokens_hash   = std::stoull(j.at("tokens_hash").get<std::string>(), nullptr, 16);
++            m.n_kv          = j.at("n_kv").get<llama_pos>();
++            m.next_seq      = j.at("next_seq").get<int>();
++            m.saves         = j.at("saves").get<int64_t>();
++            m.written_total = j.at("written_total").get<uint64_t>();
++            m.saved_at      = j.at("saved_at").get<int64_t>();
++            m.pruned        = json_value(j, "pruned", false);
++            for (const auto & s : j.at("segments")) {
++                segment seg;
++                seg.seq       = s.at("seq").get<int>();
++                seg.kv_begin  = s.at("kv_begin").get<llama_pos>();
++                seg.kv_end    = s.at("kv_end").get<llama_pos>();
++                seg.file      = s.at("file").get<std::string>();
++                seg.bytes     = s.at("bytes").get<uint64_t>();
++                seg.hash      = std::stoull(s.at("hash").get<std::string>(), nullptr, 16);
++                seg.meta_off  = s.at("meta_off").get<uint64_t>();
++                seg.meta_size = s.at("meta_size").get<uint64_t>();
++                m.segments.push_back(seg);
++            }
++            const auto read_blob = [&](const char * name, blob & b) {
++                if (!j.contains(name) || j.at(name).is_null()) {
++                    return;
++                }
++                const auto & o = j.at(name);
++                b.file     = o.at("file").get<std::string>();
++                b.bytes    = o.at("bytes").get<uint64_t>();
++                b.hash     = std::stoull(o.at("hash").get<std::string>(), nullptr, 16);
++                b.meta     = from_hex(json_value(o, "meta", std::string()));
++                b.n_tokens = json_value(o, "n_tokens", (int64_t) 0);
++                b.pos_min  = json_value(o, "pos_min", (llama_pos) 0);
++                b.pos_max  = json_value(o, "pos_max", (llama_pos) 0);
++            };
++            read_blob("rs", m.rs);
++            read_blob("ck", m.ck);
++            m.found = true;
++        } catch (const std::exception & e) {
++            SRV_WRN("device parking: unreadable manifest for '%s' (%s); the key starts again\n", key.c_str(), e.what());
++            m = manifest();
++        }
++        return m;
++    }
++
++    void store(const std::string & key, const manifest & m) const {
++        json segs = json::array();
++        for (const auto & s : m.segments) {
++            segs.push_back({{"seq", s.seq}, {"kv_begin", s.kv_begin}, {"kv_end", s.kv_end}, {"file", s.file}, {"bytes", s.bytes},
++                            {"hash", hex64(s.hash)}, {"meta_off", s.meta_off}, {"meta_size", s.meta_size}});
++        }
++        const auto write_blob = [](const blob & b) -> json {
++            if (b.file.empty()) {
++                return nullptr;
++            }
++            return {{"file", b.file}, {"bytes", b.bytes}, {"hash", hex64(b.hash)}, {"meta", to_hex(b.meta)},
++                    {"n_tokens", b.n_tokens}, {"pos_min", b.pos_min}, {"pos_max", b.pos_max}};
++        };
++        const json j = {
++            {"version", 1}, {"key", key}, {"fingerprint", m.fingerprint}, {"n_tokens", m.n_tokens}, {"tokens_hash", hex64(m.tokens_hash)},
++            {"n_kv", m.n_kv}, {"next_seq", m.next_seq}, {"segments", segs}, {"rs", write_blob(m.rs)}, {"ck", write_blob(m.ck)},
++            {"saves", m.saves}, {"written_total", m.written_total}, {"saved_at", m.saved_at}, {"pruned", m.pruned},
++        };
++        write_whole(key_dir(key) + "manifest.json", j.dump(1) + "\n");
++    }
++
++    // what must be the same for a parked state to fit this server
++    static std::string fingerprint(const server_slot & slot) {
++        const llama_model * model = llama_get_model(slot.ctx_tgt);
++        char desc[256] = {0};
++        llama_model_desc(model, desc, sizeof(desc));
++        return std::string(desc) + "|" + std::to_string(llama_model_size(model)) + "|" + std::to_string(llama_model_n_params(model));
++    }
++
++    static std::string seq_name(int seq, const char * ext) {
++        char text[32];
++        snprintf(text, sizeof(text), "%06d.%s", seq, ext);
++        return text;
++    }
++
++    // the parked tokens, or false when the bookkeeping does not hold what the manifest says
++    bool load_tokens(const std::string & key, const manifest & m, llama_tokens & tokens) const {
++        tokens.resize(m.n_tokens);
++        if (m.n_tokens > 0 && !read_exact(key_dir(key) + "tokens.bin", 0, tokens.data(), tokens.size() * sizeof(llama_token))) {
++            return false;
++        }
++        return fnv(tokens.data(), tokens.size() * sizeof(llama_token)) == m.tokens_hash;
++    }
++
++    // every file the manifest names is on the worker with its size
++    static bool on_device(const manifest & m, const std::map<std::string, uint64_t> & files) {
++        const auto has = [&](const std::string & name, uint64_t bytes) {
++            const auto it = files.find(name);
++            return it != files.end() && it->second == bytes;
++        };
++        for (const auto & s : m.segments) {
++            if (!has(s.file, s.bytes)) {
++                return false;
++            }
++        }
++        return (m.rs.file.empty() || has(m.rs.file, m.rs.bytes)) && (m.ck.file.empty() || has(m.ck.file, m.ck.bytes));
++    }
++
++    static uint64_t device_bytes(const manifest & m) {
++        uint64_t n = m.rs.bytes + m.ck.bytes;
++        for (const auto & s : m.segments) {
++            n += s.bytes;
++        }
++        return n;
++    }
++
++    // keys this machine has a manifest for whose files the worker dropped: marked, and named
++    json mark_pruned() {
++        json names = json::array();
++        std::map<std::string, bool> there;
++        for (const auto & k : dev_keys()) {
++            there[std::string(k.key, strnlen(k.key, sizeof(k.key)))] = true;
++        }
++        std::error_code ec;
++        for (std::filesystem::directory_iterator it(std::filesystem::u8path(dir), ec), end; !ec && it != end; it.increment(ec)) {
++            const std::string key = it->path().filename().string();
++            if (!key_ok(key) || there.count(key)) {
++                continue;
++            }
++            manifest m = load(key);
++            if (!m.found) {
++                continue;
++            }
++            if (!m.pruned) {
++                m.pruned = true;
++                store(key, m);
++            }
++            names.push_back(key);
++        }
++        return names;
++    }
++
++    // ---- save ----
++
++    json save(server_slot & slot, const std::string & key, bool want_checkpoint) {
++        const int64_t t_start = ggml_time_us();
++        llama_context * ctx = slot.ctx_tgt;
++        const uint32_t parts = llama_state_seq_park_parts(ctx);
++        if (parts == 0) {
++            throw server_park_error{"park_unsupported", 501, "this model's memory cannot be parked in parts"};
++        }
++        if (slot.ctx_dft != nullptr || slot.prompt.tokens.has_mtmd) {
++            throw server_park_error{"park_unsupported", 501, "device parking does not keep a draft model's state or media"};
++        }
++        const llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
++        const llama_pos n_kv = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id) + 1;
++        if (tokens.empty() || n_kv <= 0 || tokens.size() != slot.prompt.tokens.size()) {
++            throw server_park_error{"park_empty", 400, "the slot holds no state to park"};
++        }
++        for (const auto & c : slot.prompt.checkpoints) {
++            if (!c.data_dft.empty() || !c.data_spec.empty()) {
++                throw server_park_error{"park_unsupported", 501, "device parking does not keep speculative-decoding checkpoints"};
++            }
++        }
++
++        // what the key holds now, and whether it can be added to
++        const std::string kdir = key_dir(key);
++        std::error_code ec;
++        std::filesystem::create_directories(std::filesystem::u8path(kdir), ec);
++        manifest m = load(key);
++        auto files = dev_files(key);
++        llama_tokens parked;
++        std::string mode = "append";
++        std::string reason;
++        if (!m.found) {
++            reason = "new";
++        } else if (m.pruned || (files.empty() && !m.segments.empty())) {
++            reason = "pruned";
++        } else if (m.fingerprint != fingerprint(slot)) {
++            reason = "incompatible";
++        } else if (!on_device(m, files) || !load_tokens(key, m, parked)) {
++            reason = "damaged";
++        }
++        if (!reason.empty()) {
++            mode = "new";
++            m = manifest();
++            parked.clear();
++            if (!files.empty()) {
++                ggml_rpc_park_rsp rsp;
++                dev_ok(GGML_RPC_PARK_DELETE, key, "", 0, 0, 0, nullptr, nullptr, rsp);
++                files.clear();
++            }
++        }
++        const int64_t n_tokens_before = m.n_tokens;
++
++        // the tokens the slot shares with the parked state, and the files that hold only those
++        size_t n_same = 0;
++        while (n_same < parked.size() && n_same < tokens.size() && parked[n_same] == tokens[n_same]) {
++            n_same++;
++        }
++        const bool stale = n_same < parked.size();
++        size_t keep = 0;
++        while (keep < m.segments.size() && (size_t) m.segments[keep].kv_end <= n_same && m.segments[keep].kv_end <= n_kv) {
++            keep++;
++        }
++        const llama_pos base = keep > 0 ? m.segments[keep - 1].kv_end : 0;
++        if (m.found && !stale && tokens.size() == parked.size() && base == n_kv) {
++            return json {
++                {"id_slot", slot.id}, {"filename", key}, {"device", true}, {"mode", "unchanged"},
++                {"n_saved", tokens.size()}, {"n_appended", 0}, {"n_written", 0}, {"n_written_kv", 0}, {"n_written_state", 0},
++                {"n_written_checkpoint", 0}, {"n_parked_bytes", device_bytes(m)}, {"pruned", json::array()},
++                {"timings", {{"save_ms", (ggml_time_us() - t_start) / 1000.0}}},
++            };
++        }
++        if (m.found && (stale || keep < m.segments.size())) {
++            mode   = "rewrite";
++            reason = "the history changed before the parked end";
++        }
++        std::vector<segment> dropped(m.segments.begin() + keep, m.segments.end());
++        m.segments.resize(keep);
++
++        // sizes first, so that the worker can make room for all of it at once
++        size_t kv_bytes = 0, rs_tensor_bytes = 0;
++        const size_t kv_meta_size = (parts & (1u << LLAMA_STATE_PARK_ATTN))
++            ? llama_state_seq_park_get(ctx, slot.id, LLAMA_STATE_PARK_ATTN, base, nullptr, 0, nullptr, nullptr, &kv_bytes) : 0;
++        const size_t rs_meta_size = (parts & (1u << LLAMA_STATE_PARK_RECR))
++            ? llama_state_seq_park_get(ctx, slot.id, LLAMA_STATE_PARK_RECR, 0, nullptr, 0, nullptr, nullptr, &rs_tensor_bytes) : 0;
++        uint8_t header[8];
++        const size_t rs_bytes = rs_tensor_bytes > 0 ? llama_state_seq_park_header(ctx, slot.id, header) + rs_meta_size + rs_tensor_bytes : 0;
++
++        // What a returning request goes back to when it differs before the parked end (a recurrent state
++        // cannot be rewound). The recurrent state of the save before is on the worker already: kept, it
++        // is that fallback for nothing. Only without one (a first save, or a history changed before it),
++        // or when the client asks, the slot's newest checkpoint is parked as well.
++        const bool prev_ok = !m.rs.file.empty() && m.rs.n_tokens <= (int64_t) n_same && m.rs.n_tokens < n_kv;
++        const common_prompt_checkpoint * ckpt = nullptr;
++        if (rs_bytes > 0 && (want_checkpoint || !prev_ok)) {
++            for (const auto & c : slot.prompt.checkpoints) {
++                if (!c.data_tgt.empty() && c.n_tokens <= (int64_t) tokens.size() && c.pos_max < n_kv && (ckpt == nullptr || c.n_tokens > ckpt->n_tokens)) {
++                    ckpt = &c;
++                }
++            }
++        }
++        const uint64_t ck_hash = ckpt ? fnv(ckpt->data_tgt.data(), ckpt->data_tgt.size()) : 0;
++        const bool ck_same = ckpt && !m.ck.file.empty() && m.ck.n_tokens == ckpt->n_tokens && m.ck.bytes == ckpt->data_tgt.size() &&
++                             m.ck.meta == hex64(ck_hash);
++        const size_t ck_bytes = ckpt && !ck_same ? ckpt->data_tgt.size() : 0;
++
++        const int seq = m.next_seq;
++        uint64_t n_pruned = 0;
++        uint64_t to_come  = kv_bytes + rs_bytes + ck_bytes;
++        ggml_rpc_park_rsp rsp;
++        segment seg;
++        std::string kv_meta(kv_meta_size, '\0');
++        blob rs;
++        blob ck;
++        try {
++            // 1. the attention cells this key does not hold yet
++            if (kv_bytes > 0) {
++                seg.seq      = seq;
++                seg.kv_begin = base;
++                seg.kv_end   = n_kv;
++                seg.file     = seq_name(seq, "kv");
++                dev_ok(GGML_RPC_PARK_WRITE_BEGIN, key, seg.file, 0, to_come, 0, nullptr, nullptr, rsp);
++                n_pruned += rsp.v[0];
++                tensor_io io {this, GGML_RPC_PARK_WRITE_TENSOR};
++                const size_t n = llama_state_seq_park_get(ctx, slot.id, LLAMA_STATE_PARK_ATTN, base, (uint8_t *) kv_meta.data(), kv_meta.size(), tensor_cb, &io, nullptr);
++                if (io.failed) {
++                    throw io.error;
++                }
++                if (n != kv_meta_size) {
++                    throw server_park_error{"park_io", 500, "the attention state changed size while it was parked"};
++                }
++                dev_ok(GGML_RPC_PARK_WRITE_COMMIT, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++                seg.bytes = rsp.v[0];
++                seg.hash  = rsp.v[1];
++                if (seg.bytes != kv_bytes) {
++                    throw server_park_error{"park_io", 500, "the worker wrote " + std::to_string(seg.bytes) + " bytes of attention state, expected " + std::to_string(kv_bytes)};
++                }
++                to_come -= kv_bytes;
++            }
++
++            // 2. the recurrent state as it is now, in the form llama gives a context checkpoint: its 8-byte
++            //    header, then the small part with each tensor's data where it belongs. The next save can
++            //    then keep this file as the state to go back to.
++            if (rs_bytes > 0) {
++                rs.file     = seq_name(seq, "rs");
++                rs.n_tokens = n_kv;
++                rs.pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
++                rs.pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
++                rs.meta.assign(rs_meta_size, '\0');
++                dev_ok(GGML_RPC_PARK_WRITE_BEGIN, key, rs.file, 0, to_come, 0, nullptr, nullptr, rsp);
++                n_pruned += rsp.v[0];
++                dev_ok(GGML_RPC_PARK_WRITE_DATA, "", "", 0, sizeof(header), 0, header, nullptr, rsp);
++                tensor_io io {this, GGML_RPC_PARK_WRITE_TENSOR};
++                io.blob = true;
++                io.meta = rs.meta.data();
++                const size_t n = llama_state_seq_park_get(ctx, slot.id, LLAMA_STATE_PARK_RECR, 0, (uint8_t *) rs.meta.data(), rs.meta.size(), tensor_cb, &io, nullptr);
++                if (io.failed) {
++                    throw io.error;
++                }
++                if (n != rs_meta_size) {
++                    throw server_park_error{"park_io", 500, "the recurrent state changed size while it was parked"};
++                }
++                io.small(rs_meta_size);
++                dev_ok(GGML_RPC_PARK_WRITE_COMMIT, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++                rs.bytes = rsp.v[0];
++                rs.hash  = rsp.v[1];
++                if (rs.bytes != rs_bytes) {
++                    throw server_park_error{"park_io", 500, "the worker wrote " + std::to_string(rs.bytes) + " bytes of recurrent state, expected " + std::to_string(rs_bytes)};
++                }
++                to_come -= rs_bytes;
++            }
++
++            // 3. the state to go back to
++            if (ck_bytes > 0) {
++                // the slot's checkpoint, which is in this machine's memory: sent in pieces
++                ck.file     = seq_name(seq, "ck");
++                ck.n_tokens = ckpt->n_tokens;
++                ck.pos_min  = ckpt->pos_min;
++                ck.pos_max  = ckpt->pos_max;
++                ck.meta     = hex64(ck_hash);
++                dev_ok(GGML_RPC_PARK_WRITE_BEGIN, key, ck.file, 0, to_come, 0, nullptr, nullptr, rsp);
++                n_pruned += rsp.v[0];
++                for (size_t at = 0; at < ck_bytes; at += GGML_RPC_PARK_MAX_DATA) {
++                    const size_t n = std::min<size_t>(GGML_RPC_PARK_MAX_DATA, ck_bytes - at);
++                    dev_ok(GGML_RPC_PARK_WRITE_DATA, "", "", 0, n, 0, ckpt->data_tgt.data() + at, nullptr, rsp);
++                }
++                dev_ok(GGML_RPC_PARK_WRITE_COMMIT, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++                ck.bytes = rsp.v[0];
++                ck.hash  = rsp.v[1];
++            } else if (ck_same) {
++                ck = m.ck;                 // the same checkpoint as last time: it is there
++            } else if (prev_ok) {
++                ck = m.rs;                 // the recurrent state of the save before
++                ck.meta = "rs";
++            }
++        } catch (...) {
++            abort_write();
++            throw;
++        }
++
++        // 4. the bookkeeping here; the manifest last, and only it makes the new files count
++        const blob old_rs = m.rs;
++        const blob old_ck = m.ck;
++        const uint64_t meta_end = m.segments.empty() ? 0 : m.segments.back().meta_off + m.segments.back().meta_size;
++        if (kv_bytes > 0) {
++            seg.meta_off  = meta_end;
++            seg.meta_size = kv_meta.size();
++            write_at(kdir + "meta.bin", meta_end, kv_meta.data(), kv_meta.size());
++            m.segments.push_back(seg);
++        } else {
++            write_at(kdir + "meta.bin", meta_end, nullptr, 0);
++        }
++        write_at(kdir + "tokens.bin", n_same * sizeof(llama_token), tokens.data() + n_same, (tokens.size() - n_same) * sizeof(llama_token));
++        m.found         = true;
++        m.fingerprint   = fingerprint(slot);
++        m.n_tokens      = tokens.size();
++        m.tokens_hash   = fnv(tokens.data(), tokens.size() * sizeof(llama_token));
++        m.n_kv          = n_kv;
++        m.next_seq      = seq + 1;
++        m.rs            = rs;
++        m.ck            = ck;
++        m.saves        += 1;
++        m.written_total += kv_bytes + rs.bytes + ck_bytes;
++        m.saved_at      = (int64_t) time(nullptr);
++        m.pruned        = false;
++        store(key, m);
++
++        // 5. what the new manifest no longer names
++        const auto drop = [&](const std::string & file) {
++            if (!file.empty()) {
++                ggml_rpc_park_rsp r;
++                dev(GGML_RPC_PARK_DELETE, key, file, 0, 0, 0, nullptr, nullptr, r);
++            }
++        };
++        std::map<std::string, bool> named;
++        for (const auto & s : m.segments) {
++            named[s.file] = true;
++        }
++        named[m.rs.file] = true;
++        named[m.ck.file] = true;
++        for (const auto & f : files) {
++            if (!named.count(f.first)) {
++                drop(f.first);
++            }
++        }
++        for (const auto & old : {old_rs.file, old_ck.file}) {
++            if (!named.count(old) && !files.count(old)) {
++                drop(old);
++            }
++        }
++
++        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
++        const int64_t n_appended = mode == "append" ? (int64_t) tokens.size() - n_tokens_before : (int64_t) tokens.size() - base;
++        SRV_INF("device parking: saved '%s' (%s): %zu tokens, %" PRId64 " new, %.1f MiB written (cells %.1f, recurrent state %.1f, checkpoint %.1f) in %.2f s\n",
++                key.c_str(), mode.c_str(), tokens.size(), n_appended, (kv_bytes + rs.bytes + ck_bytes) / 1048576.0, kv_bytes / 1048576.0,
++                rs.bytes / 1048576.0, ck_bytes / 1048576.0, t_ms / 1000.0);
++        json out = {
++            {"id_slot", slot.id}, {"filename", key}, {"device", true}, {"mode", mode},
++            {"n_saved", tokens.size()}, {"n_appended", n_appended},
++            {"n_written", kv_bytes + rs.bytes + ck_bytes}, {"n_written_kv", kv_bytes}, {"n_written_state", rs.bytes}, {"n_written_checkpoint", ck_bytes},
++            {"n_parked_bytes", device_bytes(m)}, {"n_segments", m.segments.size()},
++            {"checkpoint_n_tokens", ck.file.empty() ? json(nullptr) : json(ck.n_tokens)},
++            {"checkpoint_kind", ck.file.empty() ? json(nullptr) : json(ck.meta == "rs" ? "previous_save" : "slot_checkpoint")},
++            {"pruned", n_pruned > 0 ? mark_pruned() : json::array()},
++            {"timings", {{"save_ms", t_ms}}},
++        };
++        if (mode != "append") {
++            out["rewritten_from"] = base;
++            out["reason"]         = reason;
++        }
++        return out;
++    }
++
++    void abort_write() {
++        try {
++            ggml_rpc_park_rsp rsp;
++            dev(GGML_RPC_PARK_WRITE_ABORT, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++        } catch (...) {
++        }
++    }
++
++    // ---- restore ----
++
++    json restore(server_slot & slot, const std::string & key) {
++        const int64_t t_start = ggml_time_us();
++        llama_context * ctx = slot.ctx_tgt;
++        if (llama_state_seq_park_parts(ctx) == 0 || slot.ctx_dft != nullptr) {
++            throw server_park_error{"park_unsupported", 501, "this model's memory cannot be parked in parts"};
++        }
++        manifest m = load(key);
++        if (!m.found) {
++            throw server_park_error{"park_missing", 404, "no parked state '" + key + "'"};
++        }
++        const auto files = dev_files(key);
++        if (m.pruned || (files.empty() && device_bytes(m) > 0)) {
++            if (!m.pruned) {
++                m.pruned = true;
++                store(key, m);
++            }
++            throw server_park_error{"park_pruned", 410, "the worker no longer holds '" + key + "' (dropped to make room, or its storage was cleared)"};
++        }
++        if (m.fingerprint != fingerprint(slot)) {
++            throw server_park_error{"park_incompatible", 409, "'" + key + "' was parked by another model (" + m.fingerprint + ")"};
++        }
++        if (m.n_tokens > slot.n_ctx) {
++            throw server_park_error{"park_incompatible", 409, "'" + key + "' holds " + std::to_string(m.n_tokens) + " tokens, the slot " + std::to_string(slot.n_ctx)};
++        }
++        llama_tokens tokens;
++        if (!on_device(m, files) || !load_tokens(key, m, tokens)) {
++            throw server_park_error{"park_torn", 409, "'" + key + "' is incomplete: its files and the bookkeeping do not agree"};
++        }
++        const uint64_t meta_end = m.segments.empty() ? 0 : m.segments.back().meta_off + m.segments.back().meta_size;
++        std::string meta(meta_end, '\0');
++        if (meta_end > 0 && !read_exact(key_dir(key) + "meta.bin", 0, meta.data(), meta.size())) {
++            throw server_park_error{"park_torn", 409, "'" + key + "' is incomplete: its cell positions are missing"};
++        }
++
++        // from here the slot is being overwritten: any failure leaves it empty, never half restored
++        slot.prompt_clear();
++        uint64_t n_read = 0;
++        common_prompt_checkpoint ckpt;
++        try {
++            ggml_rpc_park_rsp rsp;
++            const auto end_file = [&](const std::string & file, uint64_t bytes, uint64_t hash) {
++                dev_ok(GGML_RPC_PARK_READ_END, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++                if (rsp.v[0] != bytes || rsp.v[1] != hash) {
++                    throw server_park_error{"park_torn", 409, "'" + key + "/" + file + "' does not hold what was parked (checksum)"};
++                }
++                n_read += bytes;
++            };
++            const auto load_part = [&](int part, bool append, const char * data, size_t size, const std::string & file) {
++                tensor_io io {this, GGML_RPC_PARK_READ_TENSOR};
++                io.blob = part == LLAMA_STATE_PARK_RECR;
++                const size_t n = llama_state_seq_park_set(ctx, slot.id, part, append, (const uint8_t *) data, size, tensor_cb, &io);
++                if (io.failed) {
++                    throw io.error;
++                }
++                if (n != size) {
++                    throw server_park_error{"park_incompatible", 409, "'" + key + "/" + file + "' does not fit this server's context (layout or size)"};
++                }
++                if (io.blob) {
++                    io.small(size);
++                }
++            };
++            for (size_t i = 0; i < m.segments.size(); i++) {
++                const auto & s = m.segments[i];
++                dev_ok(GGML_RPC_PARK_READ_BEGIN, key, s.file, 0, 0, 0, nullptr, nullptr, rsp);
++                load_part(LLAMA_STATE_PARK_ATTN, i > 0, meta.data() + s.meta_off, s.meta_size, s.file);
++                end_file(s.file, s.bytes, s.hash);
++            }
++            if (!m.rs.file.empty()) {
++                dev_ok(GGML_RPC_PARK_READ_BEGIN, key, m.rs.file, 0, 0, 0, nullptr, nullptr, rsp);
++                uint8_t header[8];
++                dev_ok(GGML_RPC_PARK_READ_DATA, "", "", 0, sizeof(header), 0, nullptr, header, rsp);
++                load_part(LLAMA_STATE_PARK_RECR, false, m.rs.meta.data(), m.rs.meta.size(), m.rs.file);
++                end_file(m.rs.file, m.rs.bytes, m.rs.hash);
++            }
++            if (!m.ck.file.empty()) {
++                dev_ok(GGML_RPC_PARK_READ_BEGIN, key, m.ck.file, 0, 0, 0, nullptr, nullptr, rsp);
++                ckpt.data_tgt.resize(m.ck.bytes);
++                for (size_t at = 0; at < m.ck.bytes; at += GGML_RPC_PARK_MAX_DATA) {
++                    const size_t n = std::min<size_t>(GGML_RPC_PARK_MAX_DATA, m.ck.bytes - at);
++                    dev_ok(GGML_RPC_PARK_READ_DATA, "", "", 0, n, 0, nullptr, ckpt.data_tgt.data() + at, rsp);
++                }
++                end_file(m.ck.file, m.ck.bytes, m.ck.hash);
++                ckpt.id_task  = -1;
++                ckpt.n_tokens = m.ck.n_tokens;
++                ckpt.pos_min  = m.ck.pos_min;
++                ckpt.pos_max  = m.ck.pos_max;
++            }
++            if (llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id) + 1 != m.n_kv) {
++                throw server_park_error{"park_torn", 409, "'" + key + "' restored to another length than it was parked at"};
++            }
++            server_tokens restored(tokens, slot.mctx != nullptr);
++            if (!restored.validate(ctx)) {
++                throw server_park_error{"park_torn", 409, "'" + key + "' holds tokens this model does not have"};
++            }
++            slot.prompt.tokens = std::move(restored);
++            if (!m.ck.file.empty()) {
++                slot.prompt.checkpoints.push_back(std::move(ckpt));
++            }
++        } catch (...) {
++            ggml_rpc_park_rsp rsp;
++            try {
++                dev(GGML_RPC_PARK_READ_END, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++            } catch (...) {
++            }
++            slot.prompt_clear();
++            throw;
++        }
++
++        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
++        SRV_INF("device parking: restored '%s': %zu tokens, %.1f MiB from %zu file(s) in %.2f s\n",
++                key.c_str(), tokens.size(), n_read / 1048576.0, m.segments.size() + 2, t_ms / 1000.0);
++        return json {
++            {"id_slot", slot.id}, {"filename", key}, {"device", true},
++            {"n_restored", tokens.size()}, {"n_read", n_read}, {"n_segments", m.segments.size()},
++            {"checkpoint_n_tokens", m.ck.file.empty() ? json(nullptr) : json(m.ck.n_tokens)},
++            {"checkpoint_kind", m.ck.file.empty() ? json(nullptr) : json(m.ck.meta == "rs" ? "previous_save" : "slot_checkpoint")},
++            {"timings", {{"restore_ms", t_ms}}},
++        };
++    }
++
++    // ---- keys ----
++
++    json status() {
++        ggml_rpc_park_rsp rsp;
++        dev_ok(GGML_RPC_PARK_STAT, "", "", 0, 0, 0, nullptr, nullptr, rsp);
++        return json {
++            {"device", true}, {"worker", endpoint},
++            {"free_bytes", rsp.v[0] == UINT64_MAX ? json(nullptr) : json(rsp.v[0])},
++            {"parked_bytes", rsp.v[1]}, {"cap_bytes", rsp.v[2]}, {"n_keys", rsp.v[3]},
++        };
++    }
++
++    json list() {
++        json out = status();
++        json keys = json::array();
++        std::map<std::string, ggml_rpc_park_key_entry> there;
++        for (const auto & k : dev_keys()) {
++            there[std::string(k.key, strnlen(k.key, sizeof(k.key)))] = k;
++        }
++        std::map<std::string, bool> seen;
++        std::error_code ec;
++        uint64_t host_bytes = 0;
++        for (std::filesystem::directory_iterator it(std::filesystem::u8path(dir), ec), end; !ec && it != end; it.increment(ec)) {
++            const std::string key = it->path().filename().string();
++            if (!key_ok(key)) {
++                continue;
++            }
++            manifest m = load(key);
++            if (!m.found) {
++                continue;
++            }
++            seen[key] = true;
++            const auto dk = there.find(key);
++            const bool on_dev = dk != there.end();
++            if (!on_dev && !m.pruned && device_bytes(m) > 0) {
++                m.pruned = true;
++                store(key, m);
++            }
++            uint64_t here = 0;
++            for (std::filesystem::directory_iterator fit(it->path(), ec), fend; !ec && fit != fend; fit.increment(ec)) {
++                std::error_code e;
++                here += fit->file_size(e);
++            }
++            host_bytes += here;
++            keys.push_back({
++                {"key", key}, {"state", on_dev && !m.pruned ? "parked" : "pruned"}, {"n_tokens", m.n_tokens}, {"n_segments", m.segments.size()},
++                {"saves", m.saves}, {"saved_at", m.saved_at}, {"device_bytes", on_dev ? json(dk->second.bytes) : json(0)},
++                {"last_used", on_dev ? json(dk->second.mtime) : json(nullptr)}, {"host_bytes", here}, {"written_total", m.written_total},
++            });
++        }
++        // files on the worker that this machine knows nothing about (its bookkeeping was lost): only a delete helps
++        for (const auto & [key, k] : there) {
++            if (!seen.count(key)) {
++                keys.push_back({{"key", key}, {"state", "orphan"}, {"device_bytes", k.bytes}, {"last_used", k.mtime}});
++            }
++        }
++        out["keys"]       = keys;
++        out["host_bytes"] = host_bytes;
++        return out;
++    }
++
++    json remove(const std::string & key) {
++        ggml_rpc_park_rsp rsp;
++        dev_ok(GGML_RPC_PARK_DELETE, key, "", 0, 0, 0, nullptr, nullptr, rsp);
++        std::error_code ec;
++        const bool here = std::filesystem::remove_all(std::filesystem::u8path(key_dir(key)), ec) > 0;
++        return json {{"filename", key}, {"device", true}, {"deleted", here || rsp.v[1] != 0}, {"freed_bytes", rsp.v[0]}};
++    }
++
++    std::string dir;
++    std::string endpoint;
++    park_fn_t   park_fn = nullptr;
++    std::mutex  mutex;
++};
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 97d31fd..28f4411 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -188,6 +188,7 @@ struct server_task {
+         int id_slot;
+         std::string filename;
+         std::string filepath;
++        int park = 0; // PS5LM device parking: a server_park_action; filename is then the key
+     };
+     slot_action slot_action;
+ 
