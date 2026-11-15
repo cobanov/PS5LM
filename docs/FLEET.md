@@ -463,23 +463,36 @@ How it holds together:
 - One worker only: with several, a slot's state is spread over them, and
   parking is refused.
 
-What it writes to the console's SSD, for Qwen3.8-27B (18 MiB per 1,000 tokens
-of cells, 150 MiB of recurrent state):
+Measured on 2026-11-15 on one PS5 on 11.60 serving Qwen3.8-27B (GSQ-RCO
+IQ3_XXS, every layer on the console, one slot of 155,648 tokens, q4_0 cache)
+from a PC over gigabit Ethernet. Neurons of real source code, each firing 200
+new tokens and a 16-token reply; times are the server's own for the whole
+action:
 
-| Save | Bytes | At 75 MB/s |
-|---|---|---|
-| First, 20K tokens | 0.65 GiB | 9 s |
-| First, 50K | 1.17 GiB | 17 s |
-| First, 100K | 2.05 GiB | 29 s |
-| First, 153K | 2.98 GiB | 43 s |
-| Append of 2K tokens | 186 MiB | 2.6 s |
-| Append of 5K | 240 MiB | 3.4 s |
-| Append of 10K | 330 MiB | 4.6 s |
+| | 20K tokens | 100K | 153K |
+|---|---|---|---|
+| First save | 651 MiB, 10.4 s | 2,057 MiB, 30.6 s | |
+| Save after growing to this size | | 1,552 MiB for 79,784 new tokens, 22.1 s | 1,059 MiB for 51,704 new tokens, 15.0 s |
+| Save after a firing (216 new tokens) | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s |
+| Restore | 2.2 s | 3.6 s | 4.6 s |
+| The same return through the host prompt cache | 14 s | 46 s | 65 s |
 
-A first save includes the checkpoint (two 150 MiB blocks); an append with
-`"checkpoint": true` adds 150 MiB (2 s). These are sizes from the model's layout
-and the write speed of the weight cache; device parking has not run on a
-console yet.
+- A save writes 149.6 MiB (the recurrent state) plus 18.0 KiB per new token,
+  at 72 to 74 MB/s; with `"checkpoint": true` 303 MiB in 5.7 s. A first save
+  includes the checkpoint.
+- Four neurons at 100K took turns on the slot, twelve hand-overs: each reply
+  was the one the same neuron gave without leaving the slot, 201 tokens were
+  read for the 200 new ones, and a hand-over (restore, firing, save) took about
+  18 s. The host's llama-server stayed at 1.1 GiB.
+- A request that differed from the parked tokens 3 tokens before their end
+  read 414 tokens after a default save (217 with the neuron still in the slot,
+  and 217 after a save with `"checkpoint": true`), at 101K and at 153K alike.
+- The console's free memory did not move during saves and restores (never
+  under 71.7 MiB in 306 samples), and the keys were restored by a new server
+  process and a restarted worker with the same replies.
+- At 5 hand-overs an hour that is 18 GiB written to the console's SSD a day,
+  at 48 an hour 173 GiB, for firings this small; a firing that adds 3,000
+  tokens writes 202 MiB (24 and 228 GiB a day).
 
 `scripts/ps5lm-app.sh bench-park [GiB]` measures the write path first: that
 many GiB (4) in 8 MiB pieces through ftpsrv to the data folder and to

@@ -112,11 +112,17 @@ v0.1.x are the upstream payload releases by cobanov.
   in `/data/PS5LM/park`, instead of fetching it into its own memory, and loads
   it back from the console's storage. `POST /slots/N?action=save|restore` with
   the conversation's name; `park-list`, `park-delete`, `park-status`
-  ([FLEET.md](docs/FLEET.md#parked-state)). Not run on a console yet.
+  ([FLEET.md](docs/FLEET.md#parked-state)). On a console serving Qwen3.8-27B
+  a 153K-token conversation came back in 4.6 s (65 s through the host prompt
+  cache) and a hand-over's save took 2.2 s.
   - A save writes only what was added: the attention cells of the new tokens
     and one recurrent state. For Qwen3.8-27B that is 18 MiB per 1,000 new tokens
     plus 150 MiB, where the host prompt cache moved 2.8 GiB each way for a 153K
     history. The host keeps 28 bytes a token.
+  - The worker drops the least recently used key when the folder is full, by
+    its own record of saves and restores (a console's file times do not move
+    when a key is read), and files are read with `read()` (the console's libc
+    reads an unbuffered stream a byte per call).
   - `patches/fleet/0009`: park commands in the RPC worker, offered in its
     handshake, every byte through one 8 MiB buffer, files whole or absent, the
     folder kept to its size by dropping the key used longest ago.
