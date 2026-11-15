@@ -67,9 +67,7 @@ fi
 # The PS5 changes to llama.cpp (patches/), as scripts/build-llama.sh applies them,
 # then patches/fleet for the RPC worker (docs/FLEET.md), the same set the fleet
 # host build applies.
-for p in "$root"/patches/*.patch "$root"/patches/fleet/*.patch; do
-    git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
-done
+"$root/scripts/apply-patches.sh" "$llama" "$root"/patches/*.patch "$root"/patches/fleet/*.patch
 
 # ftpsrv (drakmor's 1.16-ng-stable), PS5LM's copy: a payload the app sends to
 # elfldr when no ftpsrv answers (connect_ftp_writer in ps5/app/ftp_writer.hpp).
