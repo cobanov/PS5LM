@@ -1635,8 +1635,11 @@ def handler_for(fleet, port, extra_hosts=(), token=''):
                                      'error': 'Changes need the token this control server was started with '
                                               '(ctl: --token or $PS5LM_FLEET_TOKEN)'})
                     return
-            length = int(self.headers.get('Content-Length') or 0)
-            if length > 4 * MIB:
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+            except ValueError:
+                length = -1
+            if not 0 <= length <= 4 * MIB:
                 self._send(413, {'error': 'Request too large'})
                 return
             try:

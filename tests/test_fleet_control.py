@@ -805,6 +805,26 @@ class PageTests(unittest.TestCase):
         self.assertEqual(self.request('POST', '/api/settings', {'api_port': 9000}, header=False)[0], 403)
         self.assertEqual(self.fleet.config['api_port'], 8081)
 
+    def test_a_bad_content_length_is_refused_without_waiting(self):
+        # Not a number, negative (rfile.read(-1) would wait for the connection to
+        # close) and over 4 MiB: each is answered 413 at once, and changes nothing.
+        body = json.dumps({'api_port': 9000}).encode()
+        for length in ('abc', '-1', '-9999999999', '1e3', '', str(4 * 1024 * 1024 + 1), '99999999999999999999'):
+            with self.subTest(content_length=length):
+                started = time.monotonic()
+                status, reply = self.raw_post(length, body)
+                if length == '':
+                    # No length is an empty body, as before: nothing to change.
+                    self.assertEqual(status, 200)
+                    continue
+                self.assertEqual((status, reply), (413, {'error': 'Request too large'}))
+                self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(self.fleet.config['api_port'], 8081)
+        status, reply = self.raw_post(len(body), body)                 # a right one still works
+        self.assertEqual((status, self.fleet.config['api_port']), (200, 9000))
+        status, state = self.request('GET', '/api/state')              # and the server is still there
+        self.assertEqual(status, 200)
+
     def test_a_keyless_api_on_the_network_and_a_foreign_launcher_are_refused(self):
         status, reply = self.request('POST', '/api/settings', {'api_lan': True})
         self.assertEqual(status, 400)
