@@ -757,6 +757,12 @@ class PageTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.fleet = control.Fleet(Path(tmp.name) / 'control.json', binary_dir=Path(tmp.name), watch=False)
+        # ctl reads a token file from the configuration folder: not this user's.
+        self.config_home = Path(tmp.name) / 'config'
+        self.config_home.mkdir()
+        environment = patch.dict(ctl.os.environ, {'XDG_CONFIG_HOME': str(self.config_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), control.handler_for(self.fleet, 0))
         self.port = self.server.server_address[1]
         self.server.RequestHandlerClass = control.handler_for(self.fleet, self.port, self.extra_hosts, self.token)
@@ -947,6 +953,39 @@ class TokenTests(PageTests):
         self.assertEqual((code, [d['id'] for d in self.fleet.config['devices']]), (0, ['ps5-a']))
         with patch.dict(ctl.os.environ, {'PS5LM_FLEET_TOKEN': self.token}):
             self.assertEqual(ctl.parser().parse_args(['status']).token, self.token)
+
+    def test_the_token_file(self):
+        add = ('device', 'add', 'ps5-a', '--kind', 'ps5', '--address', '192.168.50.21')
+        path = ctl.token_file()
+        self.assertEqual(path, self.config_home / 'ps5lm-fleet' / 'token')
+        self.assertEqual(ctl.read_token(), '')                              # no file: no token
+        path.parent.mkdir()
+        path.write_text(self.token + '\nanything after the first line\n', encoding='utf-8')
+        path.chmod(0o600)
+        # Neither --token nor the variable: ctl and the control server read the same file.
+        self.assertEqual(ctl.read_token(), self.token)
+        self.assertEqual(control.access_token(['pc.tailnet.ts.net:8090'], control.read_token()), (self.token, False))
+        self.assertEqual(self.ctl(*add, token='')[0], 0)
+        self.assertEqual([d['id'] for d in self.fleet.config['devices']], ['ps5-a'])
+        # --token comes before the file, and --token-file names another one.
+        other = self.config_home / 'other'
+        other.write_text('wrong-token-wrong-token\n', encoding='utf-8')
+        other.chmod(0o600)
+        self.assertEqual(self.ctl('device', 'rm', 'ps5-a', token='wrong-token-wrong-token')[0], 1)
+        self.assertEqual(self.ctl('--token-file', str(other), 'device', 'rm', 'ps5-a', token='')[0], 1)
+        self.assertEqual([d['id'] for d in self.fleet.config['devices']], ['ps5-a'])
+        # A file that is asked for and missing, or that other users can read, is an error.
+        code, answer = self.ctl('--token-file', str(self.config_home / 'none'), 'device', 'rm', 'ps5-a', token='')
+        self.assertEqual(code, 1)
+        self.assertIn('token file', answer['error'])
+        if ctl.os.name != 'nt':
+            path.chmod(0o644)
+            with self.assertRaises(PermissionError):
+                ctl.read_token()
+            code, answer = self.ctl('device', 'rm', 'ps5-a', token='')
+            self.assertEqual(code, 1)
+            self.assertIn('chmod 600', answer['error'])
+        self.assertEqual([d['id'] for d in self.fleet.config['devices']], ['ps5-a'])
 
     def test_the_token_is_given_or_made_with_allow_host(self):
         self.assertEqual(control.access_token([]), ('', False))             # loopback only: as before

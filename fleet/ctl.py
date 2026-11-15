@@ -1,6 +1,6 @@
 """Drive the fleet control server from a shell or an agent; every answer is JSON.
 
-    python3 -m fleet ctl [--url URL] [--token TOKEN] [--state] COMMAND ...
+    python3 -m fleet ctl [--url URL] [--token TOKEN | --token-file FILE] [--state] COMMAND ...
 
   status                       everything: devices, pools and replicas, API, jobs
   devices | pools | jobs       one part of it
@@ -41,7 +41,10 @@ the default for one GPU). --auto adds COUNT replicas of K free devices each.
 
 The control server is --url, else $PS5LM_FLEET_URL, else http://127.0.0.1:8090.
 One started with --allow-host or --token takes changes only with its token:
---token, else $PS5LM_FLEET_TOKEN.
+--token, else $PS5LM_FLEET_TOKEN, else the first line of --token-file, which is
+~/.config/ps5lm-fleet/token (under $XDG_CONFIG_HOME when set) unless given. The
+control server reads the same file, so a token kept there reaches both, however
+they are started. The file is refused when other users can read it (chmod 600).
 Exit status: 0 done, 1 refused or failed (the JSON's "error" says why), 2 usage.
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -68,6 +71,29 @@ class Failed(Exception):
 
 
 TOKEN = ''     # sent with every change, when the control server asks for one
+
+
+def token_file():
+    """Where a token is kept for the control server and ctl alike."""
+    return Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'ps5lm-fleet' / 'token'
+
+
+def read_token(path=None):
+    """The token in a file, its first line: `path`, else the usual file, where
+    none is '' (no token). OSError for a file that is asked for and missing, or
+    that other users can read."""
+    if path is None:
+        try:
+            path = token_file()
+        except RuntimeError:        # no home directory
+            return ''
+        if not path.is_file():
+            return ''
+    path = Path(path).expanduser()
+    with open(path, encoding='utf-8') as file:
+        if os.name != 'nt' and os.fstat(file.fileno()).st_mode & 0o077:
+            raise PermissionError(f'{path} holds the token and other users can read it: chmod 600 it')
+        return file.readline().strip()
 
 
 def call(url, path, body=None, timeout=120):
@@ -156,6 +182,9 @@ def parser():
     top.add_argument('--token', default=os.environ.get('PS5LM_FLEET_TOKEN', ''),
                      help='the token a control server started with --allow-host or --token asks for '
                           '(default $PS5LM_FLEET_TOKEN)')
+    top.add_argument('--token-file', metavar='FILE',
+                     help='a file with that token on its first line, read when neither gives one '
+                          '(default ~/.config/ps5lm-fleet/token, if it is there)')
     top.add_argument('--state', action='store_true', help='after a change, print the whole state too')
     sub = top.add_subparsers(dest='command', required=True)
     sub.add_parser('help')
@@ -308,12 +337,14 @@ def run(args):
 def main(argv=None):
     global TOKEN
     args = parser().parse_args(argv)
-    TOKEN = args.token
     try:
+        TOKEN = args.token or read_token(args.token_file)
         answer = run(args)
         code = 0 if answer.get('ok', True) is not False else 1
     except Failed as exc:
         answer, code = exc.answer, 1
+    except (OSError, UnicodeDecodeError) as exc:
+        answer, code = dict(ok=False, error=f'cannot read the token file: {exc}'), 1
     if not args.state and args.command not in ('status',):
         answer = {k: v for k, v in answer.items() if k != 'state'}
     print(json.dumps(answer, indent=2))

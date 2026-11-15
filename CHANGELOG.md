@@ -72,7 +72,10 @@ v0.1.x are the upstream payload releases by cobanov.
       site's `Origin`, so a page open in the browser cannot drive a keyless API.
     - Behind `--allow-host`, the page and `ctl` change things only with a token
       (`--token` or `$PS5LM_FLEET_TOKEN`; without one, a new token is printed
-      at each start). The page asks for it once; `ctl` takes `--token`.
+      at each start). The page asks for it once; `ctl` takes `--token`. Both
+      also read it from a file that only you can read
+      (`~/.config/ps5lm-fleet/token`, or `--token-file`), so scripts that call
+      `ctl` need no variable.
     - The launch payload comes from one folder (`build/app-ps5`, or
       `--launcher-dir`): `launcher` picks a `.elf` in it, and only an ELF is
       sent. A model given as a path is copied to a console only if it is a GGUF.

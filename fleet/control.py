@@ -28,8 +28,8 @@ RPC has no authentication, so devices belong on a network you trust. The page
 can write to consoles and start processes: it listens on loopback only, and
 refuses requests with a foreign Host header or without its own request header,
 so another web site cannot drive it from your browser. Put under another name
-with --allow-host, it takes changes only with a token (given at start, or made
-then and printed once). The API is shared on the network only with a key, and
+with --allow-host, it takes changes only with a token (given at start or kept
+in a file, or made then and printed once). The API is shared on the network only with a key, and
 the launch payload it sends to consoles comes from one folder (--launcher-dir).
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -57,6 +57,7 @@ import time
 import urllib.parse
 
 from . import controller, devices, router
+from .ctl import read_token
 from .models import ModelError, fetch_model, inspect_file
 from .planner import CACHE_TYPES, FleetError, MIB, endpoint, plan as make_plan
 
@@ -1561,8 +1562,9 @@ class Fleet:
 
 def access_token(allow_host, given=''):
     """The token changes need, and whether it was made here: the one given
-    (--token or $PS5LM_FLEET_TOKEN), else a new one when --allow-host puts the
-    page under another name, else none (loopback only, as before)."""
+    (--token, $PS5LM_FLEET_TOKEN or the token file), else a new one when
+    --allow-host puts the page under another name, else none (loopback only,
+    as before)."""
     if given:
         if not 16 <= len(given) <= 256 or any(c.isspace() for c in given):
             raise ControlError('the token is 16 to 256 characters without spaces')
@@ -1690,11 +1692,15 @@ def main(argv=None):
                         help='also answer requests for this Host header: the name a proxy that only your own devices '
                              'reach puts the page under, e.g. `tailscale serve --https=8090 http://127.0.0.1:8090` '
                              'and --allow-host pc.tailnet.ts.net:8090. Never a public proxy. Changes then need '
-                             'a token: --token, or one made at start and printed once.')
+                             'a token: --token or --token-file, or one made at start and printed once.')
     parser.add_argument('--token', default=os.environ.get('PS5LM_FLEET_TOKEN', ''), metavar='TOKEN',
                         help='require this token (16 to 256 characters) on every change, as the page and `ctl '
-                             '--token` send it (default $PS5LM_FLEET_TOKEN; with --allow-host and neither, a new '
-                             'one each start)')
+                             '--token` send it (default $PS5LM_FLEET_TOKEN; with --allow-host and neither, nor '
+                             'a token file, a new one each start)')
+    parser.add_argument('--token-file', metavar='FILE',
+                        help='a file with that token on its first line, readable by you alone and read when neither '
+                             'gives one; `ctl` reads the same file (default ~/.config/ps5lm-fleet/token, if it is '
+                             'there)')
     parser.add_argument('--launcher-dir', default=str(DEFAULT_LAUNCHER.parent), metavar='DIR',
                         help="the folder PS5LM's launch payload is sent to consoles from: launch-PPSA99575.elf "
                              'there, or the .elf in it that the launcher setting names (default: the app build, '
@@ -1705,10 +1711,10 @@ def main(argv=None):
             print(f'ps5lm-fleet control: --allow-host takes a host name with an optional :port, not {host!r}')
             return 2
     try:
-        token, made = access_token(args.allow_host, args.token)
+        token, made = access_token(args.allow_host, args.token or read_token(args.token_file))
         fleet = Fleet(args.config, binary_dir=Path(args.build).expanduser() / 'bin',
                       cache_dir=Path(args.cache_dir).expanduser(), launcher_dir=args.launcher_dir)
-    except (ControlError, json.JSONDecodeError, OSError) as exc:
+    except (ControlError, json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         print(f'ps5lm-fleet control: {exc}')
         return 2
     server = http.server.ThreadingHTTPServer(('127.0.0.1', args.port),
@@ -1723,7 +1729,8 @@ def main(argv=None):
           + ''.join(f', also as {host}' for host in args.allow_host), flush=True)
     if made:
         # Shown this once. The page asks for it at the first change; ctl takes it
-        # as --token or $PS5LM_FLEET_TOKEN. Give --token to keep one across starts.
+        # as --token or $PS5LM_FLEET_TOKEN. Give --token, or keep one in the token
+        # file, for the same one at every start.
         print(f'ps5lm-fleet control: changes need this token: {token}', flush=True)
     elif token:
         print('ps5lm-fleet control: changes need the token it was started with', flush=True)

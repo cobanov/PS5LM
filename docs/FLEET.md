@@ -523,7 +523,7 @@ JSON. It exits 1 with the refusal in `"error"`:
 
 ```sh
 ctl() { python3 -m fleet ctl "$@"; }          # --url or $PS5LM_FLEET_URL for another server,
-                                              # --token or $PS5LM_FLEET_TOKEN when it asks for one
+                                              # --token, $PS5LM_FLEET_TOKEN or the token file when it asks for one
 ctl search --wait                             # consoles on the LAN
 ctl device add ps5-a --kind ps5 --address 192.168.50.21
 ctl device add pc-gpu --kind gpu --device CUDA0
@@ -560,7 +560,12 @@ With `--allow-host`, changes need a token: every POST carries it as
 state does not need it.
 
 ```sh
-# A token of your own (16 to 256 characters), the same at every start:
+# A token of your own (16 to 256 characters) in the token file: the same at every
+# start, and `ctl` reads it there too, from any shell or script.
+mkdir -p ~/.config/ps5lm-fleet && (umask 077; openssl rand -hex 24 > ~/.config/ps5lm-fleet/token)
+python3 -m fleet control --allow-host pc.tailnet.ts.net:8090
+python3 -m fleet ctl pool start qwen27
+# Or given: --token or $PS5LM_FLEET_TOKEN, to the control server and to ctl.
 PS5LM_FLEET_TOKEN="$(cat ~/.ps5lm-fleet-token)" python3 -m fleet control --allow-host pc.tailnet.ts.net:8090
 # Or none: one is made at each start and printed once.
 python3 -m fleet control --allow-host pc.tailnet.ts.net:8090
@@ -569,8 +574,11 @@ PS5LM_FLEET_TOKEN=Zk3... python3 -m fleet ctl pool start qwen27    # or ctl --to
 ```
 
 The page asks for the token at the first change and keeps it in that browser.
-`--token` (or `$PS5LM_FLEET_TOKEN`) without `--allow-host` asks for it on
-loopback too. Without either, the page is as before: loopback only, no token.
+The token is `--token`, else `$PS5LM_FLEET_TOKEN`, else the first line of the
+token file: `~/.config/ps5lm-fleet/token` (under `$XDG_CONFIG_HOME` when set),
+or `--token-file FILE`. The file is refused when other users can read it
+(`chmod 600`). A token without `--allow-host` is asked for on loopback too.
+Without a token or `--allow-host`, the page is as before: loopback only, no token.
 A model given as a path is copied to a console only when the file is a GGUF.
 
 ## Tests / CI
