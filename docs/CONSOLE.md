@@ -162,6 +162,7 @@ from a drive instead of holding them in memory (Qwen3.8-Flash-Next on the roadma
 | `bench-read <model file>` | Sequential reads (8 MiB, up to 2 GiB), then three seconds each of random reads of 64 KiB, 256 KiB, 1 MiB and 4 MiB with one and four threads, through the cache and with `O_DIRECT`: MB/s, reads a second, median and p99 latency |
 | `bench-memory` | The direct pool and what the system keeps of a nominal 12 GiB, its largest free block, the flexible pool; with no model loaded, also the largest block that allocates and maps, given back at once |
 | `bench-write` | Write speed by method to the data folder and a USB drive |
+| `bench-park [GiB]` | The write path of parked state ([FLEET.md](FLEET.md#parked-state)), sustained: that many GiB (4) in 8 MiB pieces through ftpsrv to the data folder, `/mnt/usb0` and `/mnt/ext0`, the speed of every GiB, then read back in 8 MiB reads and checked; on the two drives also the title's own writes. Works beside a running worker |
 | `memory` | One `memory asked` line: pools, CPU heap and ggml's devices |
 
 Point `bench-read` at a model of several GiB on the drive in question (internal storage, the M.2
