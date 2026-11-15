@@ -107,6 +107,15 @@ v0.1.x are the upstream payload releases by cobanov.
   - The files are written through ftpsrv: a title's own writes slow to about
     1.2 MB/s after 2 GB.
 
+- **Large tensors go to a fleet worker in 8 MiB pieces** (`patches/fleet/0007`).
+  A worker took every tensor write, and built every answer to a read, in one
+  buffer of its size. A host that saved or restored a slot moved whole KV layers
+  that way, and every prompt batch sent an attention mask that grows with the
+  depth: a console serving Qwen3.8-27B with 60 MiB to spare died saving a
+  100K-token history. Split by the host, the same saves and restores ran to
+  153K tokens with the console's free memory unmoved. `GGML_RPC_CHUNK_MB` sets
+  the piece size (0 for off).
+
 ### Changed
 - **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
   (the system's default is 448 MiB), so the direct pool, where models go, is

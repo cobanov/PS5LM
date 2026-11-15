@@ -28,6 +28,7 @@ if [[ ${1:-} == --rpc ]]; then
     python3 tests/fleet_rpc_graph_free_test.py --binary "$out/bin/ggml-rpc-server"
     python3 tests/fleet_rpc_smoke.py --build "$out"
     python3 tests/fleet_rpc_cache_test.py --build "$out"
+    python3 tests/fleet_rpc_chunk_test.py --build "$out"
     python3 tests/server_system_messages_test.py --build "$out"
     python3 tests/server_checkpoints_test.py --build "$out"
     python3 tests/server_kv_rotation_test.py --build "$out"
