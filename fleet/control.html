@@ -182,11 +182,23 @@ details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 const $ = (id) => document.getElementById(id);
 let state = null, settingsLoaded = false, editing = null;
 
-async function post(path, body = {}) {
+// A control server reached under another name (--allow-host) takes changes only
+// with its token: asked for once, then kept in this browser.
+const token = {
+  get() { try { return localStorage.getItem("fleet-token") || ""; } catch (error) { return token.value || ""; } },
+  set(value) { token.value = value; try { localStorage.setItem("fleet-token", value); } catch (error) { /* kept for this page */ } },
+};
+
+async function post(path, body = {}, asked = false) {
   try {
-    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Fleet-Control": "1" },
-      body: JSON.stringify(body) });
+    const headers = { "Content-Type": "application/json", "X-Fleet-Control": "1" };
+    if (token.get()) headers.Authorization = "Bearer " + token.get();
+    const response = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
     const data = await response.json();
+    if (response.status === 401 && data.token && !asked) {
+      const given = prompt("This control server takes changes only with its token (printed when it started, or its --token):");
+      if (given && given.trim()) { token.set(given.trim()); return post(path, body, true); }
+    }
     if (data.state) render(data.state);
     if (!data.ok) toast(data.error || "Refused", true);
     else if (data.result) toast(data.result);

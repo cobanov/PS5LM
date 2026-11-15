@@ -7,6 +7,7 @@ import http.server
 import io
 import json
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import time
@@ -64,6 +65,8 @@ class ConfigTests(unittest.TestCase):
             dict(devices=[ps5(memory_mib=0)]),
             dict(devices=[ps5(tags=['has space'])]),
             dict(lan='8.8.8.0/24'), dict(lan='10.0.0.0/8'), dict(lan='nonsense'), dict(api_key='has space'),
+            dict(api_lan=True), dict(api_lan=True, api_key=''),     # on the network only with a key
+            dict(launcher='/etc/passwd'), dict(launcher='/tmp/launch-PPSA99575.elf'),   # not the launcher folder
             fleet(pool(sha256='abc')), fleet(pool(model='http://example.org/m.gguf')), fleet(pool(context=100)),
             fleet(pool(cache_type='q8_0', flash_attn=False)),       # a quantized V needs flash attention
             fleet(pool(cache_type='q3_k')),
@@ -95,6 +98,38 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(only['id'], 'Qwen3.8-27B-UD-Q4_K_XL')
         self.assertEqual(only['replicas'], [dict(devices=['ps5-a', 'pc-gpu'], via='rpc', split=[])])
         self.assertEqual((only['context'], only['running'], only['cache_type']), (32768, False, 'q8_0'))
+
+    def test_the_api_is_shared_on_the_network_only_with_a_key(self):
+        with self.assertRaisesRegex(control.ControlError, 'api_lan needs an api_key'):
+            control.validate_config(dict(api_lan=True))
+        config = control.validate_config(dict(api_lan=True, api_key='fleet-key'))
+        self.assertEqual((config['api_lan'], config['api_key']), (True, 'fleet-key'))
+        # A saved configuration that shares a keyless API is refused when it is loaded.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'control.json'
+            path.write_text(json.dumps(dict(api_lan=True, api_key='')))
+            with self.assertRaisesRegex(control.ControlError, 'control.json: api_lan needs an api_key'):
+                control.Fleet(path, binary_dir=Path(directory), watch=False)
+
+    def test_the_launcher_is_a_payload_in_the_launcher_folder(self):
+        self.assertEqual(control.launcher_file(''), control.DEFAULT_LAUNCHER)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory).resolve() / 'app-ps5'
+            folder.mkdir()
+            inside, outside = folder / 'launch-OTHER.elf', Path(directory).resolve() / 'secret.elf'
+            inside.write_bytes(b'\x7fELF')
+            outside.write_bytes(b'\x7fELF')
+            self.assertEqual(control.launcher_file('', folder), folder / 'launch-PPSA99575.elf')
+            self.assertEqual(control.launcher_file(str(inside), folder), inside)
+            self.assertEqual(control.launcher_file('launch-OTHER.elf', folder), inside)   # a name: in the folder
+            (folder / 'link.elf').symlink_to(outside)
+            for bad in (str(outside), str(folder / '..' / 'secret.elf'), '../secret.elf', str(folder / 'link.elf'),
+                        str(folder / 'notes.txt'), '/etc/passwd', str(folder), 7, None):
+                with self.subTest(launcher=bad), self.assertRaisesRegex(control.ControlError, 'launcher is'):
+                    control.launcher_file(bad, folder)
+            control.validate_config(dict(launcher=str(inside)), folder)
+            with self.assertRaises(control.ControlError):
+                control.validate_config(dict(launcher=str(inside)))          # the default folder is the app build's
 
     def test_saved_and_loaded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -279,7 +314,6 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(FakeFTP.log[-1], ('DELE', '/data/PS5LM/unload'))
 
     def test_launch_sends_the_payload_to_the_elf_loader(self):
-        import socket
         with tempfile.TemporaryDirectory() as folder:
             launcher = Path(folder) / 'launch-PPSA99575.elf'
             launcher.write_bytes(b'\x7fELF payload')
@@ -308,6 +342,19 @@ class ConsoleTests(unittest.TestCase):
             self.assertFalse(devices.launch_app('127.0.0.1', Path(folder) / 'missing.elf'))
         with patch.object(devices, 'port_probe', return_value='refused'):
             self.assertFalse(devices.launch_app('192.168.50.21', launcher))   # no loader on the console
+
+    def test_launch_sends_nothing_but_an_elf_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            key, huge = Path(folder) / 'id_rsa.elf', Path(folder) / 'huge.elf'
+            key.write_bytes(b'-----BEGIN OPENSSH PRIVATE KEY-----')
+            with huge.open('wb') as file:
+                file.write(b'\x7fELF')
+                file.truncate(devices.LAUNCHER_MAX + 1)
+            with patch.object(devices, 'port_probe', return_value='open'), \
+                    patch.object(devices.socket, 'create_connection') as connect:
+                self.assertFalse(devices.launch_app('192.168.50.21', key))
+                self.assertFalse(devices.launch_app('192.168.50.21', huge))
+            connect.assert_not_called()
 
     def test_the_weight_cache_is_listed_and_cleared(self):
         self.assertIsNone(devices.cache_use('192.168.50.21'))       # no folder: no cache yet
@@ -409,7 +456,7 @@ class FleetTests(unittest.TestCase):
 
     def test_a_console_already_serving_the_model_is_taken_over(self):
         model = self.dir / 'm.gguf'
-        model.write_bytes(b'gguf')
+        model.write_bytes(b'GGUF')
         self.fleet.apply(dict(devices=[ps5()], pools=[pool(model=str(model), running=True,
                                                            replicas=[dict(devices=['ps5-a'])])]))
         (replica,) = self.fleet.replicas
@@ -431,6 +478,35 @@ class FleetTests(unittest.TestCase):
                 patch.object(devices, 'serve_model', return_value=True) as serve:
             self.fleet._start_replica(replica, settings)
         serve.assert_called_once_with('192.168.50.21', args, worker=False)
+
+    def test_a_console_replica_copies_only_a_model_to_its_console(self):
+        # A pool's model is a path on this computer and a console's address is the
+        # caller's too: a file that is not a GGUF is never copied there.
+        secret = self.dir / 'id_rsa'
+        secret.write_bytes(b'-----BEGIN OPENSSH PRIVATE KEY-----')
+        self.fleet.apply(dict(devices=[ps5()], pools=[pool(model=str(secret), replicas=[dict(devices=['ps5-a'])])]))
+        (replica,) = self.fleet.replicas
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')), \
+                patch.object(devices, 'console_has', return_value=False), \
+                patch.object(devices, 'push_file') as push, patch.object(devices, 'serve_model') as serve, \
+                self.assertRaisesRegex(control.ControlError, 'id_rsa is not a GGUF model'):
+            self.fleet._start_replica(replica, self.fleet.pool('qwen'))
+        push.assert_not_called()
+        serve.assert_not_called()
+
+    def test_settings_refuse_a_keyless_api_on_the_network_and_a_foreign_launcher(self):
+        with self.assertRaisesRegex(control.ControlError, 'api_lan needs an api_key'):
+            self.fleet.set_settings(dict(api_lan=True))
+        self.assertFalse(self.fleet.config['api_lan'])
+        self.fleet.set_settings(dict(api_lan=True, api_key='fleet-key'))
+        self.assertTrue(self.fleet.config['api_lan'])
+        with self.assertRaisesRegex(control.ControlError, 'api_lan needs an api_key'):
+            self.fleet.set_settings(dict(api_key=''))               # the key cannot be taken away under it
+        self.assertEqual(self.fleet.config['api_key'], 'fleet-key')
+        for launcher in ('/etc/passwd', str(self.dir / 'launch.elf')):
+            with self.assertRaisesRegex(control.ControlError, 'launcher is a .elf file in'):
+                self.fleet.set_settings(dict(launcher=launcher))
+        self.assertEqual(self.fleet.launcher(), control.DEFAULT_LAUNCHER)
 
     def test_stopping_a_console_replica_unloads_its_model(self):
         self.fleet.apply(dict(devices=[ps5()], pools=[pool(running=True, replicas=[dict(devices=['ps5-a'])])]))
@@ -550,8 +626,12 @@ class FleetTests(unittest.TestCase):
     def test_a_split_reopens_a_crashed_console_as_a_worker(self):
         # PS5LM gone (ftpsrv still answers): fleet-worker.txt is written, then the
         # console is opened through its ELF loader and comes back as a worker.
+        # The launcher is another payload in the launcher folder (--launcher-dir).
+        launcher = self.dir.resolve() / 'launch-OTHER.elf'
+        self.fleet = control.Fleet(self.dir / 'control.json', binary_dir=self.dir / 'no-build', watch=False,
+                                   launcher_dir=self.dir)
         self.fleet.apply(dict(devices=[ps5(), gpu()], pools=[pool(replicas=[dict(devices=['ps5-a', 'pc-gpu'])])],
-                              launcher='/opt/launch.elf'))
+                              launcher=str(launcher)))
         (replica,) = self.fleet.replicas
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')), \
                 patch.object(devices, 'make_worker', return_value=False) as make, \
@@ -559,7 +639,7 @@ class FleetTests(unittest.TestCase):
                 patch.object(self.fleet, '_wait_port', return_value=True):
             self.fleet._ensure_worker(self.fleet.device('ps5-a'), replica)
         make.assert_called_once()
-        launch.assert_called_once_with('192.168.50.21', Path('/opt/launch.elf'))
+        launch.assert_called_once_with('192.168.50.21', launcher)
 
     def test_an_older_worker_is_restarted_by_leaving_worker_mode(self):
         self.fleet.add_device(ps5())
@@ -666,34 +746,51 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 
 
 class PageTests(unittest.TestCase):
+    extra_hosts, token = (), ''
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.fleet = control.Fleet(Path(tmp.name) / 'control.json', binary_dir=Path(tmp.name), watch=False)
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), control.handler_for(self.fleet, 0))
         self.port = self.server.server_address[1]
-        self.server.RequestHandlerClass = control.handler_for(self.fleet, self.port)
+        self.server.RequestHandlerClass = control.handler_for(self.fleet, self.port, self.extra_hosts, self.token)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.url = f'http://127.0.0.1:{self.port}'
 
-    def request(self, method, path, body=None, host=None, header=True):
+    def request(self, method, path, body=None, host=None, header=True, token=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
         headers = {'Host': host or f'127.0.0.1:{self.port}', 'Content-Type': 'application/json'}
         if header:
             headers['X-Fleet-Control'] = '1'
+        if token is not None:
+            headers['Authorization'] = f'Bearer {token}'
         connection.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
         response = connection.getresponse()
         data = response.read()
         connection.close()
         return response.status, (json.loads(data) if response.getheader('Content-Type', '').startswith('application/json') else data)
 
-    def ctl(self, *argv):
+    def ctl(self, *argv, token=''):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = ctl.main(['--url', self.url, *argv])
+            code = ctl.main(['--url', self.url, '--token', token, *argv])
         return code, json.loads(out.getvalue())
+
+    def raw_post(self, content_length, body=b''):
+        """A POST with the Content-Length header as given; the status line, or
+        a timeout (socket.timeout) if the server waits for a body."""
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as sock:
+            sock.sendall((f'POST /api/settings HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nX-Fleet-Control: 1\r\n'
+                          f'Authorization: Bearer {self.token}\r\nContent-Type: application/json\r\n'
+                          f'Content-Length: {content_length}\r\n\r\n').encode() + body)
+            reply = b''
+            while chunk := sock.recv(65536):
+                reply += chunk
+        head, _, payload = reply.partition(b'\r\n\r\n')
+        return int(head.split()[1]), json.loads(payload)
 
     def test_page_and_state(self):
         status, page = self.request('GET', '/')
@@ -707,6 +804,21 @@ class PageTests(unittest.TestCase):
         self.assertEqual(self.request('GET', '/api/state', host='evil.example')[0], 403)
         self.assertEqual(self.request('POST', '/api/settings', {'api_port': 9000}, header=False)[0], 403)
         self.assertEqual(self.fleet.config['api_port'], 8081)
+
+    def test_a_keyless_api_on_the_network_and_a_foreign_launcher_are_refused(self):
+        status, reply = self.request('POST', '/api/settings', {'api_lan': True})
+        self.assertEqual(status, 400)
+        self.assertIn('api_lan needs an api_key', reply['error'])
+        status, reply = self.request('POST', '/api/apply', {'config': {'api_lan': True}})
+        self.assertEqual(status, 400)
+        status, reply = self.request('POST', '/api/settings', {'api_lan': True, 'api_key': 'fleet-key'})
+        self.assertEqual((status, reply['state']['settings']['api_lan']), (200, True))
+        # Any file on this computer as the launcher, to a console address of the caller's.
+        for path in ('/api/settings', '/api/apply'):
+            status, reply = self.request('POST', path, {'launcher': '/etc/passwd'})
+            self.assertEqual(status, 400)
+            self.assertIn('launcher is a .elf file in', reply['error'])
+        self.assertEqual(self.fleet.config['launcher'], '')
 
     def test_changes_are_validated_and_saved(self):
         status, reply = self.request('POST', '/api/settings', {'api_port': 9000})
@@ -770,6 +882,60 @@ class PageTests(unittest.TestCase):
                                         '--server', 'http://10.0.0.9:8080'])
         self.assertEqual(ctl.replicas(args), [dict(devices=['a', 'b']), dict(devices=['c'], via='rpc'),
                                               dict(url='http://10.0.0.9:8080')])
+
+
+
+class TokenTests(PageTests):
+    """The page under another name (--allow-host): changes need the token."""
+    extra_hosts, token = ('pc.tailnet.ts.net:8090',), 'a-token-of-24-characters'
+
+    def request(self, method, path, body=None, host=None, header=True, token='a-token-of-24-characters'):
+        return super().request(method, path, body, host, header, token)
+
+    def ctl(self, *argv, token='a-token-of-24-characters'):
+        return super().ctl(*argv, token=token)
+
+    def test_a_change_needs_the_token(self):
+        for host in ('pc.tailnet.ts.net:8090', None):                # under the other name, and on loopback
+            for token in (None, '', 'wrong-token-wrong-token', 'a-token-of-24-characterS'):
+                with self.subTest(host=host, token=token):
+                    status, reply = self.request('POST', '/api/settings', {'api_port': 9000}, host=host, token=token)
+                    self.assertEqual((status, reply['ok'], reply['token']), (401, False, True))
+                    self.assertNotIn('state', reply)
+        self.assertEqual(self.fleet.config['api_port'], 8081)
+        status, reply = self.request('POST', '/api/devices/add', ps5(), host='pc.tailnet.ts.net:8090', token=None)
+        self.assertEqual((status, self.fleet.config['devices']), (401, []))
+        status, reply = self.request('POST', '/api/settings', {'api_port': 9000}, host='pc.tailnet.ts.net:8090')
+        self.assertEqual((status, self.fleet.config['api_port']), (200, 9000))
+        # The header that keeps other web sites out is still needed with it.
+        self.assertEqual(self.request('POST', '/api/settings', {'api_port': 9001}, header=False)[0], 403)
+        # The page itself and what it shows load without the token; it asks at the first change.
+        self.assertEqual(self.request('GET', '/', token=None)[0], 200)
+        self.assertEqual(self.request('GET', '/api/state', host='pc.tailnet.ts.net:8090', token=None)[0], 200)
+
+    def test_ctl_sends_the_token(self):
+        code, answer = self.ctl('device', 'add', 'ps5-a', '--kind', 'ps5', '--address', '192.168.50.21', token='')
+        self.assertEqual(code, 1)
+        self.assertIn('token', answer['error'])
+        self.assertEqual(self.fleet.config['devices'], [])
+        code, answer = self.ctl('device', 'add', 'ps5-a', '--kind', 'ps5', '--address', '192.168.50.21')
+        self.assertEqual((code, [d['id'] for d in self.fleet.config['devices']]), (0, ['ps5-a']))
+        with patch.dict(ctl.os.environ, {'PS5LM_FLEET_TOKEN': self.token}):
+            self.assertEqual(ctl.parser().parse_args(['status']).token, self.token)
+
+    def test_the_token_is_given_or_made_with_allow_host(self):
+        self.assertEqual(control.access_token([]), ('', False))             # loopback only: as before
+        token, made = control.access_token(['pc.tailnet.ts.net:8090'])
+        self.assertTrue(made)
+        self.assertGreaterEqual(len(token), 32)
+        self.assertNotEqual(token, control.access_token(['pc.tailnet.ts.net:8090'])[0])
+        self.assertEqual(control.access_token(['pc.tailnet.ts.net:8090'], self.token), (self.token, False))
+        self.assertEqual(control.access_token([], self.token), (self.token, False))
+        for bad in ('short', 'has a space in it, though long', 'x' * 257):
+            with self.assertRaises(control.ControlError):
+                control.access_token([], bad)
+        handler = control.handler_for(self.fleet, 8090, ['pc.tailnet.ts.net:8090'], token)
+        self.assertTrue(issubclass(handler, http.server.BaseHTTPRequestHandler))
 
 
 if __name__ == '__main__':

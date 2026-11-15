@@ -1,6 +1,6 @@
 """Drive the fleet control server from a shell or an agent; every answer is JSON.
 
-    python3 -m fleet ctl [--url URL] [--state] COMMAND ...
+    python3 -m fleet ctl [--url URL] [--token TOKEN] [--state] COMMAND ...
 
   status                       everything: devices, pools and replicas, API, jobs
   devices | pools | jobs       one part of it
@@ -40,6 +40,8 @@ model with PS5LM (:app, the default for one console), or one local GPU (:direct,
 the default for one GPU). --auto adds COUNT replicas of K free devices each.
 
 The control server is --url, else $PS5LM_FLEET_URL, else http://127.0.0.1:8090.
+One started with --allow-host or --token takes changes only with its token:
+--token, else $PS5LM_FLEET_TOKEN.
 Exit status: 0 done, 1 refused or failed (the JSON's "error" says why), 2 usage.
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -65,12 +67,17 @@ class Failed(Exception):
         self.answer = answer
 
 
+TOKEN = ''     # sent with every change, when the control server asks for one
+
+
 def call(url, path, body=None, timeout=120):
     """GET (body None) or POST a JSON body; the control server's JSON answer."""
     data = None if body is None else json.dumps(body).encode('utf-8')
     headers = {'Accept': 'application/json'}
     if data is not None:
         headers.update({'Content-Type': 'application/json', 'X-Fleet-Control': '1'})
+        if TOKEN:
+            headers['Authorization'] = f'Bearer {TOKEN}'
     request = urllib.request.Request(url.rstrip('/') + path, data=data, headers=headers,
                                      method='GET' if data is None else 'POST')
     try:
@@ -146,6 +153,9 @@ def parser():
                                   epilog='Commands: see python3 -m fleet ctl help', add_help=True)
     top.add_argument('--url', default=os.environ.get('PS5LM_FLEET_URL', 'http://127.0.0.1:8090'),
                      help='the control server (default $PS5LM_FLEET_URL or http://127.0.0.1:8090)')
+    top.add_argument('--token', default=os.environ.get('PS5LM_FLEET_TOKEN', ''),
+                     help='the token a control server started with --allow-host or --token asks for '
+                          '(default $PS5LM_FLEET_TOKEN)')
     top.add_argument('--state', action='store_true', help='after a change, print the whole state too')
     sub = top.add_subparsers(dest='command', required=True)
     sub.add_parser('help')
@@ -295,7 +305,9 @@ def run(args):
 
 
 def main(argv=None):
+    global TOKEN
     args = parser().parse_args(argv)
+    TOKEN = args.token
     try:
         answer = run(args)
         code = 0 if answer.get('ok', True) is not False else 1

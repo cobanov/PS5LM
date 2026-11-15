@@ -419,18 +419,23 @@ def quit_app(address):
 
 
 ELF_LOADER_PORT = 9021      # elfldr (ps5-payload-dev), or an OnionHEN plugin of it
+LAUNCHER_MAX = 16 * MIB     # the launch payload is about 100 KiB
 
 
 def launch_app(address, launcher, timeout=10):
     """Open PS5LM on a console from here: send the launcher payload (PS5LM's
     ps5/app/launch_app.c, built as build/app-ps5/launch-PPSA99575.elf) to the
     console's ELF loader, which runs it; it asks the system to start the title
-    for the foreground user. False when no loader listens or the file is missing."""
+    for the foreground user. False when no loader listens, or the file is missing
+    or is not an ELF of a payload's size: no other file is ever sent."""
     launcher = Path(launcher)
-    if not launcher.is_file() or port_probe(address, ELF_LOADER_PORT) != 'open':
+    if not launcher.is_file() or not 4 <= launcher.stat().st_size <= LAUNCHER_MAX:
+        return False
+    payload = launcher.read_bytes()
+    if payload[:4] != b'\x7fELF' or port_probe(address, ELF_LOADER_PORT) != 'open':
         return False
     with socket.create_connection((address, ELF_LOADER_PORT), timeout=timeout) as sock:
-        sock.sendall(launcher.read_bytes())
+        sock.sendall(payload)
     return True
 
 

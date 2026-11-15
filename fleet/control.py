@@ -27,7 +27,10 @@ and `ctl` edit it a piece at a time, and `ctl apply` replaces it whole.
 RPC has no authentication, so devices belong on a network you trust. The page
 can write to consoles and start processes: it listens on loopback only, and
 refuses requests with a foreign Host header or without its own request header,
-so another web site cannot drive it from your browser.
+so another web site cannot drive it from your browser. Put under another name
+with --allow-host, it takes changes only with a token (given at start, or made
+then and printed once). The API is shared on the network only with a key, and
+the launch payload it sends to consoles comes from one folder (--launcher-dir).
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 from __future__ import annotations
@@ -38,12 +41,15 @@ import concurrent.futures
 import contextlib
 import copy
 import ftplib
+import hmac
 import http.server
 import ipaddress
 import itertools
 import json
+import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import threading
@@ -60,7 +66,10 @@ BIN = controller.ROOT / 'build' / 'fleet-host' / 'bin'
 UNBOUNDED_MIB = 1 << 20    # a device without a budget: capped by the free memory it reports
 # launcher: PS5LM's launch payload (ps5/app/launch_app.c), which an ELF loader on the
 # console's port 9021 runs to open PS5LM, so a closed or crashed console comes back
-# without anyone there. Empty: the app build's own copy, when there is one.
+# without anyone there. Empty: launch-PPSA99575.elf in the launcher folder, which
+# is the app build's (build/app-ps5) unless --launcher-dir names another. A
+# launcher is a .elf file in that folder, never a path the page's API chooses
+# freely: the control server sends the file to a console's address.
 SETTINGS = dict(api_port=8081, api_lan=False, api_key='', host_memory_mib=8192, host_reserve_mib=2048, lan='',
                 launcher='')
 DEFAULT_LAUNCHER = controller.ROOT / 'build' / 'app-ps5' / 'launch-PPSA99575.elf'
@@ -120,6 +129,23 @@ def _secret(value, label):
     if not isinstance(value, str) or len(value) > 256 or any(c.isspace() for c in value):
         raise ControlError(f'{label} is up to 256 characters without spaces')
     return value
+
+
+def launcher_file(value, folder=None):
+    """The file a `launcher` setting names: a .elf inside `folder` (the launcher
+    folder), after symbolic links; a bare name is looked for there. Empty is
+    launch-PPSA99575.elf there."""
+    folder = Path(folder).expanduser() if folder else DEFAULT_LAUNCHER.parent
+    if not isinstance(value, str) or len(value) > 4096 or '\0' in value:
+        raise ControlError('launcher is the path of launch-PPSA99575.elf on this computer, or empty')
+    if not value:
+        return folder / DEFAULT_LAUNCHER.name
+    path = Path(value).expanduser()
+    path = (path if path.is_absolute() else folder / path).resolve()
+    if path.suffix != '.elf' or not path.is_relative_to(folder.resolve()):
+        raise ControlError(f'launcher is a .elf file in {folder}, or empty for {DEFAULT_LAUNCHER.name} there; '
+                           'start the control server with --launcher-dir for another folder')
+    return path
 
 
 def validate_device(raw):
@@ -252,7 +278,7 @@ def migrate(raw):
     return dict({k: raw[k] for k in SETTINGS if k in raw}, devices=found, pools=pools)
 
 
-def validate_config(raw):
+def validate_config(raw, launcher_dir=None):
     if not isinstance(raw, dict):
         raise ControlError('The configuration is an object')
     if 'workers' in raw and 'devices' not in raw:
@@ -267,8 +293,7 @@ def validate_config(raw):
         raise ControlError('api_lan needs an api_key: the API is shared on the network only with a key set')
     _int(config, 'host_memory_mib', 256, UNBOUNDED_MIB)
     _int(config, 'host_reserve_mib', 1, UNBOUNDED_MIB)
-    if not isinstance(config['launcher'], str) or len(config['launcher']) > 4096:
-        raise ControlError('launcher is the path of launch-PPSA99575.elf on this computer, or empty')
+    launcher_file(config['launcher'], launcher_dir)
     if not isinstance(config['lan'], str):
         raise ControlError('lan is a network such as 192.168.1.0/24, or empty')
     if config['lan']:
@@ -322,13 +347,16 @@ def validate_config(raw):
     return config
 
 
-def load_config(path):
+def load_config(path, launcher_dir=None):
     path = Path(path)
     if not path.exists():
         return validate_config({})
     if path.stat().st_size > 4 * MIB:
         raise ControlError(f'{path} is over 4 MiB')
-    return validate_config(json.loads(path.read_text()))
+    try:
+        return validate_config(json.loads(path.read_text()), launcher_dir)
+    except ControlError as exc:
+        raise ControlError(f'{path}: {exc}') from exc
 
 
 def save_config(path, config):
@@ -440,15 +468,17 @@ class Replica:
 class Fleet:
     """The configuration and everything running for it, behind one lock."""
 
-    def __init__(self, config_path, binary_dir=BIN, cache_dir=None, watch=True):
+    def __init__(self, config_path, binary_dir=BIN, cache_dir=None, watch=True, launcher_dir=None):
         self.config_path = Path(config_path)
         self.binary_dir = Path(binary_dir)
+        # The one folder launch payloads are sent to consoles from.
+        self.launcher_dir = Path(launcher_dir).expanduser() if launcher_dir else DEFAULT_LAUNCHER.parent
         # Downloaded models. Not inside the checkout by default: under WSL that
         # is often /mnt/c, a slow disk to mmap a model from.
         self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / '.cache' / 'ps5lm-fleet'
         self.lock = threading.RLock()
         self.wake = threading.Event()
-        self.config = load_config(self.config_path)
+        self.config = load_config(self.config_path, self.launcher_dir)
         self.replicas = []            # Replica, in configuration order
         self.status = {}              # device id -> live status
         self.probing = set()
@@ -519,7 +549,7 @@ class Fleet:
         """Replace the whole configuration. Replicas whose pool settings or devices
         changed start over; a running pool's new replicas start."""
         with self.lock:
-            config = validate_config(unmask(raw, self.config))
+            config = validate_config(unmask(raw, self.config), self.launcher_dir)
             save_config(self.config_path, config)
             self.config = config
             stale = self._sync()
@@ -598,8 +628,9 @@ class Fleet:
             self.note(f'{device_id}: {exc}; the settings apply at its next restart')
 
     def launcher(self):
+        # Checked again here: a link in the folder may have changed since.
         with self.lock:
-            return Path(self.config['launcher']) if self.config['launcher'] else DEFAULT_LAUNCHER
+            return launcher_file(self.config['launcher'], self.launcher_dir)
 
     def _open_console(self, device, replica=None):
         """Open PS5LM on a console where it is closed (or crashed): send the launch
@@ -896,6 +927,11 @@ class Fleet:
                 path = Path(model).expanduser().resolve()
                 if not path.is_file():
                     raise ControlError(f'No model file {path}')
+                # A console replica copies the file to its console, so it has to
+                # be a model: never another file of this computer's.
+                with path.open('rb') as file:
+                    if file.read(4) != b'GGUF':
+                        raise ControlError(f'{path.name} is not a GGUF model')
                 digest = None
                 if pool['sha256']:
                     stat = path.stat()
@@ -1521,9 +1557,22 @@ class Fleet:
 
 # --- the page and its API ----------------------------------------------------------
 
-def handler_for(fleet, port, extra_hosts=()):
+def access_token(allow_host, given=''):
+    """The token changes need, and whether it was made here: the one given
+    (--token or $PS5LM_FLEET_TOKEN), else a new one when --allow-host puts the
+    page under another name, else none (loopback only, as before)."""
+    if given:
+        if not 16 <= len(given) <= 256 or any(c.isspace() for c in given):
+            raise ControlError('the token is 16 to 256 characters without spaces')
+        return given, False
+    return (secrets.token_urlsafe(24), True) if allow_host else ('', False)
+
+
+def handler_for(fleet, port, extra_hosts=(), token=''):
     # extra_hosts: names a trusted proxy puts the page under, such as
     # `tailscale serve` (tailnet only), which keeps the visitor's Host header.
+    # token: when set, every POST carries it as Authorization: Bearer. The page
+    # asks for it once and keeps it in the browser; ctl takes --token.
     allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}', f'[::1]:{port}', *extra_hosts}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -1578,6 +1627,14 @@ def handler_for(fleet, port, extra_hosts=()):
             if self.headers.get('X-Fleet-Control') != '1':
                 self._send(403, {'error': 'Missing X-Fleet-Control header'})
                 return
+            if token:
+                given = self.headers.get('Authorization', '')
+                given = given[7:].strip() if given[:7].lower() == 'bearer ' else ''
+                if not hmac.compare_digest(given.encode('utf-8'), token.encode('utf-8')):
+                    self._send(401, {'ok': False, 'token': True,
+                                     'error': 'Changes need the token this control server was started with '
+                                              '(ctl: --token or $PS5LM_FLEET_TOKEN)'})
+                    return
             length = int(self.headers.get('Content-Length') or 0)
             if length > 4 * MIB:
                 self._send(413, {'error': 'Request too large'})
@@ -1627,19 +1684,30 @@ def main(argv=None):
     parser.add_argument('--allow-host', action='append', default=[], metavar='NAME[:PORT]',
                         help='also answer requests for this Host header: the name a proxy that only your own devices '
                              'reach puts the page under, e.g. `tailscale serve --https=8090 http://127.0.0.1:8090` '
-                             'and --allow-host pc.tailnet.ts.net:8090. Never a public proxy.')
+                             'and --allow-host pc.tailnet.ts.net:8090. Never a public proxy. Changes then need '
+                             'a token: --token, or one made at start and printed once.')
+    parser.add_argument('--token', default=os.environ.get('PS5LM_FLEET_TOKEN', ''), metavar='TOKEN',
+                        help='require this token (16 to 256 characters) on every change, as the page and `ctl '
+                             '--token` send it (default $PS5LM_FLEET_TOKEN; with --allow-host and neither, a new '
+                             'one each start)')
+    parser.add_argument('--launcher-dir', default=str(DEFAULT_LAUNCHER.parent), metavar='DIR',
+                        help="the folder PS5LM's launch payload is sent to consoles from: launch-PPSA99575.elf "
+                             'there, or the .elf in it that the launcher setting names (default: the app build, '
+                             'build/app-ps5)')
     args = parser.parse_args(argv)
     for host in args.allow_host:
         if not re.fullmatch(r'[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?', host):
             print(f'ps5lm-fleet control: --allow-host takes a host name with an optional :port, not {host!r}')
             return 2
     try:
+        token, made = access_token(args.allow_host, args.token)
         fleet = Fleet(args.config, binary_dir=Path(args.build).expanduser() / 'bin',
-                      cache_dir=Path(args.cache_dir).expanduser())
+                      cache_dir=Path(args.cache_dir).expanduser(), launcher_dir=args.launcher_dir)
     except (ControlError, json.JSONDecodeError, OSError) as exc:
         print(f'ps5lm-fleet control: {exc}')
         return 2
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', args.port), handler_for(fleet, args.port, args.allow_host))
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', args.port),
+                                             handler_for(fleet, args.port, args.allow_host, token))
     server.daemon_threads = True
     fleet.start_api()
 
@@ -1648,6 +1716,12 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, stop)
     print(f'ps5lm-fleet control: http://127.0.0.1:{args.port}/  (configuration in {args.config})'
           + ''.join(f', also as {host}' for host in args.allow_host), flush=True)
+    if made:
+        # Shown this once. The page asks for it at the first change; ctl takes it
+        # as --token or $PS5LM_FLEET_TOKEN. Give --token to keep one across starts.
+        print(f'ps5lm-fleet control: changes need this token: {token}', flush=True)
+    elif token:
+        print('ps5lm-fleet control: changes need the token it was started with', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
