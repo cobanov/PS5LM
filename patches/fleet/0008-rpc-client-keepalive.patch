@@ -1,0 +1,38 @@
+Subject: [PATCH] rpc: the client keeps an idle connection alive
+
+The connection from a host to a worker carries nothing while no request runs.
+A host behind a NAT (WSL2 behind Windows) loses it after about half an hour of
+that: the next request's first message fails, and llama-server aborts with
+"Remote RPC server crashed", although the worker is fine. The client socket
+now has TCP keepalive: a probe after GGML_RPC_KEEPALIVE_S seconds idle
+(default 60, 0 = off), then every 20 s, given up after 6 misses. Linux only.
+
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 8fad632..be2355b 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -792,6 +792,24 @@ socket_ptr socket_t::connect(const char * host, int port) {
+     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+         return nullptr;
+     }
++#if defined(__linux__)
++    // PS5LM context study 2026-11-15: keep an idle connection alive. A host behind a NAT (WSL2) loses its
++    // connection to the worker after about half an hour without traffic, and the next request aborts the server.
++    // Probe after GGML_RPC_KEEPALIVE_S seconds idle (default 60, 0 = off), then every 20 s, give up after 6 misses.
++    {
++        const char * e = getenv("GGML_RPC_KEEPALIVE_S");
++        const int idle = e ? atoi(e) : 60;
++        if (idle > 0) {
++            int on = 1, intvl = 20, cnt = 6;
++            if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on)) != 0 ||
++                setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, (char *) &idle, sizeof(idle)) != 0 ||
++                setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, (char *) &intvl, sizeof(intvl)) != 0 ||
++                setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, (char *) &cnt, sizeof(cnt)) != 0) {
++                LOG_ERROR("Failed to set TCP keepalive (continuing without it)\n");
++            }
++        }
++    }
++#endif
+     LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
+     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+ }
