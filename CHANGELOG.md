@@ -46,8 +46,9 @@ v0.1.x are the upstream payload releases by cobanov.
     `config` / `apply` for the whole configuration.
   - **A console's worker settings**, on the page or with `ctl device set`:
     `screen` (off by default, about 350 MiB more for the model) and `cache_gib`
-    (32 by default: the weights its worker keeps, so a reload reads them on the
-    console). They go into its env.txt; a change restarts an idle worker, and one
+    (0 by default, no cache, as in the app; set, the GiB of weights its worker
+    keeps, so a reload reads them on the console: 32 holds a 27B model's share).
+    They go into its env.txt; a change restarts an idle worker, and one
     in use takes it at its next restart. The page shows what each cache holds.
     New actions: **restart** (a worker as a worker, with its settings) and
     **clear-cache**.
@@ -63,6 +64,20 @@ v0.1.x are the upstream payload releases by cobanov.
     the console's port 9021 and PS5LM's launch payload.
   - A version 1 `control.json` (one list of workers) becomes devices and a stopped
     pool.
+  - **Who can use it:**
+    - The API is shared on the network (`api_lan`) only with an `api_key`; a
+      configuration without one is refused, when loaded and when changed.
+    - The API sends CORS headers only with a key set. Without one it sends
+      none, drops a replica's own, and refuses requests that carry another
+      site's `Origin`, so a page open in the browser cannot drive a keyless API.
+    - Behind `--allow-host`, the page and `ctl` change things only with a token
+      (`--token` or `$PS5LM_FLEET_TOKEN`; without one, a new token is printed
+      at each start). The page asks for it once; `ctl` takes `--token`.
+    - The launch payload comes from one folder (`build/app-ps5`, or
+      `--launcher-dir`): `launcher` picks a `.elf` in it, and only an ELF is
+      sent. A model given as a path is copied to a console only if it is a GGUF.
+    - A POST with a `Content-Length` that is not a number, negative or over
+      4 MiB is answered 413; a negative one used to wait on the connection.
 - **Long contexts in a split**:
   - The planner and `fleet serve` take a quantized cache with flash attention
     (`--cache-type q8_0 --flash-attn on`) and parallel slots, sized as llama.cpp

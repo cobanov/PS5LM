@@ -386,7 +386,7 @@ The control server runs a fleet of any size from one JSON document,
   | Setting | Default | In env.txt |
   |---|---|---|
   | `screen` | `false`: about 350 MiB more for the model, and the TV shows the system's splash | `PS5LM_WORKER_SCREEN=on` or `off` |
-  | `cache_gib` | `32`: up to 32 GiB of the weights hosts send are kept on the console, so loading them again reads them there instead of sending them; `0` for none | `PS5LM_RPC_CACHE_GB=32` |
+  | `cache_gib` | `0`: no weight cache, as in the app. Set, up to that many GiB of the weights hosts send are kept on the console, so loading them again reads them there instead of sending them; `32` holds a 27B model's share | `PS5LM_RPC_CACHE_GB=0` |
 
   They are written whenever the control server makes the console a worker. A
   change restarts the console's worker when nothing uses it; a worker in use
@@ -416,8 +416,19 @@ The control server runs a fleet of any size from one JSON document,
   of them.
 - **Settings:**
   - `api_port` (8081) and `api_lan`: the API listens on 127.0.0.1 unless `api_lan` is set.
+    `api_lan` needs an `api_key`: a configuration that shares the API on the
+    network without one is refused, when it is loaded and when it is changed.
   - `api_key`: once set, every request needs it as `Authorization: Bearer` or `x-api-key`.
   - The controller's own memory, and `lan`, the network to search.
+  - `launcher`: another launch payload for **launch** (below), a `.elf` in the
+    launcher folder.
+
+  Web pages on other sites can use the API only with a key. With one set, the
+  API answers any origin (CORS), and each request has to carry the key. Without
+  one it sends no CORS headers (a replica's own are dropped too), and refuses a
+  request that carries another site's `Origin`, so a page open in your browser
+  cannot drive a keyless API on 127.0.0.1. llama-server's chat page, opened
+  through the API on loopback, works either way.
 
 Raising throughput means more replicas. Fitting a bigger model or a longer
 context means more devices per replica. Both work at once: 100 consoles can be
@@ -481,9 +492,13 @@ PS5LM's request files, so no one has to be at the console:
 - **clear-cache** deletes the weights the worker keeps
   (`/data/PS5LM/rpc-cache`).
 - **launch** opens a closed (or crashed) PS5LM: it sends PS5LM's launch payload
-  (`ps5/app/launch_app.c`, built as `build/app-ps5/launch-PPSA99575.elf`; the
-  `launcher` setting points at another copy) to an ELF loader on the console's
-  port 9021, which runs it. The title opens as a worker when `fleet-worker.txt`
+  (`ps5/app/launch_app.c`, built as `build/app-ps5/launch-PPSA99575.elf`) to an
+  ELF loader on the console's port 9021, which runs it. The payload comes from
+  one folder, the launcher folder: `build/app-ps5`, or the one
+  `--launcher-dir DIR` names when the app is built elsewhere. The `launcher`
+  setting can pick another `.elf` in that folder and nothing outside it, and
+  only a file that starts as an ELF is sent, so the page's API cannot send
+  another file of this computer's to an address. The title opens as a worker when `fleet-worker.txt`
   is there, as the app otherwise. A split, `worker` and `restart` do the same
   when they find PS5LM closed, so a console whose title crashed comes back by
   itself on the replica's next retry. Without a loader on 9021 they say so, as
@@ -507,7 +522,8 @@ From a shell or an agent, `python3 -m fleet ctl` does all of it and answers in
 JSON. It exits 1 with the refusal in `"error"`:
 
 ```sh
-ctl() { python3 -m fleet ctl "$@"; }          # --url or $PS5LM_FLEET_URL for another server
+ctl() { python3 -m fleet ctl "$@"; }          # --url or $PS5LM_FLEET_URL for another server,
+                                              # --token or $PS5LM_FLEET_TOKEN when it asks for one
 ctl search --wait                             # consoles on the LAN
 ctl device add ps5-a --kind ps5 --address 192.168.50.21
 ctl device add pc-gpu --kind gpu --device CUDA0
@@ -517,7 +533,7 @@ ctl pool plan qwen27 --wait                   # blocks and memory per device, wi
 ctl pool start qwen27 --wait 900              # exits 0 when every replica is ready
 ctl pool set qwen27 context=81920 cache_type=q8_0
 ctl device leave ps5-a --wait               # after `ctl pool stop qwen27`
-ctl device set ps5-a screen=true cache_gib=64 # restarts its worker if nothing uses it
+ctl device set ps5-a screen=true cache_gib=32 # restarts its worker if nothing uses it
 ctl config > fleet.json; ctl apply fleet.json # the whole configuration; keys stay "set"
 ```
 
@@ -538,6 +554,24 @@ browser). Under WSL, Windows reaches it at http://localhost:8090. Behind a proxy
 that only your own devices reach, such as `tailscale serve`, add
 `--allow-host NAME:PORT`. The workers' RPC is unauthenticated whatever the page
 does: keep them on a network you trust.
+
+With `--allow-host`, changes need a token: every POST carries it as
+`Authorization: Bearer`, under the other name and on loopback alike. Reading the
+state does not need it.
+
+```sh
+# A token of your own (16 to 256 characters), the same at every start:
+PS5LM_FLEET_TOKEN="$(cat ~/.ps5lm-fleet-token)" python3 -m fleet control --allow-host pc.tailnet.ts.net:8090
+# Or none: one is made at each start and printed once.
+python3 -m fleet control --allow-host pc.tailnet.ts.net:8090
+#   ps5lm-fleet control: changes need this token: Zk3...
+PS5LM_FLEET_TOKEN=Zk3... python3 -m fleet ctl pool start qwen27    # or ctl --token
+```
+
+The page asks for the token at the first change and keeps it in that browser.
+`--token` (or `$PS5LM_FLEET_TOKEN`) without `--allow-host` asks for it on
+loopback too. Without either, the page is as before: loopback only, no token.
+A model given as a path is copied to a console only when the file is a GGUF.
 
 ## Tests / CI
 
