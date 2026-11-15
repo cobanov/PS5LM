@@ -129,6 +129,47 @@ inline RpcCache rpc_cache_config(const char * gib, const std::string & dir) {
     return cache;
 }
 
+// Parked state (patches/fleet/0009): a host that serves many conversations on
+// one slot keeps the state of those not in the slot here, in files under `dir`,
+// instead of in its own memory, and loads it back from the console's storage.
+// The RPC server keeps the folder to `gib` itself, dropping the key used longest
+// ago, as it knows which one is being read or written. On unless env.txt sets
+// PS5LM_PARK_GB=0: a worker that offers it costs nothing until a host parks.
+struct RpcPark {
+    std::string dir;       // empty: no parking
+    unsigned    gib = 0;
+    std::string error;     // a value that was refused (parking is then off)
+};
+
+// 128 GiB: forty conversations at a full 155K window of Qwen3.8-27B (3.1 GiB
+// each), or a hundred at about 60K; a sixth of the console's own drive.
+constexpr unsigned kRpcParkDefaultGib = 128;
+
+// PS5LM_PARK_GB's value (null when it is not set: the default size): 0 is off,
+// 1..4096 whole GiB in `dir`.
+inline RpcPark rpc_park_config(const char * gib, const std::string & dir) {
+    RpcPark park;
+    unsigned value = kRpcParkDefaultGib;
+    if (gib) {
+        const std::string text(gib);
+        bool ok = !text.empty() && text.size() <= 4 && (text.size() == 1 || text[0] != '0');
+        value = 0;
+        for (char c : text) {
+            ok = ok && c >= '0' && c <= '9';
+            value = ok ? value * 10 + static_cast<unsigned>(c - '0') : 0;
+        }
+        if (!ok || value > kRpcCacheMaxGib) {
+            park.error = "PS5LM_PARK_GB is whole GiB from 0 to 4096, not \"" + text + "\"; no parking";
+            return park;
+        }
+    }
+    if (value > 0) {
+        park.dir = dir;
+        park.gib = value;
+    }
+    return park;
+}
+
 // What a cache holds, and what prune_rpc_cache dropped to keep it to its limit.
 struct RpcCacheUse {
     uint64_t files = 0, bytes = 0;
@@ -144,6 +185,6 @@ RpcCacheUse prune_rpc_cache(const RpcCache & cache, bool at_start);
 
 // Blocks in upstream RPC until it fails; returns the reason, never silently
 // falls back to CPU. The title must be closed/restarted to stop this worker.
-std::string run_fleet_worker(const FleetWorkerConfig & config, const RpcCache & cache = {});
+std::string run_fleet_worker(const FleetWorkerConfig & config, const RpcCache & cache = {}, const RpcPark & park = {});
 
 }  // namespace ps5lm
