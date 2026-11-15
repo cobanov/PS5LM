@@ -27,6 +27,16 @@ keeps the old file behaviour when --slot-save-path is set too.
   park_incompatible (409), park_no_space (507), park_unsupported (501),
   park_empty and park_bad_request (400), park_io (500). A key that was never
   parked is a 404.
+- A save or a restore waits for its slot like a request sent to it, in the
+  order they came (the task carries the slot's id), and lets what waited behind
+  it go on when it is done. The server does one thing on a slot at a time, so
+  no park action runs beside a request or beside another one.
+- The tokens and cell positions of a key are appended to by a save that adds
+  and written to a new pair of files by one that rewrites; the old pair, like
+  the worker's old files, goes only after the manifest is replaced. A server
+  that dies in any save leaves the key as its last finished save left it.
+  LLAMA_PARK_DIE_AT=manifest ends the server just before the manifest is
+  replaced, for the test of that.
 - One RPC worker only, no draft model, no media in the slot.
 
 diff --git a/common/arg.cpp b/common/arg.cpp
@@ -67,7 +77,7 @@ index 20a6466..2bc5f4e 100644
  
      float slot_prompt_similarity = 0.1f;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 6dba147..7659105 100644
+index 6dba147..3892ed8 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1009,6 +1009,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
@@ -109,7 +119,7 @@ index 6dba147..7659105 100644
                      const int id_slot = task.slot_action.id_slot;
                      server_slot * slot = get_slot_by_id(id_slot);
                      if (slot == nullptr) {
-@@ -3221,6 +3239,15 @@ private:
+@@ -3221,6 +3239,17 @@ private:
                          break;
                      }
  
@@ -119,13 +129,15 @@ index 6dba147..7659105 100644
 +                        res->id      = task.id;
 +                        res->id_slot = id_slot;
 +                        queue_results.send(std::move(res));
++                        // the slot did not run, so nothing releases it: what waited behind this goes on now
++                        queue_tasks.pop_deferred_task(id_slot);
 +                        break;
 +                    }
 +
                      const int64_t t_start = ggml_time_us();
  
                      std::string filename = task.slot_action.filename;
-@@ -5985,7 +6012,7 @@ void server_routes::init_routes() {
+@@ -5985,7 +6014,7 @@ void server_routes::init_routes() {
  
      this->post_slots = [this](const server_http_req & req) {
          auto res = create_response();
@@ -134,7 +146,7 @@ index 6dba147..7659105 100644
              res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
              return res;
          }
-@@ -6002,6 +6029,52 @@ void server_routes::init_routes() {
+@@ -6002,6 +6031,54 @@ void server_routes::init_routes() {
  
          std::string action = req.get_param("action");
  
@@ -155,6 +167,8 @@ index 6dba147..7659105 100644
 +            if (park_only || json_value(body, "device", true)) {
 +                server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
 +                task.id = res->rd.get_new_id();
++                // a save or a restore waits for its slot like a request sent to it, and in the order they came
++                task.id_slot = park_only ? -1 : id_slot;
 +                task.slot_action.id_slot  = id_slot;
 +                task.slot_action.filename = json_value(body, "filename", std::string());
 +                // a save with "checkpoint": true also parks the slot's own checkpoint (server-park.h)
@@ -189,10 +203,10 @@ index 6dba147..7659105 100644
          }
 diff --git a/tools/server/server-park.h b/tools/server/server-park.h
 new file mode 100644
-index 0000000..84dc9a2
+index 0000000..b2cfc15
 --- /dev/null
 +++ b/tools/server/server-park.h
-@@ -0,0 +1,1040 @@
+@@ -0,0 +1,1074 @@
 +// PS5LM device parking: a slot's state is kept on the RPC worker's own storage
 +// instead of in a file or in the prompt cache on this machine.
 +//
@@ -201,10 +215,15 @@ index 0000000..84dc9a2
 +// (ggml-rpc/park.h), and action=park-list, park-delete and park-status look
 +// after the keys. DIR holds only the bookkeeping, a folder per key:
 +//
-+//   manifest.json  which files on the worker make up the state, their sizes and
-+//                  checksums, and how many tokens they cover; replaced whole
-+//   tokens.bin     the tokens of the parked state (4 bytes each)
-+//   meta.bin       the positions of the parked attention cells (24 bytes each)
++//   manifest.json      which files on the worker make up the state, their sizes and
++//                      checksums, and how many tokens they cover; replaced whole
++//   tokens.NNNNNN.bin  the tokens of the parked state (4 bytes each)
++//   meta.NNNNNN.bin    the positions of the parked attention cells (24 bytes each)
++//
++// A save that only adds appends to the two .bin files, past what the manifest in
++// place covers. A save that rewrites starts two new ones and removes the old
++// pair after the new manifest is in place: whatever a save is doing when the
++// server or the machine dies, the manifest on disk names files that are whole.
 +//
 +// On the worker a key is a folder of files, each written once:
 +//
@@ -343,7 +362,7 @@ index 0000000..84dc9a2
 +        std::string file;
 +        uint64_t    bytes    = 0;
 +        uint64_t    hash     = 0;
-+        uint64_t    meta_off  = 0;  // in meta.bin
++        uint64_t    meta_off  = 0;  // in the meta file
 +        uint64_t    meta_size = 0;
 +    };
 +
@@ -371,6 +390,8 @@ index 0000000..84dc9a2
 +        uint64_t    written_total = 0;
 +        int64_t     saved_at      = 0;
 +        bool        pruned        = false;
++        std::string tokens_file;    // in the key's folder here
++        std::string meta_file;
 +    };
 +
 +    // ---- the worker ----
@@ -629,6 +650,8 @@ index 0000000..84dc9a2
 +            m.written_total = j.at("written_total").get<uint64_t>();
 +            m.saved_at      = j.at("saved_at").get<int64_t>();
 +            m.pruned        = json_value(j, "pruned", false);
++            m.tokens_file   = j.at("tokens_file").get<std::string>();
++            m.meta_file     = j.at("meta_file").get<std::string>();
 +            for (const auto & s : j.at("segments")) {
 +                segment seg;
 +                seg.seq       = s.at("seq").get<int>();
@@ -681,6 +704,7 @@ index 0000000..84dc9a2
 +            {"version", 1}, {"key", key}, {"fingerprint", m.fingerprint}, {"n_tokens", m.n_tokens}, {"tokens_hash", hex64(m.tokens_hash)},
 +            {"n_kv", m.n_kv}, {"next_seq", m.next_seq}, {"segments", segs}, {"rs", write_blob(m.rs)}, {"ck", write_blob(m.ck)},
 +            {"saves", m.saves}, {"written_total", m.written_total}, {"saved_at", m.saved_at}, {"pruned", m.pruned},
++            {"tokens_file", m.tokens_file}, {"meta_file", m.meta_file},
 +        };
 +        write_whole(key_dir(key) + "manifest.json", j.dump(1) + "\n");
 +    }
@@ -702,7 +726,7 @@ index 0000000..84dc9a2
 +    // the parked tokens, or false when the bookkeeping does not hold what the manifest says
 +    bool load_tokens(const std::string & key, const manifest & m, llama_tokens & tokens) const {
 +        tokens.resize(m.n_tokens);
-+        if (m.n_tokens > 0 && !read_exact(key_dir(key) + "tokens.bin", 0, tokens.data(), tokens.size() * sizeof(llama_token))) {
++        if (m.n_tokens > 0 && !read_exact(key_dir(key) + m.tokens_file, 0, tokens.data(), tokens.size() * sizeof(llama_token))) {
 +            return false;
 +        }
 +        return fnv(tokens.data(), tokens.size() * sizeof(llama_token)) == m.tokens_hash;
@@ -798,14 +822,13 @@ index 0000000..84dc9a2
 +            reason = "damaged";
 +        }
 +        if (!reason.empty()) {
++            // nothing of the old state is kept. Its files stay until the new manifest is in place (they are
++            // removed with whatever else it does not name), and the new ones get numbers of their own.
 +            mode = "new";
++            const int next_seq = m.found ? m.next_seq : 1;
 +            m = manifest();
++            m.next_seq = next_seq;
 +            parked.clear();
-+            if (!files.empty()) {
-+                ggml_rpc_park_rsp rsp;
-+                dev_ok(GGML_RPC_PARK_DELETE, key, "", 0, 0, 0, nullptr, nullptr, rsp);
-+                files.clear();
-+            }
 +        }
 +        const int64_t n_tokens_before = m.n_tokens;
 +
@@ -960,15 +983,27 @@ index 0000000..84dc9a2
 +        const blob old_rs = m.rs;
 +        const blob old_ck = m.ck;
 +        const uint64_t meta_end = m.segments.empty() ? 0 : m.segments.back().meta_off + m.segments.back().meta_size;
++        if (mode == "append") {
++            // past what the manifest in place covers: its part of the two files is not touched
++            write_at(kdir + m.meta_file, meta_end, kv_meta.data(), kv_meta.size());
++            write_at(kdir + m.tokens_file, n_same * sizeof(llama_token), tokens.data() + n_same, (tokens.size() - n_same) * sizeof(llama_token));
++        } else {
++            // a new pair of files: the old pair still belongs to the manifest in place
++            std::string kept(meta_end, '\0');
++            if (meta_end > 0 && !read_exact(kdir + m.meta_file, 0, kept.data(), kept.size())) {
++                throw server_park_error{"park_io", 500, "the bookkeeping of '" + key + "' cannot be read"};
++            }
++            m.meta_file   = seq_name(seq, "bin").insert(0, "meta.");
++            m.tokens_file = seq_name(seq, "bin").insert(0, "tokens.");
++            kept += kv_meta;
++            write_at(kdir + m.meta_file, 0, kept.data(), kept.size());
++            write_at(kdir + m.tokens_file, 0, tokens.data(), tokens.size() * sizeof(llama_token));
++        }
 +        if (kv_bytes > 0) {
 +            seg.meta_off  = meta_end;
 +            seg.meta_size = kv_meta.size();
-+            write_at(kdir + "meta.bin", meta_end, kv_meta.data(), kv_meta.size());
 +            m.segments.push_back(seg);
-+        } else {
-+            write_at(kdir + "meta.bin", meta_end, nullptr, 0);
 +        }
-+        write_at(kdir + "tokens.bin", n_same * sizeof(llama_token), tokens.data() + n_same, (tokens.size() - n_same) * sizeof(llama_token));
 +        m.found         = true;
 +        m.fingerprint   = fingerprint(slot);
 +        m.n_tokens      = tokens.size();
@@ -981,7 +1016,20 @@ index 0000000..84dc9a2
 +        m.written_total += kv_bytes + rs.bytes + ck_bytes;
 +        m.saved_at      = (int64_t) time(nullptr);
 +        m.pruned        = false;
++        // for the test of a server that dies with everything written but the manifest
++        if (const char * die = getenv("LLAMA_PARK_DIE_AT"); die != nullptr && strcmp(die, "manifest") == 0 && mode != "new") {
++            SRV_ERR("%s", "device parking: LLAMA_PARK_DIE_AT=manifest, stopping before the manifest is replaced\n");
++            std::_Exit(3);
++        }
 +        store(key, m);
++        // the files here that the manifest no longer names (the pair a rewrite replaced)
++        for (std::filesystem::directory_iterator it(std::filesystem::u8path(kdir), ec), end; !ec && it != end; it.increment(ec)) {
++            const std::string name = it->path().filename().string();
++            if (name != "manifest.json" && name != m.tokens_file && name != m.meta_file) {
++                std::error_code e;
++                std::filesystem::remove(it->path(), e);
++            }
++        }
 +
 +        // 5. what the new manifest no longer names
 +        const auto drop = [&](const std::string & file) {
@@ -1069,7 +1117,7 @@ index 0000000..84dc9a2
 +        }
 +        const uint64_t meta_end = m.segments.empty() ? 0 : m.segments.back().meta_off + m.segments.back().meta_size;
 +        std::string meta(meta_end, '\0');
-+        if (meta_end > 0 && !read_exact(key_dir(key) + "meta.bin", 0, meta.data(), meta.size())) {
++        if (meta_end > 0 && !read_exact(key_dir(key) + m.meta_file, 0, meta.data(), meta.size())) {
 +            throw server_park_error{"park_torn", 409, "'" + key + "' is incomplete: its cell positions are missing"};
 +        }
 +

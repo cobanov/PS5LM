@@ -19,6 +19,11 @@ Checked here:
             from the change, never resumed as it was
   prune     a small cap drops the least recently used key, and the server says so
   mixed     a worker without parking, and with --old-build an older host or worker
+  busy      a save or a restore sent while the slot generates, or with a request
+            queued behind it, waits its turn in the order it came; two saves of
+            one key, and a save racing a restore of it, leave the key whole
+  crash     the server dies with a save written but its manifest not yet
+            replaced, in an append and in a rewrite: the state before loads
   memory    the worker's memory does not grow with the size of what it parks
 
 By default the model is the untrained llama fixture (attention only). With
@@ -39,6 +44,7 @@ import shutil
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -84,7 +90,7 @@ class Rig:
 
     # -- processes --
 
-    def start(self, park=True, cap_gb=None, worker_env=None, worker_bin=None, server_bin=None, server_park=True):
+    def start(self, park=True, cap_gb=None, worker_env=None, worker_bin=None, server_bin=None, server_park=True, server_env=None):
         self.stack = ExitStack()
         self.n_start += 1
         env = dict(self.env)
@@ -108,7 +114,7 @@ class Rig:
             command += ["--cache-type-k", "f16", "--cache-type-v", "f16", "--flash-attn", "off", "--load-mode", "mmap", "--lazy-mode", "off"]
         if server_park:
             command += ["--slot-park-path", str(self.host_dir)]
-        self.server = spawn(self.stack, command, self.out / f"server-{self.n_start}.log", self.env)
+        self.server = spawn(self.stack, command, self.out / f"server-{self.n_start}.log", dict(self.env, **(server_env or {})))
         wait_ready(self.server, self.api, http=True)
 
     def stop(self):
@@ -130,7 +136,7 @@ class Rig:
     # -- requests --
 
     def call(self, path, body=None, timeout=1800):
-        data = json.dumps(body if body is not None else {}).encode()
+        data = json.dumps(body).encode() if body is not None else None    # no body: a GET
         request = urllib.request.Request(f"http://127.0.0.1:{self.api}{path}", data=data, headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -139,17 +145,40 @@ class Rig:
             return error.code, json.loads(error.read() or b"{}")
 
     def slot(self, action, key=None, expect=200, **more):
-        status, body = self.call(f"/slots/0?action={action}", dict({} if key is None else {"filename": key}, **more))
+        status, body = self.call(f"/slots/0?action={action}", dict({} if key is None else {"filename": key}, **more) or {})
         assert status == expect, (action, key, status, body)
         return body if status == 200 else body["error"]
 
-    def turn(self, tokens):
+    def turn(self, tokens, n=REPLY):
         """One greedy turn on the slot: the reply's tokens, and how many prompt tokens were read rather than reused."""
-        status, body = self.call("/completion", {"prompt": tokens, "n_predict": REPLY, "temperature": 0, "seed": 42,
-                                                 "ignore_eos": True, "return_tokens": True, "cache_prompt": True})
+        status, body = self.call("/completion", {"prompt": tokens, "n_predict": n, "temperature": 0, "seed": 42,
+                                                 "ignore_eos": True, "return_tokens": True, "cache_prompt": True, "id_slot": 0})
         assert status == 200, body
-        assert len(body["tokens"]) == REPLY, body
+        assert len(body["tokens"]) == n, body
         return body["tokens"], body["timings"]["prompt_n"]
+
+    def background(self, function, *args, **kwargs):
+        """Runs a request on a thread of its own: .result (or .error) and .done, the time it answered."""
+        def run():
+            try:
+                thread.result = function(*args, **kwargs)
+            except BaseException as error:   # reported by the case that joins it
+                thread.error = error
+            thread.done = time.monotonic()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.result = thread.error = thread.done = None
+        thread.start()
+        return thread
+
+    def generating(self):
+        status, body = self.call("/slots", None)
+        return status == 200 and body[0]["is_processing"]
+
+    def wait_generating(self):
+        deadline = time.monotonic() + 60
+        while not self.generating():
+            assert time.monotonic() < deadline, "the long generation did not start"
+            time.sleep(0.02)
 
     def history(self, seed, n):
         """n tokens of a conversation of its own."""
@@ -441,6 +470,164 @@ def case_prune(rig, report):
     report["prune"] = dict(key_bytes=size, cap_bytes=int(2.6 * size), pruned=saved["pruned"])
 
 
+LONG = 240   # tokens of a generation long enough to send other requests into
+
+
+def joined(*threads):
+    for thread in threads:
+        thread.join(timeout=600)
+        assert not thread.is_alive(), "a request did not answer"
+        if thread.error is not None:
+            raise thread.error
+    return [thread.result for thread in threads]
+
+
+def case_busy(rig, report):
+    """Park actions against a slot that is generating or has a request queued: each waits its turn, in the order it came."""
+    n = rig.args.tokens
+    a, b, more, more2 = rig.history(110, n), rig.history(111, n), rig.history(112, 30), rig.history(113, 30)
+    # what each history answers on a slot nothing else touches
+    rig.slot("erase")
+    a_long, _ = rig.turn(a, LONG)
+    a2, _ = rig.turn(a + a_long + more)
+    a3, _ = rig.turn(a + a_long + more + a2 + more2)
+    rig.slot("erase")
+    b_long, _ = rig.turn(b, LONG)
+    b2, _ = rig.turn(b + b_long + more)
+    rig.slot("erase")
+
+    # 1. a save sent while the slot generates waits for the generation and parks what it left
+    gen = rig.background(rig.turn, a, LONG)
+    rig.wait_generating()
+    save = rig.background(rig.slot, "save", "busy-a")
+    (reply, _), saved = joined(gen, save)
+    assert reply == a_long
+    assert save.done >= gen.done - 0.05, "the save answered before the generation it was sent into had finished"
+    assert saved["n_saved"] == len(a) + LONG - 1 and saved["mode"] == "new", saved
+
+    # 2. a restore sent while the slot generates waits too: the generation is whole, then the slot holds the key
+    gen = rig.background(rig.turn, b, LONG)
+    rig.wait_generating()
+    restore = rig.background(rig.slot, "restore", "busy-a")
+    (reply, _), restored = joined(gen, restore)
+    assert reply == b_long, "a generation was disturbed by a restore sent into it"
+    assert restore.done >= gen.done - 0.05 and restored["n_restored"] == len(a) + LONG - 1, restored
+    reply, read = rig.turn(a + a_long + more)
+    assert reply == a2 and read <= len(more) + 1, (read, "the key restored after a generation does not answer as its history does")
+
+    # 3. a save, then a request, both sent while the slot generates: they run in that order, and neither is left waiting
+    rig.slot("erase")
+    gen = rig.background(rig.turn, b, LONG)
+    rig.wait_generating()
+    save = rig.background(rig.slot, "save", "busy-b")
+    time.sleep(0.3)
+    queued = rig.background(rig.turn, a + a_long + more + a2 + more2)
+    (reply, _), saved, (queued_reply, _) = joined(gen, save, queued)
+    assert reply == b_long and queued_reply == a3
+    assert saved["n_saved"] == len(b) + LONG - 1, ("the save parked the queued request's state, not the generation's", saved)
+    assert gen.done - 0.05 <= save.done <= queued.done + 0.05, (gen.done, save.done, queued.done)
+    rig.slot("restore", "busy-b")
+    reply, read = rig.turn(b + b_long + more)
+    assert reply == b2 and read <= len(more) + 1, read
+    # and the other way round: the request first, the save after it, parks what the request left. (The requests
+    # here name their slot, "id_slot": 0, as the swarm's do. One that names none is taken up after the park
+    # actions that wait for the slot, whenever it came.)
+    gen = rig.background(rig.turn, a, LONG)
+    rig.wait_generating()
+    queued = rig.background(rig.turn, b + b_long + more)
+    time.sleep(0.3)
+    save = rig.background(rig.slot, "save", "busy-c")
+    joined(gen, queued, save)
+    assert save.result["n_saved"] == len(b) + LONG + len(more) + KEPT, save.result
+    assert queued.done - 0.05 <= save.done
+
+    # the keys can be listed while the slot generates, and a save whose client gives up while it waits is not run
+    gen = rig.background(rig.turn, a, LONG)
+    rig.wait_generating()
+    listed = rig.slot("park-list")
+    assert rig.generating(), "park-list waited for the generation"
+    assert "busy-gone" not in [k["key"] for k in listed["keys"]]
+    try:
+        rig.call("/slots/0?action=save", {"filename": "busy-gone"}, timeout=0.5)
+        raise AssertionError("a save answered while the slot was generating")
+    except (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError):
+        pass
+    joined(gen)
+    rig.turn(a + a_long + more)                           # the slot has been idle and busy again since
+    assert "busy-gone" not in [k["key"] for k in rig.slot("park-list")["keys"]], "a save its client had given up on was run"
+
+    # 4. two saves of one key at once: one parks, the other finds nothing to add
+    rig.slot("restore", "busy-a")
+    rig.turn(a + a_long + more)
+    first, second = joined(rig.background(rig.slot, "save", "busy-a"), rig.background(rig.slot, "save", "busy-a"))
+    assert sorted([first["mode"], second["mode"]]) == ["append", "unchanged"], (first, second)
+    assert first["n_saved"] == second["n_saved"] == len(a) + LONG + len(more) + KEPT
+
+    # 5. a save racing a restore of the same key: whichever runs first, the key is whole afterwards
+    rig.turn(a + a_long + more + a2 + more2)             # the slot is one turn ahead of the key
+    joined(rig.background(rig.slot, "save", "busy-a"), rig.background(rig.slot, "restore", "busy-a"))
+    rig.turn(b)                                           # another conversation takes the slot
+    restored = rig.slot("restore", "busy-a")
+    ahead = len(a) + LONG + len(more) + REPLY + len(more2) + KEPT
+    assert restored["n_restored"] in (len(a) + LONG + len(more) + KEPT, ahead), restored
+    # either way the history one turn ahead answers as it should, reading at most that turn again
+    reply, read = rig.turn(a + a_long + more + a2 + more2)
+    assert reply == a3 and read <= len(more2) + REPLY + 8, read
+    report["busy"] = dict(save_during_generation="waits, parks the generation's end", restore_during_generation="waits, generation whole",
+                          order="save, restore and requests for the slot run in the order they were sent",
+                          save_racing_restore="save first" if restored["n_restored"] == ahead else "restore first")
+
+
+def case_crash(rig, report):
+    """The server dies with a save written but the manifest not replaced, in an append and in a rewrite: the state before loads."""
+    step = rig.args.firing
+    parts = [rig.history(120 + i, step) for i in range(2)]
+    add, changed, more = rig.history(125, 200), rig.history(126, step), rig.history(127, 24)
+    rig.slot("erase")
+    history = []
+    for part in parts:                                    # two firings, two files
+        history = history + part
+        reply, _ = rig.turn(history)
+        history = history + reply
+    ref, _ = rig.turn(history + more)
+    rig.slot("erase")
+    history = []
+    for part in parts:
+        history = history + part
+        reply, _ = rig.turn(history)
+        history = history + reply
+        saved = rig.slot("save", "crash")
+    before = dict(rig.device_files("crash"))
+    edited = history[:step + REPLY] + changed             # the second firing replaced: a save of this is a rewrite
+    for name, request in (("append", history + add), ("rewrite", edited)):
+        rig.stop()
+        rig.start(server_env={"LLAMA_PARK_DIE_AT": "manifest"})
+        rig.slot("restore", "crash")
+        rig.turn(request)
+        try:
+            status, body = rig.call("/slots/0?action=save", {"filename": "crash"}, timeout=120)
+            raise AssertionError(f"the save answered {status} {body} although the server died in it")
+        except (urllib.error.URLError, ConnectionError, socket.timeout, json.JSONDecodeError):
+            pass
+        assert rig.server.wait(timeout=30) == 3, "the server did not stop where the test asked"
+        assert set(before) < set(rig.device_files("crash")), (name, "the dying save left nothing on the worker: it did not get far enough")
+        rig.stop()
+        rig.start()
+        restored = rig.slot("restore", "crash")
+        assert restored["n_restored"] == saved["n_saved"] and restored["n_segments"] == 2, (name, restored)
+        reply, read = rig.turn(history + more)
+        assert reply == ref and read <= len(more) + 1, (name, read, "the state before the dying save does not answer as before")
+    # and the key still takes the rewrite; what the dying saves left is cleared away
+    rig.slot("restore", "crash")
+    rig.turn(edited)
+    after = rig.slot("save", "crash")
+    assert after["mode"] == "rewrite" and after["n_segments"] == 2, after
+    assert sum(f.endswith(".kv") for f in rig.device_files("crash")) == 2, rig.device_files("crash")
+    here = sorted(f.name for f in (rig.host_dir / "crash").iterdir())
+    assert len(here) == 3 and here[0] == "manifest.json", here
+    report["crash"] = dict(server_died_before_manifest_in=["append", "rewrite"], restored_tokens=saved["n_saved"])
+
+
 def hello_features(rig, park):
     """The fourth byte of a worker's HELLO answer; a worker of its own, as one serves a single client at a time."""
     port, = free_ports(1)
@@ -549,7 +736,7 @@ def case_memory(rig, report):
 
 
 CASES = dict(swap=case_swap, firings=case_firings, many=case_many, torn=case_torn, stale=case_stale,
-             prune=case_prune, mixed=case_mixed, memory=case_memory)
+             prune=case_prune, mixed=case_mixed, busy=case_busy, crash=case_crash, memory=case_memory)
 
 
 def no_core_dumps():

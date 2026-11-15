@@ -356,10 +356,26 @@ by name:
 | `POST /slots/0?action=park-delete` `{"filename": "n17"}` | Drops a key, on the console and on the host |
 | `POST /slots/0?action=park-status` | Free space, bytes parked, the cap |
 
-A key is 1 to 64 letters, digits, `.`, `_` or `-`. A save or a restore waits
-while a request runs on the slot. With `--slot-save-path` also set,
-`"device": false` in the body makes the same two actions use a host file as
-before.
+A key is 1 to 64 letters, digits, `.`, `_` or `-`. With `--slot-save-path` also
+set, `"device": false` in the body makes the same two actions use a host file
+as before.
+
+A save or a restore is never refused because the slot is busy, and never runs
+beside a request: it waits for the slot, and the server does one thing on a
+slot at a time.
+
+- Sent while a request generates, a save parks what that request leaves when
+  it ends, and a restore replaces it then. The request itself is not disturbed.
+- Saves, restores and requests that name the slot (`"id_slot": 0`, as the
+  swarm's do) run in the order they were sent. A request that names no slot is
+  taken up after the park actions that wait, whenever it came.
+- Two saves of one key at once: the first parks, the second answers
+  `"mode": "unchanged"`. A save and a restore of one key at once run one after
+  the other in the order sent; either way the key is whole.
+- A client that closes its connection while its save or restore still waits
+  takes it out of the queue. Once one has started it runs to its end.
+- `park-list`, `park-delete` and `park-status` do not wait for the slot; they
+  run between the batches of a request in progress.
 
 A save answers with what it wrote (Qwen3.5-0.8B on a CPU worker, the fourth
 firing of a conversation):
@@ -430,10 +446,13 @@ How it holds together:
   space, the disk above 16 GiB free: before a save it drops whole keys, the one
   used longest ago first, never one with a file open. 128 GiB holds forty
   conversations at a full 155K window (3.1 GiB each) or a hundred at about 60K.
-- On the host a key is `manifest.json`, `tokens.bin` (4 bytes a token) and
-  `meta.bin` (24 bytes a token): 4.3 MB at 153K tokens. They survive a server
-  restart and a reboot; a parked key is resumed by a new server process as by
-  the old one.
+- On the host a key is `manifest.json`, `tokens.NNNNNN.bin` (4 bytes a token)
+  and `meta.NNNNNN.bin` (24 bytes a token): 4.3 MB at 153K tokens. They survive
+  a server restart and a reboot; a parked key is resumed by a new server process
+  as by the old one. A save that adds appends to the two files past what the
+  manifest covers; a save that rewrites starts a new pair and drops the old one
+  after the manifest is replaced. So if the server or the PC dies in a save,
+  append or rewrite, the key is as its last finished save left it.
 - One worker only: with several, a slot's state is spread over them, and
   parking is refused.
 
