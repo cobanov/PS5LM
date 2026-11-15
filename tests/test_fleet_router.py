@@ -26,6 +26,9 @@ def backend(name):
             self.send_response(code)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
+            # As llama-server does: any origin may read the answer.
+            self.send_header('Access-Control-Allow-Origin', self.headers.get('Origin', '*'))
+            self.send_header('Access-Control-Allow-Headers', '*')
             self.end_headers()
             self.wfile.write(data)
 
@@ -145,6 +148,59 @@ class RouterTests(unittest.TestCase):
         self.assertIsNone(json.loads(data)['api_key'])
         response, _ = self.request('GET', '/health')
         self.assertEqual(response.status, 200)
+
+    def cors(self, response):
+        return {k.lower(): v for k, v in response.getheaders() if k.lower().startswith('access-control-')}
+
+    def test_without_a_key_no_web_page_on_another_site_can_use_the_api(self):
+        self.ready('alpha/0')
+        own = f'http://127.0.0.1:{self.api.server_address[1]}'
+        # No CORS headers, the router's or a replica's: nothing is readable cross-site.
+        for method, path, body in (('GET', '/v1/models', None), ('GET', '/health', None), ('GET', '/props', None),
+                                   ('POST', '/v1/chat/completions', dict(model='alpha')),
+                                   ('POST', '/v1/chat/completions', dict(model='nobody-and-not-ready'))):
+            for origin in (None, own):
+                with self.subTest(path=path, origin=origin):
+                    response, _ = self.request(method, path, body, {'Origin': origin} if origin else None)
+                    self.assertEqual(self.cors(response), {})
+        response, _ = self.request('OPTIONS', '/v1/chat/completions')
+        self.assertEqual((response.status, self.cors(response)), (204, {}))
+        # A page on another site: its preflight is refused, and so is the request a
+        # page can send without one (a text/plain POST), before any replica sees it.
+        rebound = f'http://evil.example:{self.api.server_address[1]}'
+        for origin in ('https://evil.example', 'http://localhost:3000', 'null', rebound):
+            for method, path in (('OPTIONS', '/v1/chat/completions'), ('POST', '/v1/chat/completions'),
+                                 ('POST', '/completion'), ('GET', '/v1/models'), ('GET', '/slots')):
+                with self.subTest(origin=origin, method=method, path=path):
+                    served = self.fleet.requests
+                    response, data = self.request(method, path, None if method != 'POST' else dict(model='alpha'),
+                                                  {'Origin': origin, 'Content-Type': 'text/plain'})
+                    self.assertEqual((response.status, self.cors(response)), (403, {}))
+                    self.assertIn('no key', json.loads(data)['error']['message'])
+                    self.assertEqual(self.fleet.requests, served)
+        # Its own pages (llama-server's chat page through this API) still work.
+        response, data = self.request('POST', '/v1/chat/completions', dict(model='alpha'), {'Origin': own})
+        self.assertEqual((response.status, json.loads(data)['backend']), (200, 'a1'))
+
+    def test_with_a_key_pages_on_other_sites_use_the_api_with_it(self):
+        self.ready('alpha/0')
+        self.fleet.set_settings(dict(api_key='fleet-key'))
+        site = {'Origin': 'https://chat.example'}
+        response, _ = self.request('OPTIONS', '/v1/chat/completions',
+                                   headers=dict(site, **{'Access-Control-Request-Headers': 'authorization, content-type'}))
+        self.assertEqual((response.status, self.cors(response)), (204, {
+            'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS',
+            'access-control-allow-headers': 'authorization, content-type'}))
+        response, _ = self.request('OPTIONS', '/v1/chat/completions',
+                                   headers=dict(site, **{'Access-Control-Request-Headers': 'x(bad)'}))
+        self.assertEqual(self.cors(response)['access-control-allow-headers'], router._CORS_HEADERS)
+        response, _ = self.request('POST', '/v1/chat/completions', dict(model='alpha'), site)
+        self.assertEqual((response.status, self.cors(response)), (401, {'access-control-allow-origin': '*'}))
+        response, data = self.request('POST', '/v1/chat/completions', dict(model='alpha'),
+                                      dict(site, Authorization='Bearer fleet-key'))
+        # One header from here, none of the replica's own.
+        self.assertEqual((response.status, self.cors(response)), (200, {'access-control-allow-origin': '*'}))
+        self.assertEqual(response.headers.get_all('Access-Control-Allow-Origin'), ['*'])
 
     def test_models_and_health(self):
         response, _ = self.request('GET', '/health')

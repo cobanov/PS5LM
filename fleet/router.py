@@ -16,6 +16,12 @@ take yet. A replica that refuses the connection is skipped and the request
 tried on another one (nothing has been sent back by then). Responses stream
 through as they arrive, so "stream": true works end to end.
 
+Web pages: with an API key set, the API answers pages on any origin (CORS),
+since each request has to carry the key. Without a key it sends no CORS headers,
+passes none on from a replica, and refuses a request a page on another site
+makes (its Origin header is not this API's own loopback address), so a page
+open in the browser cannot drive a keyless API.
+
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 from __future__ import annotations
@@ -25,6 +31,7 @@ import hmac
 import http.client
 import http.server
 import json
+import re
 import socket
 import urllib.parse
 
@@ -32,6 +39,9 @@ import urllib.parse
 _SKIP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'trailers',
          'transfer-encoding', 'upgrade', 'host', 'content-length', 'authorization', 'x-api-key'}
 MAX_BODY = 256 * 1024 * 1024
+_LOOPBACK = ('127.0.0.1', 'localhost', '::1')
+_CORS_HEADERS = 'Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta'
+_HEADER_LIST = re.compile(r'[A-Za-z0-9_-]+(, ?[A-Za-z0-9_-]+){0,63}')
 # A reply without streaming sends nothing until it ends: a 128k prompt on a split
 # reads at about 100 tokens/s, over 20 minutes before the first token.
 READ_TIMEOUT = 3600
@@ -72,13 +82,34 @@ def handler_for(fleet):
             self.send_response(code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(data)))
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self._cors()
             self.end_headers()
             if self.command != 'HEAD':
                 self.wfile.write(data)
 
         def _error(self, code, message, kind):
             self._json(code, {'error': {'message': message, 'type': kind, 'code': code}})
+
+        def _cors(self):
+            # Only with a key: then a page on another origin needs the key too.
+            if fleet.api_key():
+                self.send_header('Access-Control-Allow-Origin', '*')
+
+        def _same_site(self):
+            """Without a key, refuse what a web page on another site sends: browsers
+            put the page's origin on such requests. The API's own pages (llama-server's
+            chat page, opened on loopback) and clients that are not browsers pass."""
+            origin = self.headers.get('Origin')
+            if origin is None or fleet.api_key():
+                return True
+            parts = urllib.parse.urlsplit(origin)
+            if (parts.scheme in ('http', 'https') and parts.hostname in _LOOPBACK
+                    and parts.netloc.lower() == self.headers.get('Host', '').lower()):
+                return True
+            self._error(403, 'This API has no key, so it takes requests from its own pages only; '
+                             'set an API key to use it from another site', 'permission_error')
+            self.close_connection = True
+            return False
 
         def _authorized(self):
             key = fleet.api_key()
@@ -94,10 +125,16 @@ def handler_for(fleet):
             return False
 
         def do_OPTIONS(self):
+            if not self._same_site():
+                return
             self.send_response(204)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', '*')
+            if fleet.api_key():
+                # A preflight cannot carry the key; the request after it must.
+                asked = self.headers.get('Access-Control-Request-Headers', '')
+                self._cors()
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Headers',
+                                 asked if _HEADER_LIST.fullmatch(asked) else _CORS_HEADERS)
             self.send_header('Content-Length', '0')
             self.end_headers()
 
@@ -107,7 +144,7 @@ def handler_for(fleet):
                 healthy = fleet.healthy()
                 self._json(200 if healthy else 503, {'status': 'ok' if healthy else 'no pool is ready'})
                 return
-            if not self._authorized():
+            if not self._same_site() or not self._authorized():
                 return
             if path in ('/v1/models', '/models'):
                 self._json(200, {'object': 'list', 'data': fleet.models()})
@@ -116,7 +153,7 @@ def handler_for(fleet):
             self._forward(None, (query.get('model') or [None])[0])
 
         def do_POST(self):
-            if not self._authorized():
+            if not self._same_site() or not self._authorized():
                 return
             if 'chunked' in self.headers.get('Transfer-Encoding', '').lower():
                 self._error(411, 'Send the request with a Content-Length', 'invalid_request_error')
@@ -180,8 +217,11 @@ def handler_for(fleet):
             try:
                 self.send_response(response.status, response.reason)
                 for key, value in response.getheaders():
-                    if key.lower() not in _SKIP:
+                    # llama-server answers any origin; whether pages may read this
+                    # API is decided here (_cors), not by a replica.
+                    if key.lower() not in _SKIP and not key.lower().startswith('access-control-'):
                         self.send_header(key, value)
+                self._cors()
                 self.send_header('X-Fleet-Pool', replica.pool_id)
                 self.send_header('X-Fleet-Replica', replica.key)
                 if self.command == 'HEAD' or response.status in (204, 304) or 100 <= response.status < 200:

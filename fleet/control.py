@@ -262,6 +262,9 @@ def validate_config(raw):
     _int(config, 'api_port', 1024, 65535)
     _bool(config, 'api_lan', False)
     _secret(config['api_key'], 'The API key')
+    if config['api_lan'] and not config['api_key']:
+        # Without a key every llama-server endpoint would be open to the network.
+        raise ControlError('api_lan needs an api_key: the API is shared on the network only with a key set')
     _int(config, 'host_memory_mib', 256, UNBOUNDED_MIB)
     _int(config, 'host_reserve_mib', 1, UNBOUNDED_MIB)
     if not isinstance(config['launcher'], str) or len(config['launcher']) > 4096:
