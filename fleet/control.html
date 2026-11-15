@@ -137,7 +137,9 @@ details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
           <label>Memory MiB<input id="d-memory" type="number" placeholder="what it reports"></label>
           <label>Reserve MiB<input id="d-reserve" type="number" value="512"></label>
           <label>Tags<input id="d-tags" placeholder="rack1 lounge" autocomplete="off"></label>
-          <label class="d-ps5">Weight cache GiB<input id="d-cache" type="number" min="0" max="4096" value="32"></label>
+          <label class="d-ps5 wide">Weight cache GiB: how much of the weights hosts send the console keeps on its storage, so a
+            reload reads them there instead of over the network. 0 is off (the default); 32 holds a 27B model's share.
+            <input id="d-cache" type="number" min="0" max="4096" value="0"></label>
           <label class="check d-ps5"><input id="d-screen" type="checkbox"> Screen as a worker (about 350 MiB less for the model)</label>
         </div>
         <div class="row"><button id="d-save" class="primary">Add device</button><button id="d-cancel">Cancel</button></div>
@@ -434,7 +436,7 @@ function editDevice(d) {
   $("d-device").value = d && d.device ? d.device : "CUDA0";
   $("d-memory").value = d && d.memory_mib ? d.memory_mib : "";
   $("d-tags").value = d ? d.tags.join(" ") : "";
-  $("d-cache").value = d && d.kind === "ps5" ? d.cache_gib : 32; $("d-screen").checked = !!(d && d.screen);
+  $("d-cache").value = d && d.kind === "ps5" ? d.cache_gib : 0; $("d-screen").checked = !!(d && d.screen);
   deviceKind();
   if (d) $("d-reserve").value = d.reserve_mib;
   $("d-save").textContent = d ? "Save device" : "Add device";

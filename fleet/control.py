@@ -84,8 +84,10 @@ DEFAULT_PORT = dict(ps5=devices.WORKER_PORT, gpu=50052, rpc=50052)
 DEFAULT_RESERVE = dict(ps5=512, gpu=1024, rpc=1024)
 # A console's worker settings, written to its env.txt (devices.worker_env). No
 # screen by default: a console in a fleet is only a worker, and its screen takes
-# about 350 MiB the model can have. 32 GiB of the weights hosts send are kept.
-CONSOLE_FIELDS = dict(screen=False, cache_gib=32)
+# about 350 MiB the model can have. No weight cache by default, as in the app:
+# cache_gib is how many GiB of the weights hosts send a console keeps on its
+# storage (32 holds a 27B model's share), so a reload reads them there.
+CONSOLE_FIELDS = dict(screen=False, cache_gib=0)
 CACHE_GIB_MAX = 4096
 ACTIONS = dict(ps5=('worker', 'leave', 'restart', 'launch', 'quit', 'unload', 'clear-cache'), gpu=('worker', 'stop'),
                rpc=())
@@ -1113,7 +1115,7 @@ class Fleet:
             # (12.12 GiB free at start, 7.08 GiB after one 27B session, measured
             # 2026-11-11), so a second load can run out of memory. The restart also
             # applies the console's settings; it takes 4 s, and the weights come
-            # back from the console's cache.
+            # back from the console's cache when it keeps one (cache_gib).
             replica.detail = f'restarting {name} for a clean start'
             self._restart_worker(device, env, replica)
             return

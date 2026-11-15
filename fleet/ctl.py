@@ -15,8 +15,8 @@
              [--screen] [--cache-gib N]
   device set ID KEY=VALUE...   e.g. memory_mib=null enabled=false tags='["rack1"]'
                                a console's worker: screen=true (default false: about
-                               350 MiB more for the model), cache_gib=64 (default 32,
-                               0 for none: the weights it keeps, so a reload is local)
+                               350 MiB more for the model), cache_gib=32 (default 0,
+                               none: the GiB of weights it keeps, so a reload is local)
   device rm ID
   device worker|leave|restart|launch|quit|unload|clear-cache ID [--wait]
                                a console: into worker mode, out of it (PS5LM restarts as
@@ -179,7 +179,8 @@ def parser():
     add.add_argument('--tag', action='append')
     add.add_argument('--disabled', action='store_true')
     add.add_argument('--screen', action='store_true', help='a console: keep its screen as a worker')
-    add.add_argument('--cache-gib', type=int, help="a console: GiB of weights its worker keeps (default 32, 0: none)")
+    add.add_argument('--cache-gib', type=int,
+                     help="a console: GiB of weights its worker keeps (default 0: none; 32 holds a 27B model's)")
     edit = device.add_parser('set')
     edit.add_argument('id')
     edit.add_argument('pairs', nargs='+', metavar='KEY=VALUE')

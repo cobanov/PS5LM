@@ -162,7 +162,12 @@ class ConfigTests(unittest.TestCase):
             dict(id='box', kind='rpc', address='10.0.0.5')]))
         console, card, box = config['devices']
         self.assertEqual((console['reserve_mib'], card['reserve_mib'], box['reserve_mib']), (512, 1024, 1024))
-        self.assertEqual((console['screen'], console['cache_gib']), (False, 32))   # a fleet console is only a worker
+        # A fleet console is only a worker; it keeps no weights unless asked to, as in the app.
+        self.assertEqual((console['screen'], console['cache_gib']), (False, 0))
+        self.assertEqual(control.CONSOLE_FIELDS['cache_gib'], 0)
+        self.assertEqual(devices.worker_env(console['screen'], console['cache_gib'])['PS5LM_RPC_CACHE_GB'], '0')
+        kept = control.validate_device(dict(id='ps5-a', kind='ps5', address='192.168.50.21', cache_gib=32))
+        self.assertEqual(kept['cache_gib'], 32)                      # a configuration that sets it keeps its value
         self.assertNotIn('screen', card)
         for bad in (dict(cache_gib=-1), dict(cache_gib=4097), dict(cache_gib='32'), dict(screen='off')):
             with self.assertRaises(control.ControlError):
@@ -557,7 +562,7 @@ class FleetTests(unittest.TestCase):
             self.fleet.update_device('ps5-a', dict(screen=True))
             (job,) = self.finished()
         self.assertEqual(job['state'], 'done', job)
-        restart.assert_called_once_with('192.168.50.21', devices.worker_env(True, 32))
+        restart.assert_called_once_with('192.168.50.21', devices.worker_env(True, 0))
         self.assertNotIn('ps5-a', self.fleet.env_pending)
 
     def test_new_settings_wait_for_a_worker_in_use(self):
@@ -584,7 +589,7 @@ class FleetTests(unittest.TestCase):
                 patch.object(devices, 'restart', return_value=True) as restart, \
                 patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
             self.fleet._ensure_worker(device, replica)
-        restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 32))
+        restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 0))
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker', busy=True)), \
                 patch.object(devices, 'restart') as restart:
             self.fleet._ensure_worker(device, replica)                 # in use by someone: left alone
@@ -652,7 +657,7 @@ class FleetTests(unittest.TestCase):
             (job,) = self.finished()
         self.assertEqual((job['id'], job['state']), (answer['job']['id'], 'done'))
         leave.assert_called_once_with('192.168.50.21')
-        make.assert_called_once_with('192.168.50.21', 30052, devices.worker_env(False, 32))
+        make.assert_called_once_with('192.168.50.21', 30052, devices.worker_env(False, 0))
 
     def test_clear_cache(self):
         self.fleet.add_device(ps5())
