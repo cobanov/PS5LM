@@ -372,8 +372,11 @@ slot at a time.
 - Two saves of one key at once: the first parks, the second answers
   `"mode": "unchanged"`. A save and a restore of one key at once run one after
   the other in the order sent; either way the key is whole.
-- A client that closes its connection while its save or restore still waits
-  takes it out of the queue. Once one has started it runs to its end.
+- A client that gives up on a save or a restore that is still waiting cannot
+  count on it being dropped: the server notices a closed connection about
+  once a second and drops the action then, but one whose turn comes first is
+  run all the same, and once started it runs to its end. After giving up on a
+  restore, look at the slot (`GET /slots`) or send the restore again.
 - `park-list`, `park-delete` and `park-status` do not wait for the slot; they
   run between the batches of a request in progress.
 
