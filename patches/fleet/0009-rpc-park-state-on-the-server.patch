@@ -17,7 +17,13 @@ ggml-rpc/park.h).
 - The folder is kept under GGML_RPC_PARK_GB (default 128) and the disk above
   GGML_RPC_PARK_RESERVE_GB free (default 16, where the system says how much is
   free): before a write the keys used longest ago are dropped, never one with
-  a file open.
+  a file open and never the one restored last. The server keeps the order of
+  use itself, in the file .used of the folder, as a save or a restore happens:
+  a PS5's file times move when a key is saved and not when it is read, so by
+  them a small save dropped a 100K-token state that had been restored minutes
+  before.
+- Files are read with open() and read(): the console's libc reads a stream
+  without a buffer a byte per call.
 - A title that defines ps5lm_rpc_park_write (PS5LM does) writes the files with
   it: a PS5 title's own writes slow to about 1.2 MB/s after 2 GB.
 - A server with a park folder sets bit 1 in the fourth byte of its HELLO answer
@@ -465,10 +471,10 @@ index e8dc5fc..a0d5d70 100644
      }
 diff --git a/ggml/src/ggml-rpc/park.h b/ggml/src/ggml-rpc/park.h
 new file mode 100644
-index 0000000..6ce1e86
+index 0000000..dc60b2a
 --- /dev/null
 +++ b/ggml/src/ggml-rpc/park.h
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,708 @@
 +// PS5LM device parking: the files an RPC worker keeps for its clients.
 +//
 +// A client (llama-server) parks the state of a conversation on the worker's own
@@ -478,7 +484,11 @@ index 0000000..6ce1e86
 +// byte goes through one buffer of PARK_BUF_SIZE: nothing here grows with the
 +// size of the state. The folder is kept under GGML_RPC_PARK_GB (default 128) and
 +// the disk above GGML_RPC_PARK_RESERVE_GB free (default 16) by dropping whole
-+// keys, least recently used first, never one with a file open.
++// keys, least recently used first, never one with a file open and never the one
++// restored last. "Used" is a save or a restore, and the server keeps that order
++// itself, in the file .used of the folder: a PS5's file times move when a key is
++// saved but not when it is read, so by them a neuron restored a minute ago
++// looked older than one saved an hour ago and was dropped for it.
 +//
 +// A PS5 title's own writes to /data slow to about 1.2 MB/s after 2 GB, so a title
 +// that defines ps5lm_rpc_park_write (PS5LM does) writes the files through it:
@@ -493,6 +503,7 @@ index 0000000..6ce1e86
 +#include <cstdlib>
 +#include <cstring>
 +#include <filesystem>
++#include <map>
 +#include <string>
 +#include <vector>
 +
@@ -591,7 +602,8 @@ index 0000000..6ce1e86
 +    std::string name;
 +    uint64_t    bytes   = 0;
 +    uint32_t    n_files = 0;
-+    int64_t     mtime   = 0;   // of the folder or its newest file: the key's last use
++    int64_t     mtime   = 0;   // of the folder or its newest file: about when it was last saved
++    uint64_t    used    = 0;   // its place in the order of use (higher is later); 0: not in the record
 +};
 +
 +struct file_info {
@@ -638,6 +650,7 @@ index 0000000..6ce1e86
 +                }
 +            }
 +        }
++        used_load();
 +    }
 +
 +    ~store() {
@@ -756,7 +769,7 @@ index 0000000..6ce1e86
 +            w_key.clear();
 +            return fail(GGML_RPC_PARK_IO, "could not finish " + w_final);
 +        }
-+        touch(w_key);
++        touch(w_key, false);
 +        w_key.clear();
 +        size = w_bytes;
 +        hash = w_hash.done();
@@ -818,7 +831,7 @@ index 0000000..6ce1e86
 +        r_path  = path;
 +        r_bytes = 0;
 +        r_hash  = hash64();
-+        touch(r_key);
++        touch(r_key, true);
 +        size = on_disk;
 +        return GGML_RPC_PARK_OK;
 +    }
@@ -900,6 +913,8 @@ index 0000000..6ce1e86
 +            }
 +            existed = pfs::exists(kdir, ec) ? 1 : 0;
 +            pfs::remove_all(kdir, ec);
++            forget(key);
++            used_store();
 +        } else {
 +            const pfs::path path = kdir / file;
 +            const uintmax_t n = pfs::file_size(path, ec);
@@ -927,6 +942,8 @@ index 0000000..6ce1e86
 +            }
 +            const auto dt = pfs::last_write_time(kit->path(), e);
 +            k.mtime = e ? 0 : unix_time(dt);
++            const auto u = used.find(k.name);
++            k.used = u == used.end() ? 0 : u->second;
 +            for (const auto & f : files(k.name)) {
 +                k.bytes += f.bytes;
 +                k.n_files++;
@@ -981,7 +998,10 @@ index 0000000..6ce1e86
 +            used += k.bytes;
 +        }
 +        uint64_t free_bytes = disk_free();
-+        std::sort(all.begin(), all.end(), [](const key_info & a, const key_info & b) { return a.mtime < b.mtime; });
++        // by the record of use; keys it does not know (parked by a build without it) come first, by their file times
++        std::sort(all.begin(), all.end(), [](const key_info & a, const key_info & b) {
++            return a.used != b.used ? a.used < b.used : a.mtime < b.mtime;
++        });
 +        const auto enough = [&]() {
 +            return used + need <= cap && (free_bytes == UINT64_MAX || free_bytes >= need + reserve);
 +        };
@@ -989,17 +1009,21 @@ index 0000000..6ce1e86
 +            if (enough()) {
 +                break;
 +            }
-+            if (k.name == keep || k.name == w_key || k.name == r_key) {
++            if (k.name == keep || k.name == w_key || k.name == r_key || k.name == last_restored) {
 +                continue;
 +            }
 +            std::error_code ec;
 +            pfs::remove_all(pfs::path(dir) / k.name, ec);
++            forget(k.name);
 +            LOG_INFO("[park] dropped key '%s' (%.1f MiB, least recently used) to make room\n", k.name.c_str(), k.bytes / 1048576.0);
 +            used -= std::min(used, k.bytes);
 +            if (free_bytes != UINT64_MAX) {
 +                free_bytes += k.bytes;
 +            }
 +            n_pruned++;
++        }
++        if (n_pruned > 0) {
++            used_store();
 +        }
 +        if (!enough()) {
 +            char text[160];
@@ -1038,10 +1062,91 @@ index 0000000..6ce1e86
 +        return ec || sp.capacity == 0 || sp.available == (uintmax_t) -1 ? UINT64_MAX : (uint64_t) sp.available;
 +    }
 +
-+    // the time of a key's last use, for prune()
-+    void touch(const std::string & key) const {
++    // ---- the order the keys were used in, for prune() ----
++
++    // a key was saved or restored just now
++    void touch(const std::string & key, bool restored) {
++        used[key] = ++used_clock;
++        if (restored) {
++            last_restored = key;
++        }
++        used_store();
++    }
++
++    void forget(const std::string & key) {
++        used.erase(key);
++        if (last_restored == key) {
++            last_restored.clear();
++        }
++    }
++
++    // .used: a line "<place> <key>" per key, and "R <key>" for the one restored last
++    void used_load() {
++        FILE * f = std::fopen((pfs::path(dir) / ".used").string().c_str(), "rb");
++        if (f == nullptr) {
++            return;
++        }
++        char line[GGML_RPC_PARK_KEY_SIZE + 40];
++        while (std::fgets(line, sizeof(line), f) != nullptr) {
++            std::string text(line);
++            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
++                text.pop_back();
++            }
++            const size_t space = text.find(' ');
++            if (space == std::string::npos) {
++                continue;
++            }
++            const std::string key = text.substr(space + 1);
++            std::error_code ec;
++            if (!name_ok(key.c_str(), GGML_RPC_PARK_KEY_SIZE, GGML_RPC_PARK_KEY_SIZE - 1) || !pfs::is_directory(pfs::path(dir) / key, ec)) {
++                continue;   // a key that is gone
++            }
++            if (text[0] == 'R') {
++                last_restored = key;
++            } else {
++                const uint64_t place = std::strtoull(text.c_str(), nullptr, 10);
++                used[key]  = place;
++                used_clock = std::max(used_clock, place);
++            }
++        }
++        std::fclose(f);
++    }
++
++    // Written whole under another name and renamed, through the title's writer where there is one. While a
++    // parked file is being written the writer is taken: the record goes out with the next change then, and
++    // until it does only this process knows the order (a worker restarted in between falls back to file times
++    // for what it missed).
++    void used_store() {
++        if (w_open) {
++            return;
++        }
++        std::string text;
++        for (const auto & [key, place] : used) {
++            text += std::to_string(place) + " " + key + "\n";
++        }
++        if (!last_restored.empty()) {
++            text += "R " + last_restored + "\n";
++        }
++        const std::string whole = (pfs::path(dir) / ".used").string();
++        const std::string part  = whole + ".part";
++        bool ok;
++        if (ps5lm_rpc_park_write) {
++            ok = ps5lm_rpc_park_write(0, part.c_str(), nullptr, 0) == 1 &&
++                 (text.empty() || ps5lm_rpc_park_write(1, part.c_str(), text.data(), text.size()) == 1) &&
++                 ps5lm_rpc_park_write(2, part.c_str(), nullptr, 0) == 1;
++        } else {
++            FILE * f = std::fopen(part.c_str(), "wb");
++            ok = f != nullptr && std::fwrite(text.data(), 1, text.size(), f) == text.size();
++            ok = f != nullptr && std::fclose(f) == 0 && ok;
++        }
 +        std::error_code ec;
-+        pfs::last_write_time(pfs::path(dir) / key, pfs::file_time_type::clock::now(), ec);
++        if (ok) {
++            pfs::rename(part, whole, ec);
++        }
++        if (!ok || ec) {
++            pfs::remove(part, ec);
++            LOG_ERROR("[park] could not write %s: the order of use is kept in memory only\n", whole.c_str());
++        }
 +    }
 +
 +    int fail(int status, const std::string & text) {
@@ -1057,6 +1162,9 @@ index 0000000..6ce1e86
 +    uint64_t    reserve = 0;
 +    std::string err;
 +    std::vector<uint8_t> buf;
++    std::map<std::string, uint64_t> used;   // key -> its place in the order of use
++    uint64_t    used_clock = 0;
++    std::string last_restored;
 +    std::string die_ext;
 +    uint64_t    die_at  = 0;
 +

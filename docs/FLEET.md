@@ -445,10 +445,14 @@ How it holds together:
   buffer, whatever the size of the state. The files are written through ftpsrv,
   as the weight cache's are, and read in 8 MiB reads. Without an ftpsrv a save
   is refused (`park_io`): it is never written the slow way.
-- The worker keeps the folder to N GiB and, where the system tells it the free
-  space, the disk above 16 GiB free: before a save it drops whole keys, the one
-  used longest ago first, never one with a file open. 128 GiB holds forty
+- The worker keeps the folder to N GiB: before a save it drops whole keys, the
+  one used longest ago first, never one with a file open and never the one
+  restored last. It keeps the order of use itself (`/data/PS5LM/park/.used`,
+  rewritten at every save and restore), because the console's file times move
+  when a key is saved but not when it is read. 128 GiB holds forty
   conversations at a full 155K window (3.1 GiB each) or a hundred at about 60K.
+  There is no free-space floor on a console: a title's free-space call answers
+  a fixed 16 GiB, so only N bounds the folder.
 - On the host a key is `manifest.json`, `tokens.NNNNNN.bin` (4 bytes a token)
   and `meta.NNNNNN.bin` (24 bytes a token): 4.3 MB at 153K tokens. They survive
   a server restart and a reboot; a parked key is resumed by a new server process

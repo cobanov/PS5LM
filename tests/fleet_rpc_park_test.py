@@ -448,15 +448,33 @@ def case_prune(rig, report):
         assert rig.slot("save", key)["pruned"] == []
         time.sleep(1.1)                             # the keys' times of last use differ
     rig.slot("restore", "prune-1")                  # used now: prune-2 is the least recently used
-    time.sleep(1.1)
+    # The worker keeps the order of use itself, not by file times: a PS5's do not move when a key is read. Here
+    # the times say the opposite of the truth (prune-1 ancient, prune-2 brand new), and the worker is restarted,
+    # so the order has to come from its own record.
+    for key, when in (("prune-1", 1_000_000_000), ("prune-2", time.time() + 3600)):
+        for path in [rig.park_dir / key, *(rig.park_dir / key).iterdir()]:
+            os.utime(path, (when, when))
+    rig.stop()
+    rig.start(cap_gb=2.6 * size / 2**30)
     rig.turn(rig.history(83, n))
     saved = rig.slot("save", "prune-3")
-    assert saved["pruned"] == ["prune-2"], saved
+    assert saved["pruned"] == ["prune-2"], ("the key restored last was dropped, or the wrong one", saved)
+    assert (rig.park_dir / ".used").is_file()
     listed = {k["key"]: k["state"] for k in rig.slot("park-list")["keys"]}
     assert listed == {"prune-1": "parked", "prune-2": "pruned", "prune-3": "parked"}, listed
     refused = rig.slot("restore", "prune-2", expect=410)
     assert refused["park_error"] == "park_pruned", refused
     rig.slot("restore", "never-parked", expect=404)   # llama-server answers every 404 with its own "File Not Found" body
+    # Least recently used, not least recently saved: prune-1 was saved before prune-3 but restored after it,
+    # so the next save drops prune-3. And the key restored last is never the one dropped: after prune-5's save
+    # prune-1 is the least recently used, yet the save after that drops prune-5.
+    rig.slot("restore", "prune-1")
+    rig.turn(rig.history(85, n))
+    assert rig.slot("save", "prune-5")["pruned"] == ["prune-3"]
+    rig.turn(rig.history(86, n))
+    assert rig.slot("save", "prune-6")["pruned"] == ["prune-5"]
+    assert rig.device_files("prune-1") and rig.slot("restore", "prune-1")["n_restored"] == n + KEPT
+    rig.slot("park-delete", "prune-6")
     # a key that does not fit at all is refused, and nothing in use is dropped for it
     rig.stop()
     rig.start(cap_gb=0.5 * size / 2**30)
