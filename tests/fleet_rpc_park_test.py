@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import random
+import resource
 import shutil
 import socket
 import struct
@@ -551,7 +552,17 @@ CASES = dict(swap=case_swap, firings=case_firings, many=case_many, torn=case_tor
              prune=case_prune, mixed=case_mixed, memory=case_memory)
 
 
+def no_core_dumps():
+    """The torn case kills the worker in a save, and llama-server then aborts, as it does for any dead
+    worker. Neither may leave a core dump (several GiB each with a real model). The servers inherit this
+    limit. 1, not 0: where the system pipes dumps to a program (WSL does), 0 is ignored and 1 means none."""
+    hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+    limit = 1 if hard == resource.RLIM_INFINITY else min(1, hard)
+    resource.setrlimit(resource.RLIMIT_CORE, (limit, limit))
+
+
 def run(args):
+    no_core_dumps()
     output = args.output
     shutil.rmtree(output, ignore_errors=True)
     output.mkdir(parents=True)
