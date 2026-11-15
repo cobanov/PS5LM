@@ -465,10 +465,10 @@ index e8dc5fc..a0d5d70 100644
      }
 diff --git a/ggml/src/ggml-rpc/park.h b/ggml/src/ggml-rpc/park.h
 new file mode 100644
-index 0000000..647ba0e
+index 0000000..307421f
 --- /dev/null
 +++ b/ggml/src/ggml-rpc/park.h
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,576 @@
 +// PS5LM device parking: the files an RPC worker keeps for its clients.
 +//
 +// A client (llama-server) parks the state of a conversation on the worker's own
@@ -555,9 +555,18 @@ index 0000000..647ba0e
 +    }
 +};
 +
++// strnlen, which the PS5 SDK's libc does not have
++inline size_t bounded_len(const char * s, size_t max) {
++    size_t n = 0;
++    while (n < max && s[n] != '\0') {
++        n++;
++    }
++    return n;
++}
++
 +// letters, digits, '.', '_' and '-', not starting with '.', shorter than the field
 +inline bool name_ok(const char * s, size_t field, size_t max_len) {
-+    const size_t n = strnlen(s, field);
++    const size_t n = bounded_len(s, field);
 +    if (n == 0 || n >= field || n > max_len || s[0] == '.') {
 +        return false;
 +    }

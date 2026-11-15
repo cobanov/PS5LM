@@ -189,10 +189,10 @@ index 6dba147..7659105 100644
          }
 diff --git a/tools/server/server-park.h b/tools/server/server-park.h
 new file mode 100644
-index 0000000..b852cd3
+index 0000000..84dc9a2
 --- /dev/null
 +++ b/tools/server/server-park.h
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1040 @@
 +// PS5LM device parking: a slot's state is kept on the RPC worker's own storage
 +// instead of in a file or in the prompt cache on this machine.
 +//
@@ -258,6 +258,15 @@ index 0000000..b852cd3
 +    virtual bool is_error() override { return err; }
 +    virtual json to_json() override { return data; }
 +};
++
++// strnlen, which the PS5 SDK's libc does not have
++static inline size_t server_park_strnlen(const char * s, size_t max) {
++    size_t n = 0;
++    while (n < max && s[n] != '\0') {
++        n++;
++    }
++    return n;
++}
 +
 +struct server_park_error {
 +    std::string code;     // park_missing, park_pruned, park_torn, ...
@@ -424,7 +433,7 @@ index 0000000..b852cd3
 +        if (rsp.status == GGML_RPC_PARK_OK) {
 +            return;
 +        }
-+        const std::string msg = what + ": " + std::string(rsp.msg, strnlen(rsp.msg, sizeof(rsp.msg)));
++        const std::string msg = what + ": " + std::string(rsp.msg, server_park_strnlen(rsp.msg, sizeof(rsp.msg)));
 +        switch (rsp.status) {
 +            case GGML_RPC_PARK_NO_SPACE:  throw server_park_error{"park_no_space", 507, msg};
 +            case GGML_RPC_PARK_NOT_FOUND: throw server_park_error{"park_pruned", 410, msg};
@@ -444,7 +453,7 @@ index 0000000..b852cd3
 +            ggml_rpc_park_rsp rsp;
 +            dev_ok(GGML_RPC_PARK_LIST_FILES, key, "", 0, room * sizeof(page[0]), at, nullptr, page.data(), rsp);
 +            for (uint64_t i = 0; i < rsp.v[0]; i++) {
-+                out[std::string(page[i].file, strnlen(page[i].file, sizeof(page[i].file)))] = page[i].bytes;
++                out[std::string(page[i].file, server_park_strnlen(page[i].file, sizeof(page[i].file)))] = page[i].bytes;
 +            }
 +            at += rsp.v[0];
 +            if (rsp.v[0] == 0 || at >= rsp.v[1]) {
@@ -726,7 +735,7 @@ index 0000000..b852cd3
 +        json names = json::array();
 +        std::map<std::string, bool> there;
 +        for (const auto & k : dev_keys()) {
-+            there[std::string(k.key, strnlen(k.key, sizeof(k.key)))] = true;
++            there[std::string(k.key, server_park_strnlen(k.key, sizeof(k.key)))] = true;
 +        }
 +        std::error_code ec;
 +        for (std::filesystem::directory_iterator it(std::filesystem::u8path(dir), ec), end; !ec && it != end; it.increment(ec)) {
@@ -1167,7 +1176,7 @@ index 0000000..b852cd3
 +        json keys = json::array();
 +        std::map<std::string, ggml_rpc_park_key_entry> there;
 +        for (const auto & k : dev_keys()) {
-+            there[std::string(k.key, strnlen(k.key, sizeof(k.key)))] = k;
++            there[std::string(k.key, server_park_strnlen(k.key, sizeof(k.key)))] = k;
 +        }
 +        std::map<std::string, bool> seen;
 +        std::error_code ec;
