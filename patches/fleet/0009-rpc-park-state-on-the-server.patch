@@ -465,10 +465,10 @@ index e8dc5fc..a0d5d70 100644
      }
 diff --git a/ggml/src/ggml-rpc/park.h b/ggml/src/ggml-rpc/park.h
 new file mode 100644
-index 0000000..307421f
+index 0000000..6ce1e86
 --- /dev/null
 +++ b/ggml/src/ggml-rpc/park.h
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,606 @@
 +// PS5LM device parking: the files an RPC worker keeps for its clients.
 +//
 +// A client (llama-server) parks the state of a conversation on the worker's own
@@ -497,6 +497,7 @@ index 0000000..307421f
 +#include <vector>
 +
 +#ifndef _WIN32
++#include <fcntl.h>
 +#include <unistd.h>
 +#endif
 +
@@ -794,18 +795,21 @@ index 0000000..307421f
 +        if (offset > on_disk) {
 +            return fail(GGML_RPC_PARK_SHORT, path + " is shorter than the offset");
 +        }
++        // Each read below is one read call of up to PARK_BUF_SIZE: a PS5 title's every read call takes about
++        // 1.4 ms. Not through a stream without a buffer: the console's libc then reads a byte per call, and a
++        // 150 MiB state would take days.
++#ifdef _WIN32
 +        r_fp = std::fopen(path.c_str(), "rb");
-+        if (r_fp == nullptr) {
++        const bool opened  = r_fp != nullptr;
++        const bool seek_ok = opened && (offset == 0 || _fseeki64(r_fp, (long long) offset, SEEK_SET) == 0);
++#else
++        r_fd = ::open(path.c_str(), O_RDONLY);
++        const bool opened  = r_fd >= 0;
++        const bool seek_ok = opened && (offset == 0 || ::lseek(r_fd, (off_t) offset, SEEK_SET) == (off_t) offset);
++#endif
++        if (!opened) {
 +            return fail(GGML_RPC_PARK_NOT_FOUND, "cannot open " + path);
 +        }
-+        // no stream buffer: each read below is one read call of up to PARK_BUF_SIZE
-+        // (a PS5 title's every read call takes about 1.4 ms)
-+        std::setvbuf(r_fp, nullptr, _IONBF, 0);
-+#ifdef _WIN32
-+        const bool seek_ok = offset == 0 || _fseeki64(r_fp, (long long) offset, SEEK_SET) == 0;
-+#else
-+        const bool seek_ok = offset == 0 || fseeko(r_fp, (off_t) offset, SEEK_SET) == 0;
-+#endif
 +        if (!seek_ok) {
 +            read_close();
 +            return fail(GGML_RPC_PARK_IO, "cannot seek in " + path);
@@ -820,11 +824,28 @@ index 0000000..307421f
 +    }
 +
 +    int read(void * data, size_t n) {
-+        if (r_fp == nullptr) {
++        if (!reading()) {
 +            return fail(GGML_RPC_PARK_BAD, "no file is being read");
 +        }
-+        if (std::fread(data, 1, n, r_fp) != n) {
-+            const bool eof = std::feof(r_fp) != 0;
++        size_t got = 0;
++        bool   eof = false;
++#ifdef _WIN32
++        got = std::fread(data, 1, n, r_fp);
++        eof = std::feof(r_fp) != 0;
++#else
++        while (got < n) {
++            const ssize_t k = ::read(r_fd, (char *) data + got, n - got);
++            if (k < 0 && errno == EINTR) {
++                continue;
++            }
++            if (k <= 0) {
++                eof = k == 0;
++                break;
++            }
++            got += (size_t) k;
++        }
++#endif
++        if (got != n) {
 +            return fail(eof ? GGML_RPC_PARK_SHORT : GGML_RPC_PARK_IO, r_path + (eof ? " ends early" : " could not be read"));
 +        }
 +        r_hash.add(data, n);
@@ -833,7 +854,7 @@ index 0000000..307421f
 +    }
 +
 +    int read_end(uint64_t & bytes, uint64_t & hash) {
-+        if (r_fp == nullptr) {
++        if (!reading()) {
 +            return fail(GGML_RPC_PARK_BAD, "no file is being read");
 +        }
 +        bytes = r_bytes;
@@ -843,10 +864,17 @@ index 0000000..307421f
 +    }
 +
 +    void read_close() {
++#ifdef _WIN32
 +        if (r_fp != nullptr) {
 +            std::fclose(r_fp);
 +            r_fp = nullptr;
 +        }
++#else
++        if (r_fd >= 0) {
++            ::close(r_fd);
++            r_fd = -1;
++        }
++#endif
 +        r_key.clear();
 +    }
 +
@@ -1038,7 +1066,9 @@ index 0000000..307421f
 +    uint64_t    w_bytes = 0;
 +    hash64      w_hash;
 +
-+    FILE *      r_fp    = nullptr;
++    FILE *      r_fp    = nullptr;   // Windows
++    int         r_fd    = -1;        // elsewhere
++    bool reading() const { return r_fp != nullptr || r_fd >= 0; }
 +    std::string r_key, r_path;
 +    uint64_t    r_bytes = 0;
 +    hash64      r_hash;
