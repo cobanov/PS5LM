@@ -158,7 +158,11 @@ std::string run_fleet_worker(const FleetWorkerConfig & config, const RpcCache & 
         if (park.dir.empty()) {
             unsetenv("GGML_RPC_PARK_DIR");
         } else if (setenv("GGML_RPC_PARK_DIR", park.dir.c_str(), 1) != 0 ||
-                   setenv("GGML_RPC_PARK_GB", std::to_string(park.gib).c_str(), 1) != 0) {
+                   setenv("GGML_RPC_PARK_GB", std::to_string(park.gib).c_str(), 1) != 0 ||
+                   // No free-space floor: a title's statvfs answers a fixed 16 GiB whatever the
+                   // disk holds (seen on a console), which the server's default floor of 16 GiB
+                   // took for a full disk and refused every save. The size above bounds the folder.
+                   setenv("GGML_RPC_PARK_RESERVE_GB", "0", 1) != 0) {
             return "Cannot set the folder for parked state; refusing to start";
         }
         // The title's stderr does not reach app.log; ggml's log (RPC and Vulkan
