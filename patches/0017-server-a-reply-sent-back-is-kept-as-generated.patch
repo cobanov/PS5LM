@@ -20,23 +20,24 @@ to. Seen on 9 of 157 follow-up turns of Qwen3.8-27B served to agents, 84 to
 2,615 tokens read again each time.
 
 When a task is handed to its slot (launch_slot_with_task) and the slot's
-tokens stop matching the prompt, the slot's remaining tokens are compared
-with the prompt up to the end-of-turn token that closes the same number of
-turns: the same marker tokens (control and user-defined, by id) in the same
-order, the same bytes of text between them, and whitespace right before an
-end-of-reasoning marker not compared, since the template drops it and no
-client can send it back. If they say the same, the prompt takes the slot's
-tokens for that stretch and is an ordinary continuation of the slot; the
-message spans after it move by the difference. Anything else is left to the
-existing path, so a history that was really changed is read again as before.
+tokens stop matching the prompt, the two are compared from there as text: the
+same marker tokens (control and user-defined, by id) in the same order, the
+same bytes between them, and whitespace right before an end-of-reasoning
+marker not compared, since the template drops it and no client can send it
+back. Up to the furthest pair of token boundaries where they still say the
+same, the prompt takes the slot's tokens; the message spans after that
+stretch move by the difference. From there the existing path decides as
+before, on a prompt that now shares that much more with the slot.
 
-- The tail can hold more than one turn: once a reply is kept, every later
-  prompt renders it again and stops matching at the same token.
+- The stretch need not reach the end of either. A later message that was
+  really changed, a reply that max_tokens cut off (the slot holds a reply
+  less its last token) or that was cancelled, stop it where they differ, and
+  the slot goes back to a checkpoint from there, not from the kept reply.
+- Once a reply is kept, every later prompt renders it again and stops
+  matching at the same token, so the comparison runs on every request of that
+  conversation, over the tokens from that reply on.
 - Completion tasks with cache_prompt only; not a child task, a decision, an
   alora, or a slot or prompt with media.
-- A reply cut off by max_tokens is left to the existing path: the slot holds a
-  reply less its last token, so its tokens end inside the text that comes back
-  and the comparison up to the end-of-turn token does not apply.
 - prompt_tokens in the usage then counts the kept tokens, a token or two away
   from what tokenising the rendered prompt gives.
 - LLAMA_REPLY_AS_GENERATED=0 turns it off.
@@ -49,7 +50,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  #include <atomic>
  #include <thread>
  #include "base64.hpp"
-@@ -65,6 +66,92 @@
+@@ -65,6 +66,135 @@
      return result;
  }
  
@@ -63,71 +64,114 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +// checkpoint and reads the whole reply again - or, resumed from a parked save, the whole last firing.
 +//
 +// cached[n_past..) is what the slot holds past the common prefix, next[n_past..) what the new prompt has there.
-+// The slot's tokens end inside a turn (its end-of-turn token was sampled, not evaluated), so the part of the new
-+// prompt they can stand for ends right before an end-of-turn token: the one after as many complete turns as the
-+// cached tail holds. (More than one turn once an earlier reply was kept: every later prompt renders it again.)
-+// When cached[n_past..) and next[n_past..end) say the same, this returns end - n_past, the number of new-prompt
-+// tokens the cached tokens stand for; otherwise -1.
-+// "The same" means: the same marker tokens (control and user-defined tokens, compared by id) in the same order,
-+// and between them the same bytes of text, except that whitespace right before an end-of-reasoning marker is not
-+// compared (the template drops it, so no client can send it back).
-+static int32_t reply_as_generated(const llama_vocab * vocab, const llama_tokens & cached, const llama_tokens & next,
-+                                  size_t n_past, const std::vector<llama_tokens> & reasoning_ends) {
-+    if (n_past >= cached.size()) {
-+        return -1;
-+    }
-+    const auto is_eog = [&](llama_token t) { return t != LLAMA_TOKEN_NULL && llama_vocab_is_eog(vocab, t); };
++// This finds how far the two go on saying the same: the furthest pair of token boundaries, one in each, up to
++// which they hold the same marker tokens (control and user-defined tokens, compared by id) in the same order and
++// the same bytes of text between them. Whitespace right before an end-of-reasoning marker is not compared (the
++// template drops it, so no client can send it back). Returns false when that is no further than n_past.
++//
++// The slot's tokens up to n_cached then stand for the prompt's up to n_next. It need not be the whole of either:
++// a later message that was really changed, a reply that was cut off or cancelled, and every request after a reply
++// was kept (each renders that reply again) all stop somewhere, and the rest is the usual path's.
++static bool reply_as_generated(const llama_vocab * vocab, const llama_tokens & cached, const llama_tokens & next,
++                               size_t n_past, const std::vector<llama_tokens> & reasoning_ends,
++                               size_t & n_cached, size_t & n_next) {
++    struct unit {
++        llama_token marker; // the marker this text follows, LLAMA_TOKEN_NULL for the first unit
++        std::string text;   // without the whitespace before an end-of-reasoning marker
++    };
++    struct place {          // where a token boundary is, in units and bytes
++        size_t unit;
++        size_t byte;
++        bool operator<(const place & o) const { return unit != o.unit ? unit < o.unit : byte < o.byte; }
++        bool operator==(const place & o) const { return unit == o.unit && byte == o.byte; }
++    };
++    struct side {
++        std::vector<unit>  units;
++        std::vector<place> after; // after[k]: the boundary after token n_past + k
++    };
 +
-+    size_t n_turns = 0;
-+    for (size_t i = n_past; i < cached.size(); i++) {
-+        n_turns += is_eog(cached[i]) ? 1 : 0;
-+    }
-+    size_t end = n_past;
-+    for (; end < next.size(); end++) {
-+        if (is_eog(next[end]) && n_turns-- == 0) {
++    const auto is_reasoning_end = [&](llama_token t) {
++        for (const auto & e : reasoning_ends) {
++            if (e.size() == 1 && e[0] == t) {
++                return true;
++            }
++        }
++        return false;
++    };
++
++    const auto read = [&](const llama_tokens & toks, side & s) {
++        s.units.push_back({LLAMA_TOKEN_NULL, ""});
++        for (size_t i = n_past; i < toks.size(); i++) {
++            const llama_token t = toks[i];
++            if (t == LLAMA_TOKEN_NULL) {
++                break; // a media chunk: nothing past it is compared
++            }
++            if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
++                if (is_reasoning_end(t)) {
++                    auto & text = s.units.back().text;
++                    while (!text.empty() && std::isspace((unsigned char) text.back())) {
++                        text.pop_back();
++                    }
++                }
++                s.units.push_back({t, ""});
++            } else {
++                s.units.back().text += common_token_to_piece(vocab, t, false);
++            }
++            s.after.push_back({s.units.size() - 1, s.units.back().text.size()});
++        }
++        // a boundary inside whitespace that was dropped afterwards is at the end of what is left
++        for (auto & p : s.after) {
++            p.byte = std::min(p.byte, s.units[p.unit].text.size());
++        }
++    };
++
++    side a;
++    side b;
++    read(cached, a);
++    read(next, b);
++
++    // how far the two say the same
++    place limit = {0, 0};
++    for (size_t u = 0; u < a.units.size() && u < b.units.size(); u++) {
++        if (u > 0 && a.units[u].marker != b.units[u].marker) {
++            break;
++        }
++        const std::string & ta = a.units[u].text;
++        const std::string & tb = b.units[u].text;
++        size_t n = 0;
++        while (n < ta.size() && n < tb.size() && ta[n] == tb[n]) {
++            n++;
++        }
++        limit = {u, n};
++        if (n < ta.size() || n < tb.size()) {
 +            break;
 +        }
 +    }
-+    if (end >= next.size()) {
-+        return -1;
-+    }
 +
-+    struct unit {
-+        llama_token marker; // the marker this text follows, LLAMA_TOKEN_NULL for the first unit
-+        std::string text;
-+        bool operator==(const unit & o) const { return marker == o.marker && text == o.text; }
-+    };
-+
-+    const auto split = [&](const llama_tokens & toks, size_t from, size_t to, std::vector<unit> & out) {
-+        out.push_back({LLAMA_TOKEN_NULL, ""});
-+        for (size_t i = from; i < to; i++) {
-+            const llama_token t = toks[i];
-+            if (t == LLAMA_TOKEN_NULL) {
-+                return false; // a media chunk
-+            }
-+            if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
-+                for (const auto & e : reasoning_ends) {
-+                    if (e.size() == 1 && e[0] == t) {
-+                        auto & text = out.back().text;
-+                        while (!text.empty() && std::isspace((unsigned char) text.back())) {
-+                            text.pop_back();
-+                        }
-+                    }
-+                }
-+                out.push_back({t, ""});
-+            } else {
-+                out.back().text += common_token_to_piece(vocab, t, false);
-+            }
++    // the furthest boundary both have within that; of several tokens ending at one place (dropped whitespace), the last
++    size_t ia = a.after.size();
++    size_t ib = b.after.size();
++    while (ia > 0 && ib > 0) {
++        const place & pa = a.after[ia - 1];
++        const place & pb = b.after[ib - 1];
++        if (limit < pa) {
++            ia--;
++        } else if (limit < pb) {
++            ib--;
++        } else if (pa == pb) {
++            break;
++        } else if (pb < pa) {
++            ia--;
++        } else {
++            ib--;
 +        }
-+        return true;
-+    };
-+
-+    std::vector<unit> a;
-+    std::vector<unit> b;
-+    if (!split(cached, n_past, cached.size(), a) || !split(next, n_past, end, b) || !(a == b)) {
-+        return -1;
 +    }
-+    return (int32_t) (end - n_past);
++    if (ia == 0 || ib == 0) {
++        return false;
++    }
++    n_cached = n_past + ia;
++    n_next   = n_past + ib;
++    return true;
 +}
 +
 +// LLAMA_REPLY_AS_GENERATED=0 turns it off (to compare)
@@ -142,37 +186,38 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
  static std::vector<llama_token> server_accept_replay(
          common_sampler * smpl,
-@@ -2111,6 +2198,39 @@
+@@ -2111,6 +2241,40 @@
          // the per-request limit takes priority over the global one
          slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
  
-+        // PS5LM: when the slot's tokens stop matching the prompt inside a reply the client sent back, and the
-+        // two say the same, the prompt takes the slot's tokens for that reply (reply_as_generated() above). Done
-+        // here, while the task can still be changed; the prompt is then an ordinary continuation of the slot.
++        // PS5LM: where the slot's tokens stop matching the prompt but go on saying the same (a reply the client
++        // sent back, see reply_as_generated() above), the prompt takes the slot's tokens for that stretch. Done
++        // here, while the task can still be changed; the prompt then shares that much more with the slot.
 +        if (reply_as_generated_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
 +                !task.is_stateless() && !task.is_child() && task.n_tokens_shared <= 0 && slot.alora_invocation_start <= 0 &&
 +                !slot.prompt.tokens.has_mtmd && !task.tokens.has_mtmd) {
 +            const size_t n_past = slot.prompt.tokens.get_common_prefix(task.tokens);
-+            if (n_past > 0 && n_past < slot.prompt.tokens.size()) {
++            if (n_past > 0 && n_past < slot.prompt.tokens.size() && n_past < task.tokens.size()) {
 +                const llama_tokens cached = slot.prompt.tokens.get_text_tokens();
 +                const llama_tokens next   = task.tokens.get_text_tokens();
-+                const int32_t n_same = reply_as_generated(llama_model_get_vocab(model_tgt), cached, next, n_past,
-+                                                          task.params.sampling.reasoning_budget_end);
-+                if (n_same >= 0 && cached.size() + next.size() - n_past - n_same < (size_t) slot.n_ctx) {
-+                    llama_tokens merged = cached;
-+                    merged.insert(merged.end(), next.begin() + n_past + n_same, next.end());
++                size_t n_cached = 0;
++                size_t n_next   = 0;
++                if (reply_as_generated(llama_model_get_vocab(model_tgt), cached, next, n_past,
++                                       task.params.sampling.reasoning_budget_end, n_cached, n_next) &&
++                        n_cached + next.size() - n_next < (size_t) slot.n_ctx) {
++                    llama_tokens merged(cached.begin(), cached.begin() + n_cached);
++                    merged.insert(merged.end(), next.begin() + n_next, next.end());
 +
-+                    // the message spans after the reply move with it
-+                    const size_t  pos_after = n_past + n_same;
-+                    const int64_t shift     = (int64_t) cached.size() - (int64_t) pos_after;
++                    // the message spans after that stretch move with it
++                    const int64_t shift = (int64_t) n_cached - (int64_t) n_next;
 +                    for (auto & span : task.params.message_spans.spans) {
-+                        if (span.pos >= pos_after) {
++                        if (span.pos >= n_next) {
 +                            span.pos = (size_t) ((int64_t) span.pos + shift);
 +                        }
 +                    }
 +
-+                    SLT_INF(slot, "previous reply kept as generated: the prompt differs at %zu, %zu cached tokens stand for its %d re-rendered ones\n",
-+                            n_past, cached.size() - n_past, n_same);
++                    SLT_INF(slot, "previous reply kept as generated: the prompt differs at %zu, %zu cached tokens stand for its %zu re-rendered ones%s\n",
++                            n_past, n_cached - n_past, n_next - n_past, n_cached < cached.size() ? ", then it differs again" : "");
 +
 +                    task.tokens = server_tokens(merged, false);
 +                }

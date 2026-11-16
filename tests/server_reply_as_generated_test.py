@@ -14,6 +14,9 @@ The slot is given each reply token by token (a raw prompt), then the chat reques
   trim      a space before the end-of-reasoning marker, which the template trims: nothing is read again
   both      split and trim in one reply, then a second and a third turn on top: nothing is read again,
             and the reply two turns back, rendered again by every later prompt, is still kept
+  after     with that reply kept two turns back: a second reply that was cut off (the slot holds it less
+            its last token) is not read again; one that comes back changed, and one that was cancelled half
+            way, are read again from a checkpoint after the kept reply, not from before it
   edits     an earlier message changed; the reply's reasoning changed; the reply's reasoning changed in a
             reply that is also split: each is read again from the checkpoint, as without the patch
   off       LLAMA_REPLY_AS_GENERATED=0: split and trim are read again from the checkpoint
@@ -66,7 +69,7 @@ class Server:
         self.log = output / f"server-{name}.log"
         command = [str(binary), "--host", "127.0.0.1", "--port", str(self.port), "--parallel", "1", "--threads", "2",
                    "--device", "none", "--gpu-layers", "0", "--fit", "off", "--no-warmup", "--jinja",
-                   "--ctx-checkpoints", "3", "--cache-ram", "0", "--no-context-shift"]
+                   "--ctx-checkpoints", "3", "--checkpoint-min-step", "1", "--cache-ram", "0", "--no-context-shift"]
         if self.real:
             template = output / "reasoning-chatml.jinja"
             template.write_text(REAL_TEMPLATE)
@@ -193,6 +196,33 @@ def cases(server, patched, report):
     kept, read, _ = server.chat(history + [second, {"role": "user", "content": "one more"}])
     assert kept == held, f"both, third turn: kept {kept} of {held}"
     report.append(f"both and a third turn kept {kept}/{held}")
+
+    # with a reply kept two turns back, a request that is not a plain continuation of the slot keeps what it
+    # shares with the slot; it does not go back to before the kept reply
+    third = [second, {"role": "user", "content": "one more"}]
+    floor = len(case.prompt) + len(first)                 # the end of the kept reply, in the slot's tokens
+
+    # the second reply was cut off: the slot holds it less its last token, the request has all of it
+    server.give(slot + reply2[:-1])
+    kept, read, _ = server.chat(history + third)
+    assert kept == len(slot) + len(reply2) - 1, f"cut off: kept {kept} of {len(slot) + len(reply2) - 1}"
+    report.append(f"cut-off reply after a kept one kept {kept}")
+
+    # the second reply comes back with another answer: read again from a checkpoint after the kept reply
+    server.give(slot)                                     # a checkpoint 4 tokens before the second reply
+    server.give(slot + reply2)
+    changed = dict(second, content="umber")
+    kept, read, _ = server.chat(history + [changed, third[1]])
+    assert floor < kept < len(slot) + len(reply2), f"changed later reply: kept {kept}, the kept reply ends at {floor}"
+    report.append(f"changed later reply read again from {kept} (kept reply ends at {floor})")
+
+    # the second reply was cancelled half way and the client asks something else instead of the second user turn's
+    # reply: nothing past the generation prompt is shared, and what is before it is kept up to a checkpoint
+    server.give(slot)
+    server.give(slot + reply2[:len(reply2) // 2])
+    kept, read, _ = server.chat(history)                  # the same request again, as after a cancel
+    assert floor < kept <= len(slot), f"cancelled reply: kept {kept}, the kept reply ends at {floor}, the prompt at {len(slot)}"
+    report.append(f"cancelled reply read again from {kept} (prompt ends at {len(slot)})")
 
     # real edits are read again, from a checkpoint before the change
     def edited(name, held_change, edit):

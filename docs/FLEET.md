@@ -624,11 +624,11 @@ changes in the API. For a client:
 - A parked key stays in append mode after such a turn, and its token list is
   the slot's, not the rendered one.
 - A message that was really changed is read again from the change, as before.
-- A reply cut off by `max_tokens` is not covered. The slot holds every reply
-  less its last token, which a normal reply never shows (the end-of-turn
-  token) and a cut-off one does, so the slot's tokens end inside the text
-  that comes back. Such a reply is still read again when it has one of the
-  two differences, as before the patch.
+- The slot's tokens are kept as far as they say the same as the prompt, which
+  need not be the end of either. A reply cut off by `max_tokens` (the slot
+  holds it less its last token), a reply that was cancelled, or a later
+  message that was changed, is read again from where it differs, not from
+  the kept reply.
 
 `LLAMA_REPLY_AS_GENERATED=0` in the server's environment turns it off. The log
 line is `previous reply kept as generated: the prompt differs at N, ...`.
@@ -882,8 +882,10 @@ recurrent state of the models the consoles serve, which the untrained fixture
 
 `tests/server_reply_as_generated_test.py` gives a slot a reply token by token
 and sends it back as a chat message: split into other tokens, with whitespace
-the template trims, both with two more turns on top, and three real edits,
-which must still be read again; then the same with the patch switched off. It
+the template trims, both with two more turns on top; then, with a reply kept
+two turns back, a reply that was cut off, one that comes back changed and one
+that was cancelled; three real edits, which must still be read again; and
+split and trim with the patch switched off. It
 uses an untrained recurrent fixture with one token per letter, and the named
 model as well when `PS5LM_PARK_TEST_MODEL` is set.
 
