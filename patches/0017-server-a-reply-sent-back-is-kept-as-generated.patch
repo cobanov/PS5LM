@@ -1,0 +1,181 @@
+Subject: [PATCH] server: a reply sent back is kept as it was generated
+
+A chat client sends the previous reply back as a message. The chat template
+writes that message out again and the text is tokenised again, and the result
+is not always the tokens the slot holds:
+
+- The same text can be spelled with other tokens. The model wrote " book" and
+  "marks", the tokeniser gives " bookmarks"; "<parameter" "=" "path" against
+  "=path".
+- The template trims the reasoning. When the reasoning budget ends the
+  thinking right after a space or a blank line, that whitespace is in the slot
+  and not in what the template writes.
+
+The prompt cache then stops matching inside the reply. A recurrent state
+cannot go back a few tokens, so the slot returns to its context checkpoint and
+reads the whole reply again; resumed from a parked save (patches/0016) it has
+no checkpoint in the last firing, goes back to the save before, and reads the
+whole firing. A parked key is then rewritten from there instead of appended
+to. Seen on 9 of 157 follow-up turns of Qwen3.8-27B served to agents, 84 to
+2,615 tokens read again each time.
+
+When a task is handed to its slot (launch_slot_with_task) and the slot's
+tokens stop matching the prompt, the slot's remaining tokens are compared
+with the prompt up to the end-of-turn token that closes the same number of
+turns: the same marker tokens (control and user-defined, by id) in the same
+order, the same bytes of text between them, and whitespace right before an
+end-of-reasoning marker not compared, since the template drops it and no
+client can send it back. If they say the same, the prompt takes the slot's
+tokens for that stretch and is an ordinary continuation of the slot; the
+message spans after it move by the difference. Anything else is left to the
+existing path, so a history that was really changed is read again as before.
+
+- The tail can hold more than one turn: once a reply is kept, every later
+  prompt renders it again and stops matching at the same token.
+- Completion tasks with cache_prompt only; not a child task, a decision, an
+  alora, or a slot or prompt with media.
+- prompt_tokens in the usage then counts the kept tokens, a token or two away
+  from what tokenising the rendered prompt gives.
+- LLAMA_REPLY_AS_GENERATED=0 turns it off.
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++#include <cctype>
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -65,6 +66,92 @@
+     return result;
+ }
+ 
++// PS5LM: keep the previous reply as it was generated.
++//
++// A chat client sends the previous reply back as a message. The chat template writes that message out again and the
++// text is tokenised again, and the result is not always the tokens the model generated: the same text can be spelled
++// with other tokens (" book" + "marks" generated, " bookmarks" on the way back), and the template trims the reasoning,
++// so whitespace the model wrote just before the end-of-reasoning marker is gone. The prompt cache then stops matching
++// inside the reply. A model with recurrent state cannot go back a few tokens, so the slot falls back to a context
++// checkpoint and reads the whole reply again - or, resumed from a parked save, the whole last firing.
++//
++// cached[n_past..) is what the slot holds past the common prefix, next[n_past..) what the new prompt has there.
++// The slot's tokens end inside a turn (its end-of-turn token was sampled, not evaluated), so the part of the new
++// prompt they can stand for ends right before an end-of-turn token: the one after as many complete turns as the
++// cached tail holds. (More than one turn once an earlier reply was kept: every later prompt renders it again.)
++// When cached[n_past..) and next[n_past..end) say the same, this returns end - n_past, the number of new-prompt
++// tokens the cached tokens stand for; otherwise -1.
++// "The same" means: the same marker tokens (control and user-defined tokens, compared by id) in the same order,
++// and between them the same bytes of text, except that whitespace right before an end-of-reasoning marker is not
++// compared (the template drops it, so no client can send it back).
++static int32_t reply_as_generated(const llama_vocab * vocab, const llama_tokens & cached, const llama_tokens & next,
++                                  size_t n_past, const std::vector<llama_tokens> & reasoning_ends) {
++    if (n_past >= cached.size()) {
++        return -1;
++    }
++    const auto is_eog = [&](llama_token t) { return t != LLAMA_TOKEN_NULL && llama_vocab_is_eog(vocab, t); };
++
++    size_t n_turns = 0;
++    for (size_t i = n_past; i < cached.size(); i++) {
++        n_turns += is_eog(cached[i]) ? 1 : 0;
++    }
++    size_t end = n_past;
++    for (; end < next.size(); end++) {
++        if (is_eog(next[end]) && n_turns-- == 0) {
++            break;
++        }
++    }
++    if (end >= next.size()) {
++        return -1;
++    }
++
++    struct unit {
++        llama_token marker; // the marker this text follows, LLAMA_TOKEN_NULL for the first unit
++        std::string text;
++        bool operator==(const unit & o) const { return marker == o.marker && text == o.text; }
++    };
++
++    const auto split = [&](const llama_tokens & toks, size_t from, size_t to, std::vector<unit> & out) {
++        out.push_back({LLAMA_TOKEN_NULL, ""});
++        for (size_t i = from; i < to; i++) {
++            const llama_token t = toks[i];
++            if (t == LLAMA_TOKEN_NULL) {
++                return false; // a media chunk
++            }
++            if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
++                for (const auto & e : reasoning_ends) {
++                    if (e.size() == 1 && e[0] == t) {
++                        auto & text = out.back().text;
++                        while (!text.empty() && std::isspace((unsigned char) text.back())) {
++                            text.pop_back();
++                        }
++                    }
++                }
++                out.push_back({t, ""});
++            } else {
++                out.back().text += common_token_to_piece(vocab, t, false);
++            }
++        }
++        return true;
++    };
++
++    std::vector<unit> a;
++    std::vector<unit> b;
++    if (!split(cached, n_past, cached.size(), a) || !split(next, n_past, end, b) || !(a == b)) {
++        return -1;
++    }
++    return (int32_t) (end - n_past);
++}
++
++// LLAMA_REPLY_AS_GENERATED=0 turns it off (to compare)
++static bool reply_as_generated_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("LLAMA_REPLY_AS_GENERATED");
++        return !(e != nullptr && e[0] == '0');
++    }();
++    return enabled;
++}
++
+ // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+ static std::vector<llama_token> server_accept_replay(
+         common_sampler * smpl,
+@@ -2111,6 +2198,39 @@
+         // the per-request limit takes priority over the global one
+         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+ 
++        // PS5LM: when the slot's tokens stop matching the prompt inside a reply the client sent back, and the
++        // two say the same, the prompt takes the slot's tokens for that reply (reply_as_generated() above). Done
++        // here, while the task can still be changed; the prompt is then an ordinary continuation of the slot.
++        if (reply_as_generated_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
++                !task.is_stateless() && !task.is_child() && task.n_tokens_shared <= 0 && slot.alora_invocation_start <= 0 &&
++                !slot.prompt.tokens.has_mtmd && !task.tokens.has_mtmd) {
++            const size_t n_past = slot.prompt.tokens.get_common_prefix(task.tokens);
++            if (n_past > 0 && n_past < slot.prompt.tokens.size()) {
++                const llama_tokens cached = slot.prompt.tokens.get_text_tokens();
++                const llama_tokens next   = task.tokens.get_text_tokens();
++                const int32_t n_same = reply_as_generated(llama_model_get_vocab(model_tgt), cached, next, n_past,
++                                                          task.params.sampling.reasoning_budget_end);
++                if (n_same >= 0 && cached.size() + next.size() - n_past - n_same < (size_t) slot.n_ctx) {
++                    llama_tokens merged = cached;
++                    merged.insert(merged.end(), next.begin() + n_past + n_same, next.end());
++
++                    // the message spans after the reply move with it
++                    const size_t  pos_after = n_past + n_same;
++                    const int64_t shift     = (int64_t) cached.size() - (int64_t) pos_after;
++                    for (auto & span : task.params.message_spans.spans) {
++                        if (span.pos >= pos_after) {
++                            span.pos = (size_t) ((int64_t) span.pos + shift);
++                        }
++                    }
++
++                    SLT_INF(slot, "previous reply kept as generated: the prompt differs at %zu, %zu cached tokens stand for its %d re-rendered ones\n",
++                            n_past, cached.size() - n_past, n_same);
++
++                    task.tokens = server_tokens(merged, false);
++                }
++            }
++        }
++
+         slot.task = std::make_unique<const server_task>(std::move(task));
+ 
+         if (slot.task->type == SERVER_TASK_TYPE_TTS) {

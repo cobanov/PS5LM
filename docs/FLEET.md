@@ -591,6 +591,46 @@ at a time:
   and it was still slower.
 - `-ub` 256 to 1024 are within 2% of each other.
 
+### A reply sent back
+
+A chat client sends each reply back as a message with its next request. The
+server writes that message out through the chat template and tokenises it
+again, and compares the result with the tokens the slot holds. They are not
+always the same tokens although the client changed nothing:
+
+- The model spells text with whatever tokens it likes (` book` `marks`); the
+  tokeniser has one spelling (` bookmarks`).
+- The template trims the reasoning. A reasoning budget that ends the thinking
+  right after a space or a blank line leaves whitespace in the slot that the
+  template does not write.
+
+A hybrid model's recurrent state cannot step back, so the slot used to return
+to its checkpoint and read the whole reply again: 9 of 157 follow-up turns of
+Qwen3.8-27B, 84 to 2,615 tokens each, 16 s at 30K tokens of depth and 48 s at
+150K. After a restore from a parked save it read the whole last firing, and the
+next save rewrote the key from there.
+
+`patches/0017` keeps the reply as it was generated: where the slot's tokens and
+the prompt stop matching, it compares the two as text, marker tokens by id,
+and when they say the same the prompt continues from the slot's tokens. Nothing
+changes in the API. For a client:
+
+- After a kept reply the model continues from the tokens it wrote, not from a
+  re-tokenised copy, so the next reply can differ from what an unpatched
+  server gives after reading the reply again.
+- `prompt_tokens` counts the kept tokens: a token or two away from tokenising
+  the rendered prompt (`/apply-template` then `/tokenize`), for the rest of
+  the conversation.
+- A parked key stays in append mode after such a turn, and its token list is
+  the slot's, not the rendered one.
+- A message that was really changed is read again from the change, as before.
+- A reply cut off by `max_tokens` and returned without streaming is not
+  covered: the server trims the cut-off content it returns, so what comes
+  back is a different text.
+
+`LLAMA_REPLY_AS_GENERATED=0` in the server's environment turns it off. The log
+line is `previous reply kept as generated: the prompt differs at N, ...`.
+
 ## Control server
 
 ```sh
@@ -837,6 +877,13 @@ and the worker's memory. With `PS5LM_PARK_TEST_MODEL` set to a GGUF it runs a
 second time with that model: Qwen3.5-0.8B has the attention cells plus
 recurrent state of the models the consoles serve, which the untrained fixture
 (attention only) has not.
+
+`tests/server_reply_as_generated_test.py` gives a slot a reply token by token
+and sends it back as a chat message: split into other tokens, with whitespace
+the template trims, both with two more turns on top, and three real edits,
+which must still be read again; then the same with the patch switched off. It
+uses an untrained recurrent fixture with one token per letter, and the named
+model as well when `PS5LM_PARK_TEST_MODEL` is set.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
 on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only

@@ -148,6 +148,21 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **A reply sent back is not read again** (`patches/0017`): a chat client sends the
+  previous reply back as a message, and the template and the tokeniser do not always
+  give the tokens the model wrote. The same text can be split into other tokens
+  (` book` `marks` written, ` bookmarks` on the way back), and the template trims
+  whitespace that a reasoning budget left before the end-of-reasoning marker. A hybrid
+  model cannot step back a few tokens, so the slot returned to its checkpoint and read
+  the whole reply again, or the whole last firing after a parked restore, and the
+  parked key was rewritten from there. Qwen3.8-27B serving agents did this on 9 of
+  157 follow-up turns, 84 to 2,615 tokens each. The server now compares the slot's
+  remaining tokens with the prompt as text, and when they say the same the prompt
+  continues from the slot's tokens. A history that was really changed is read again as
+  before. `prompt_tokens` then counts the kept tokens, a token or two away from a
+  fresh tokenisation. `LLAMA_REPLY_AS_GENERATED=0` turns it off.
+  `tests/server_reply_as_generated_test.py` checks it on a host build
+  ([FLEET.md](docs/FLEET.md#a-reply-sent-back)).
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
   every worker over the network.
