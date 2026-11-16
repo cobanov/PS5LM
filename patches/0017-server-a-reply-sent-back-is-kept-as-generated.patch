@@ -33,6 +33,10 @@ before, on a prompt that now shares that much more with the slot.
   really changed, a reply that max_tokens cut off (the slot holds a reply
   less its last token) or that was cancelled, stop it where they differ, and
   the slot goes back to a checkpoint from there, not from the kept reply.
+- Dropped whitespace is only passed together with the marker it stood before,
+  and the prompt that results is compared once more, whole, with the prompt
+  that came in: if they do not say the same it is not used (a warning in the
+  log).
 - Once a reply is kept, every later prompt renders it again and stops
   matching at the same token, so the comparison runs on every request of that
   conversation, over the tokens from that reply on.
@@ -50,7 +54,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  #include <atomic>
  #include <thread>
  #include "base64.hpp"
-@@ -65,6 +66,135 @@
+@@ -65,6 +66,142 @@
      return result;
  }
  
@@ -63,11 +67,56 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +// inside the reply. A model with recurrent state cannot go back a few tokens, so the slot falls back to a context
 +// checkpoint and reads the whole reply again - or, resumed from a parked save, the whole last firing.
 +//
++// Tokens are compared as what they say: marker tokens (control and user-defined) by id and in order, and the bytes
++// of text between them. Whitespace right before an end-of-reasoning marker is not compared (the template drops it,
++// so no client can send it back).
++struct reply_unit {
++    llama_token marker; // the marker this text follows, LLAMA_TOKEN_NULL for the first unit
++    std::string text;   // without the whitespace before an end-of-reasoning marker
++    bool operator==(const reply_unit & o) const { return marker == o.marker && text == o.text; }
++};
++
++struct reply_place {    // where a token boundary is, in units and bytes
++    size_t unit;
++    size_t byte;
++    bool operator<(const reply_place & o) const { return unit != o.unit ? unit < o.unit : byte < o.byte; }
++    bool operator==(const reply_place & o) const { return unit == o.unit && byte == o.byte; }
++};
++
++// units: what toks[from..) say; after[k]: the boundary after token from + k
++static void reply_read(const llama_vocab * vocab, const llama_tokens & toks, size_t from, const std::vector<llama_tokens> & reasoning_ends,
++                       std::vector<reply_unit> & units, std::vector<reply_place> * after) {
++    units.push_back({LLAMA_TOKEN_NULL, ""});
++    for (size_t i = from; i < toks.size(); i++) {
++        const llama_token t = toks[i];
++        if (t == LLAMA_TOKEN_NULL) {
++            break; // a media chunk: nothing past it is compared
++        }
++        if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
++            for (const auto & e : reasoning_ends) {
++                if (e.size() == 1 && e[0] == t) {
++                    auto & text = units.back().text;
++                    while (!text.empty() && std::isspace((unsigned char) text.back())) {
++                        text.pop_back();
++                    }
++                }
++            }
++            units.push_back({t, ""});
++        } else {
++            units.back().text += common_token_to_piece(vocab, t, false);
++        }
++        if (after != nullptr) {
++            // a boundary inside whitespace that is dropped afterwards keeps its place past the end of what is
++            // left: it is never taken on its own (only the text that is left counts towards how far two token
++            // lists agree), so dropped whitespace is only ever passed together with the marker it stood before
++            after->push_back({units.size() - 1, units.back().text.size()});
++        }
++    }
++}
++
 +// cached[n_past..) is what the slot holds past the common prefix, next[n_past..) what the new prompt has there.
 +// This finds how far the two go on saying the same: the furthest pair of token boundaries, one in each, up to
-+// which they hold the same marker tokens (control and user-defined tokens, compared by id) in the same order and
-+// the same bytes of text between them. Whitespace right before an end-of-reasoning marker is not compared (the
-+// template drops it, so no client can send it back). Returns false when that is no further than n_past.
++// which they are the same units. Returns false when that is no further than n_past.
 +//
 +// The slot's tokens up to n_cached then stand for the prompt's up to n_next. It need not be the whole of either:
 +// a later message that was really changed, a reply that was cut off or cancelled, and every request after a reply
@@ -75,69 +124,21 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +static bool reply_as_generated(const llama_vocab * vocab, const llama_tokens & cached, const llama_tokens & next,
 +                               size_t n_past, const std::vector<llama_tokens> & reasoning_ends,
 +                               size_t & n_cached, size_t & n_next) {
-+    struct unit {
-+        llama_token marker; // the marker this text follows, LLAMA_TOKEN_NULL for the first unit
-+        std::string text;   // without the whitespace before an end-of-reasoning marker
-+    };
-+    struct place {          // where a token boundary is, in units and bytes
-+        size_t unit;
-+        size_t byte;
-+        bool operator<(const place & o) const { return unit != o.unit ? unit < o.unit : byte < o.byte; }
-+        bool operator==(const place & o) const { return unit == o.unit && byte == o.byte; }
-+    };
-+    struct side {
-+        std::vector<unit>  units;
-+        std::vector<place> after; // after[k]: the boundary after token n_past + k
-+    };
-+
-+    const auto is_reasoning_end = [&](llama_token t) {
-+        for (const auto & e : reasoning_ends) {
-+            if (e.size() == 1 && e[0] == t) {
-+                return true;
-+            }
-+        }
-+        return false;
-+    };
-+
-+    const auto read = [&](const llama_tokens & toks, side & s) {
-+        s.units.push_back({LLAMA_TOKEN_NULL, ""});
-+        for (size_t i = n_past; i < toks.size(); i++) {
-+            const llama_token t = toks[i];
-+            if (t == LLAMA_TOKEN_NULL) {
-+                break; // a media chunk: nothing past it is compared
-+            }
-+            if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
-+                if (is_reasoning_end(t)) {
-+                    auto & text = s.units.back().text;
-+                    while (!text.empty() && std::isspace((unsigned char) text.back())) {
-+                        text.pop_back();
-+                    }
-+                }
-+                s.units.push_back({t, ""});
-+            } else {
-+                s.units.back().text += common_token_to_piece(vocab, t, false);
-+            }
-+            s.after.push_back({s.units.size() - 1, s.units.back().text.size()});
-+        }
-+        // a boundary inside whitespace that was dropped afterwards is at the end of what is left
-+        for (auto & p : s.after) {
-+            p.byte = std::min(p.byte, s.units[p.unit].text.size());
-+        }
-+    };
-+
-+    side a;
-+    side b;
-+    read(cached, a);
-+    read(next, b);
++    std::vector<reply_unit>  ua;
++    std::vector<reply_unit>  ub;
++    std::vector<reply_place> pa;
++    std::vector<reply_place> pb;
++    reply_read(vocab, cached, n_past, reasoning_ends, ua, &pa);
++    reply_read(vocab, next,   n_past, reasoning_ends, ub, &pb);
 +
 +    // how far the two say the same
-+    place limit = {0, 0};
-+    for (size_t u = 0; u < a.units.size() && u < b.units.size(); u++) {
-+        if (u > 0 && a.units[u].marker != b.units[u].marker) {
++    reply_place limit = {0, 0};
++    for (size_t u = 0; u < ua.size() && u < ub.size(); u++) {
++        if (u > 0 && ua[u].marker != ub[u].marker) {
 +            break;
 +        }
-+        const std::string & ta = a.units[u].text;
-+        const std::string & tb = b.units[u].text;
++        const std::string & ta = ua[u].text;
++        const std::string & tb = ub[u].text;
 +        size_t n = 0;
 +        while (n < ta.size() && n < tb.size() && ta[n] == tb[n]) {
 +            n++;
@@ -148,19 +149,19 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +        }
 +    }
 +
-+    // the furthest boundary both have within that; of several tokens ending at one place (dropped whitespace), the last
-+    size_t ia = a.after.size();
-+    size_t ib = b.after.size();
++    // the furthest boundary both have within that
++    size_t ia = pa.size();
++    size_t ib = pb.size();
 +    while (ia > 0 && ib > 0) {
-+        const place & pa = a.after[ia - 1];
-+        const place & pb = b.after[ib - 1];
-+        if (limit < pa) {
++        const reply_place & a = pa[ia - 1];
++        const reply_place & b = pb[ib - 1];
++        if (limit < a) {
 +            ia--;
-+        } else if (limit < pb) {
++        } else if (limit < b) {
 +            ib--;
-+        } else if (pa == pb) {
++        } else if (a == b) {
 +            break;
-+        } else if (pb < pa) {
++        } else if (b < a) {
 +            ia--;
 +        } else {
 +            ib--;
@@ -172,6 +173,16 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +    n_cached = n_past + ia;
 +    n_next   = n_past + ib;
 +    return true;
++}
++
++// whether two token lists say the same from a token on
++static bool reply_says_the_same(const llama_vocab * vocab, const llama_tokens & a, const llama_tokens & b, size_t from,
++                                const std::vector<llama_tokens> & reasoning_ends) {
++    std::vector<reply_unit> ua;
++    std::vector<reply_unit> ub;
++    reply_read(vocab, a, from, reasoning_ends, ua, nullptr);
++    reply_read(vocab, b, from, reasoning_ends, ub, nullptr);
++    return ua == ub;
 +}
 +
 +// LLAMA_REPLY_AS_GENERATED=0 turns it off (to compare)
@@ -186,7 +197,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
  static std::vector<llama_token> server_accept_replay(
          common_sampler * smpl,
-@@ -2111,6 +2241,40 @@
+@@ -2111,6 +2248,47 @@
          // the per-request limit takes priority over the global one
          slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
  
@@ -198,28 +209,35 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +                !slot.prompt.tokens.has_mtmd && !task.tokens.has_mtmd) {
 +            const size_t n_past = slot.prompt.tokens.get_common_prefix(task.tokens);
 +            if (n_past > 0 && n_past < slot.prompt.tokens.size() && n_past < task.tokens.size()) {
++                const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
++                const auto & ends = task.params.sampling.reasoning_budget_end;
 +                const llama_tokens cached = slot.prompt.tokens.get_text_tokens();
 +                const llama_tokens next   = task.tokens.get_text_tokens();
 +                size_t n_cached = 0;
 +                size_t n_next   = 0;
-+                if (reply_as_generated(llama_model_get_vocab(model_tgt), cached, next, n_past,
-+                                       task.params.sampling.reasoning_budget_end, n_cached, n_next) &&
++                if (reply_as_generated(vocab, cached, next, n_past, ends, n_cached, n_next) &&
 +                        n_cached + next.size() - n_next < (size_t) slot.n_ctx) {
 +                    llama_tokens merged(cached.begin(), cached.begin() + n_cached);
 +                    merged.insert(merged.end(), next.begin() + n_next, next.end());
 +
-+                    // the message spans after that stretch move with it
-+                    const int64_t shift = (int64_t) n_cached - (int64_t) n_next;
-+                    for (auto & span : task.params.message_spans.spans) {
-+                        if (span.pos >= n_next) {
-+                            span.pos = (size_t) ((int64_t) span.pos + shift);
++                    // the prompt built here must say what the prompt that came in says, or it is not used
++                    if (!reply_says_the_same(vocab, merged, next, n_past, ends)) {
++                        SLT_WRN(slot, "previous reply not kept: with the slot's tokens to %zu the prompt would not say the same (it differs at %zu)\n",
++                                n_cached, n_past);
++                    } else {
++                        // the message spans after that stretch move with it
++                        const int64_t shift = (int64_t) n_cached - (int64_t) n_next;
++                        for (auto & span : task.params.message_spans.spans) {
++                            if (span.pos >= n_next) {
++                                span.pos = (size_t) ((int64_t) span.pos + shift);
++                            }
 +                        }
++
++                        SLT_INF(slot, "previous reply kept as generated: the prompt differs at %zu, %zu cached tokens stand for its %zu re-rendered ones%s\n",
++                                n_past, n_cached - n_past, n_next - n_past, n_cached < cached.size() ? ", then it differs again" : "");
++
++                        task.tokens = server_tokens(merged, false);
 +                    }
-+
-+                    SLT_INF(slot, "previous reply kept as generated: the prompt differs at %zu, %zu cached tokens stand for its %zu re-rendered ones%s\n",
-+                            n_past, n_cached - n_past, n_next - n_past, n_cached < cached.size() ? ", then it differs again" : "");
-+
-+                    task.tokens = server_tokens(merged, false);
 +                }
 +            }
 +        }
