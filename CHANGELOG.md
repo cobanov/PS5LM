@@ -12,8 +12,87 @@ v0.1.x are the upstream payload releases by cobanov.
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
   on the console.
+- **The fleet splits modern models.** Any single-file model the pinned llama.cpp
+  loads as one stack of blocks is admitted. That includes Qwen 3.5/3.6/3.8 (hybrid
+  Gated DeltaNet, dense and MoE), Llama 3.1+, Gemma 3/4 and gpt-oss, in all 35
+  ggml tensor types. Before, only dense `llama` and `qwen2` were admitted.
+  - The estimator now follows llama.cpp's placement and caches: recurrent state,
+    NextN blocks, sliding windows (listed in the file or llama.cpp's own pattern),
+    shared KV, widened V rows without flash attention, and RoPE and layer-0
+    tensors.
+  - It matched `llama-fit-params --fit-print` within 1 MiB on every device for
+    nine models at 4k and 32k. Qwen 3.5 and Gemma 3 split over two RPC workers
+    gave the same greedy tokens as one worker (docs/FLEET.md).
+- Before llama-server starts, `fleet serve` checks the plan with llama.cpp itself:
+  `llama-fit-params --fit-print` against the live workers, compute buffers
+  included. It refuses a worker that would come within 256 MiB of its budget, or
+  an eighth of a smaller budget.
+  `scripts/build-fleet-host.sh` builds `llama-fit-params`.
+- **`python3 -m fleet control`** runs a fleet of any size from one JSON
+  configuration: devices (consoles, this PC's GPUs, other RPC servers), and pools.
+  A pool is one model with its context, slots and cache. Its replicas are layer
+  splits, single consoles that serve the model with PS5LM itself, local GPUs, or
+  servers elsewhere.
+  - **One API** for every pool on port 8081 (OpenAI and Anthropic routes,
+    streaming, an optional key). The request's `model` picks the pool, and the
+    least busy replica gets it.
+  - **Running pools stay up.** It starts their replicas (making consoles workers
+    and starting the GPU's RPC worker as needed) and watches every device and
+    replica. It restarts what fails, with back-off.
+  - **Consoles are switched over the network**: found with the PlayStation
+    discovery protocol (also from WSL), and put in or out of worker mode over FTP.
+  - **`python3 -m fleet ctl`**: the same from a shell or an agent, as JSON:
+    `status`, `pool add --auto`, `pool start --wait`, `device leave`, and
+    `config` / `apply` for the whole configuration.
+  - **A console's worker settings**, on the page or with `ctl device set`:
+    `screen` (off by default, about 350 MiB more for the model) and `cache_gib`
+    (0 by default, no cache, as in the app; set, the GiB of weights its worker
+    keeps, so a reload reads them on the console: 32 holds a 27B model's share).
+    They go into its env.txt; a change restarts an idle worker, and one
+    in use takes it at its next restart. The page shows what each cache holds.
+    New actions: **restart** (a worker as a worker, with its settings) and
+    **clear-cache**.
+  - Consoles keep back 512 MiB for llama.cpp's compute buffers by default, GPUs
+    and RPC servers 1024.
+  - A split restarts its consoles' workers before it loads: the console's driver
+    keeps memory an earlier host allocated, and a second load ran out of it. The
+    watcher does not probe a console while a split on it starts.
+  - Splits sample on the worker with the output layer (`--backend-sampling`):
+    18.4 instead of 16.0 tokens/s for Qwen3.8-27B on a PS5 alone.
+  - A closed or crashed PS5LM is opened from the control server (`launch`, and
+    automatically by splits, `worker` and `restart`), through an ELF loader on
+    the console's port 9021 and PS5LM's launch payload.
+  - A version 1 `control.json` (one list of workers) becomes devices and a stopped
+    pool.
+  - **Who can use it:**
+    - The API is shared on the network (`api_lan`) only with an `api_key`; a
+      configuration without one is refused, when loaded and when changed.
+    - The API sends CORS headers only with a key set. Without one it sends
+      none, drops a replica's own, and refuses requests that carry another
+      site's `Origin`, so a page open in the browser cannot drive a keyless API.
+    - Behind `--allow-host`, the page and `ctl` change things only with a token
+      (`--token` or `$PS5LM_FLEET_TOKEN`; without one, a new token is printed
+      at each start). The page asks for it once; `ctl` takes `--token`. Both
+      also read it from a file that only you can read
+      (`~/.config/ps5lm-fleet/token`, or `--token-file`), so scripts that call
+      `ctl` need no variable.
+    - The launch payload comes from one folder (`build/app-ps5`, or
+      `--launcher-dir`): `launcher` picks a `.elf` in it, and only an ELF is
+      sent. A model given as a path is copied to a console only if it is a GGUF.
+    - A POST with a `Content-Length` that is not a number, negative or over
+      4 MiB is answered 413; a negative one used to wait on the connection.
+- **Long contexts in a split**:
+  - The planner and `fleet serve` take a quantized cache with flash attention
+    (`--cache-type q8_0 --flash-attn on`) and parallel slots, sized as llama.cpp
+    sizes them.
+  - Qwen3.8 27B (Q4_K_XL) ran with a 128k context, q4_0 cache, over one PS5 and an
+    RTX 3080. With a q8_0 cache, 80k fits.
+- Manual layer splits in the planner (`layer_counts`). A split can have one node.
 
 ### Changed
+- The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
+  (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
+  every worker over the network.
 - **Qwen vision models get a narrow ubatch**: a model with a Qwen projector (`clip.projector_type`
   `qwen*`) plans `-ub 256`, `-b 1280` and `--image-max-tokens 1280` instead of the 2048 ubatch,
   and keeps 0.5 GiB of headroom for photos. llama.cpp needs a whole image in one ubatch only for
