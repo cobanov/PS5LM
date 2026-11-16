@@ -34,6 +34,9 @@ existing path, so a history that was really changed is read again as before.
   prompt renders it again and stops matching at the same token.
 - Completion tasks with cache_prompt only; not a child task, a decision, an
   alora, or a slot or prompt with media.
+- A reply cut off by max_tokens is left to the existing path: the slot holds a
+  reply less its last token, so its tokens end inside the text that comes back
+  and the comparison up to the end-of-turn token does not apply.
 - prompt_tokens in the usage then counts the kept tokens, a token or two away
   from what tokenising the rendered prompt gives.
 - LLAMA_REPLY_AS_GENERATED=0 turns it off.

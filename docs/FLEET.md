@@ -624,9 +624,11 @@ changes in the API. For a client:
 - A parked key stays in append mode after such a turn, and its token list is
   the slot's, not the rendered one.
 - A message that was really changed is read again from the change, as before.
-- A reply cut off by `max_tokens` and returned without streaming is not
-  covered: the server trims the cut-off content it returns, so what comes
-  back is a different text.
+- A reply cut off by `max_tokens` is not covered. The slot holds every reply
+  less its last token, which a normal reply never shows (the end-of-turn
+  token) and a cut-off one does, so the slot's tokens end inside the text
+  that comes back. Such a reply is still read again when it has one of the
+  two differences, as before the patch.
 
 `LLAMA_REPLY_AS_GENERATED=0` in the server's environment turns it off. The log
 line is `previous reply kept as generated: the prompt differs at N, ...`.
