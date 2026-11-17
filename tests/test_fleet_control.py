@@ -558,7 +558,8 @@ class FleetTests(unittest.TestCase):
         self.fleet.add_device(ps5())
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
                 patch.object(devices, 'restart', return_value=True) as restart, \
-                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'), \
+                patch.object(self.fleet, '_wait_gone', return_value=True):
             self.fleet.update_device('ps5-a', dict(screen=True))
             (job,) = self.finished()
         self.assertEqual(job['state'], 'done', job)
@@ -587,7 +588,8 @@ class FleetTests(unittest.TestCase):
         device = self.fleet.device('ps5-a')
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
                 patch.object(devices, 'restart', return_value=True) as restart, \
-                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'), \
+                patch.object(self.fleet, '_wait_gone', return_value=True):
             self.fleet._ensure_worker(device, replica)
         restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 0))
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker', busy=True)), \
@@ -652,12 +654,46 @@ class FleetTests(unittest.TestCase):
                 patch.object(devices, 'restart', return_value=False), \
                 patch.object(devices, 'leave_worker', return_value='restarted') as leave, \
                 patch.object(devices, 'make_worker', return_value=True) as make, \
-                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'):
+                patch.object(self.fleet, '_wait_port', return_value=True), patch.object(control.time, 'sleep'), \
+                patch.object(self.fleet, '_wait_gone', return_value=True):
             answer = self.fleet.device_action('ps5-a', 'restart')
             (job,) = self.finished()
         self.assertEqual((job['id'], job['state']), (answer['job']['id'], 'done'))
         leave.assert_called_once_with('192.168.50.21')
         make.assert_called_once_with('192.168.50.21', 30052, devices.worker_env(False, 0))
+
+    def test_a_worker_restart_waits_for_the_old_worker_to_go(self):
+        # The old worker goes on accepting for a moment after it took the request, so
+        # its open port is not the restarted worker's: the wait is for the port to
+        # close (refused, not merely silent) and then to open.
+        self.fleet.add_device(ps5())
+        answers = iter(['open', 'open', 'silent', 'refused', 'refused', 'open'])
+        seen = []
+
+        def probe(address, port, timeout=0.6):
+            seen.append(next(answers))
+            return seen[-1]
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'restart', return_value=True), \
+                patch.object(devices, 'port_probe', probe), patch.object(control.time, 'sleep'):
+            self.fleet.device_action('ps5-a', 'restart')
+            (job,) = self.finished()
+        self.assertEqual(job['state'], 'done', job)
+        self.assertEqual(seen, ['open', 'open', 'silent', 'refused', 'refused', 'open'])
+        self.assertIn('stopped answering after', job['result'])
+
+    def test_a_worker_never_seen_closed_is_reported(self):
+        # A port that stays open through the whole watch may be the old worker's:
+        # the restart still returns when it accepts, and its result says so.
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'restart', return_value=True), \
+                patch.object(devices, 'port_probe', return_value='open'), \
+                patch.object(control, 'WORKER_GONE_SECONDS', 0.05):
+            self.fleet.device_action('ps5-a', 'restart')
+            (job,) = self.finished()
+        self.assertEqual(job['state'], 'done', job)
+        self.assertIn('not seen closed', job['result'])
 
     def test_clear_cache(self):
         self.fleet.add_device(ps5())

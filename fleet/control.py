@@ -96,6 +96,7 @@ CACHE_CHECK_SECONDS = 60   # how often a console's weight cache is listed (FTP)
 LIMITS = dict(devices=1024, pools=64, replicas=256)
 REPLICA_PORTS = range(18100, 19100)
 LOAD_TIMEOUT = dict(rpc=1800, direct=900, app=900, server=0)
+WORKER_GONE_SECONDS = 30   # how long a worker asked to restart may go on accepting before the wait gives up on it
 MASK = 'set'               # how the page and `ctl export` show a key that is set
 _ID = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 _DEVICE = re.compile(r'[A-Za-z]{2,16}[0-9]{0,2}')
@@ -662,10 +663,20 @@ class Fleet:
                 raise ControlError(f'{name}: PS5LM did not take the request to become a worker again')
         with self.lock:
             self.env_pending.discard(name)
-        time.sleep(2)   # the old worker can answer for a moment after it took the request
+        # The old worker goes on accepting for some seconds after it took the request,
+        # so an open port is not yet the restarted worker's: a host that connected
+        # then lost the worker under it, or found nothing listening a moment later.
+        # Wait for the port to close first, then for the new worker to listen.
+        asked = time.monotonic()
+        gone = self._wait_gone(address, port, WORKER_GONE_SECONDS, replica)
+        closed = time.monotonic()
         if not self._wait_port(address, port, 150, replica):
             raise ControlError(f'{name} did not come back as a worker in 150 s')
-        return f'worker restarted on {address}:{port}'
+        if not gone:
+            return (f'worker restarted on {address}:{port} (its port was not seen closed in '
+                    f'{WORKER_GONE_SECONDS} s, so the old worker may still be the one answering)')
+        return (f'worker restarted on {address}:{port} (stopped answering after {closed - asked:.1f} s, '
+                f'listening again {time.monotonic() - closed:.1f} s later)')
 
     def remove_device(self, device_id):
         self.device(device_id)
@@ -1034,6 +1045,18 @@ class Fleet:
             replica.port, replica.url = port, f'http://127.0.0.1:{port}'
             replica.deadline = time.time() + LOAD_TIMEOUT[replica.via]
             self._set(replica, 'starting', detail)
+
+    def _wait_gone(self, address, port, timeout, replica=None):
+        """Wait until nothing listens on a port: True once a connection is refused.
+        No answer does not count: a listener whose queue is full is silent too."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if devices.port_probe(address, port, 1) == 'refused':
+                return True
+            if replica is not None and replica.cancel.is_set():
+                return False
+            time.sleep(0.25)
+        return False
 
     def _wait_port(self, address, port, timeout, replica=None):
         deadline = time.monotonic() + timeout

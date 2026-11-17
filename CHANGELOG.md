@@ -214,6 +214,12 @@ v0.1.x are the upstream payload releases by cobanov.
   graphs it used last on each device and tells the worker to free the others.
   Both the host build and the title need the patch; either alone behaves as
   before.
+- **A worker restart waits for the restarted worker**: the control server took the
+  worker port accepting as the restart being over, but the old worker goes on
+  accepting for some seconds after it takes the request. A host started right after
+  `ctl device restart --wait` could then find nothing listening and stop with
+  `Failed to connect`. The wait is now for the port to close and then to open, and
+  the job's result gives both times.
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
   submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
   lock held; each blocked print made the next one due, so generation stayed stopped until the app
