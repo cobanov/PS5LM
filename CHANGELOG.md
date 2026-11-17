@@ -131,6 +131,23 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
+  chat template renders an assistant message's thinking only after the last user message, so the
+  next user message rendered the turn before it differently and the cache no longer matched: on the
+  console, a 37k-token chat took 190 s before its answer started. llama.cpp keeps the thinking of
+  earlier turns by default (`--reasoning-preserve`) for templates that support it; Qwen3.5's
+  template ignored it, and now honours it (`patches/0013`, in the same place llama.cpp already
+  fixes up other templates): a message has its thinking block wherever it is in the history, and
+  only when it has thinking. A client that sends the thinking back keeps it in the context; Open
+  WebUI without a provider set sends none, and its turns render as Qwen3.5 sees past turns, with no
+  block. `--no-reasoning-preserve` (or `LLAMA_ARG_REASONING_PRESERVE=false` in `env.txt`) restores
+  the template's own behaviour. Measured on the console with the template as shipped, a 4.7k-token
+  agent turn followed by a new message processed all 4,684 tokens again in 10.5 s; with the thinking
+  kept, 52 tokens in 0.2 s; in an Open WebUI chat, a follow-up after an 8.4k-token agent turn
+  processed 37 tokens in 0.2 s. Keeping an empty block on every earlier turn instead made Qwen3.5
+  leave its visible reply empty in 4 of 6 Open WebUI follow-ups, so no empty block is rendered.
+  `tests/test-chat.cpp` checks that a new message only appends and that no empty block is rendered.
+  From @MCsumz's fork, [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix).
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
   submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
   lock held; each blocked print made the next one due, so generation stayed stopped until the app
