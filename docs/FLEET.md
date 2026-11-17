@@ -686,6 +686,13 @@ budget nor a grammar keep the whole chain on the worker, as before.
 `LLAMA_BACKEND_SAMPLING_CHECKS=0` in the server's environment turns it off.
 Only the host changes; a worker needs no new build.
 
+`LLAMA_BACKEND_SAMPLING_CHECKS=verify` is for testing a host build on a
+worker: every token chosen from the candidates is chosen again on the whole
+vocabulary's scores of the same pass, with a copy of the chain, and the
+timings add `... N of those tokens chosen again on the full logits, M
+differed`. M must be 0. It fetches the vocabulary for every token, so it is as
+slow as sampling on the host.
+
 ## Control server
 
 ```sh
@@ -953,7 +960,7 @@ worker, and compares token ids: reasoning budgets that are hit, grammars
 sampled hot enough to reject tokens, a lazy grammar beside a budget, greedy
 and seeded, two slots at once, and requests the patch leaves alone. It checks
 that the budget ends the reasoning at the same token and what each server
-logged. With `PS5LM_PARK_TEST_MODEL` it also compares chat replies with a
+logged, and a third server in `verify` mode must report no token that differs. With `PS5LM_PARK_TEST_MODEL` it also compares chat replies with a
 budget and a tool, streamed and not.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes

@@ -164,6 +164,8 @@ v0.1.x are the upstream payload releases by cobanov.
   first active sampler (no logit bias or penalties before it), no mirostat, token
   probabilities or speculative decoding; otherwise, and with
   `LLAMA_BACKEND_SAMPLING_CHECKS=0`, a request is sampled on the host as before.
+  `LLAMA_BACKEND_SAMPLING_CHECKS=verify` chooses every token both ways and counts
+  the ones that differ, for testing a build on a worker.
   `tests/server_backend_sampling_test.py` checks it
   ([FLEET.md](docs/FLEET.md#sampling-on-the-worker)).
 - **A reply sent back is not read again** (`patches/0017`): a chat client sends the
