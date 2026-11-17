@@ -43,6 +43,12 @@ if [[ ${1:-} == --rpc ]]; then
         python3 tests/server_reply_as_generated_test.py --build "$out" --model "$PS5LM_PARK_TEST_MODEL" \
             --output build/server-reply-as-generated-model
     fi
+    python3 tests/server_backend_sampling_test.py --build "$out"
+    # the same as chat requests with a reasoning budget and a tool, on the named model
+    if [[ -n ${PS5LM_PARK_TEST_MODEL:-} ]]; then
+        python3 tests/server_backend_sampling_test.py --build "$out" --model "$PS5LM_PARK_TEST_MODEL" \
+            --output build/server-backend-sampling-model
+    fi
     python3 tests/server_kv_rotation_test.py --build "$out"
     python3 tests/server_kq_mask_test.py --build "$out"
 elif [[ $# != 0 ]]; then
