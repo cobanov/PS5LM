@@ -685,6 +685,7 @@ struct Models {
                 dirs.push_back(d);
             }
         }
+        const std::string disk_cache_dir = data_path("cache/prompts");
         for (const auto & path : find_models(dirs)) {
             const ModelInfo m = read_model_info(path);
             ModelRow row;
@@ -696,7 +697,9 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, kPromptUbatch,
+                                      settings.disk_cache.c_str(), settings.disk_cache_mib,
+                                      disk_cache_dir.c_str(), settings.introspect);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -720,9 +723,15 @@ struct Models {
     }
 
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
-    std::vector<std::string> args_for(const std::string & path, Live & model_part) {
+    std::vector<std::string> args_for(const std::string & path, Live & model_part, bool * disable_introspect = nullptr) {
+        const std::string disk_cache_dir = data_path("cache/prompts");
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), kPromptUbatch,
+                                  settings.disk_cache.c_str(), settings.disk_cache_mib,
+                                  disk_cache_dir.c_str(), settings.introspect);
+        if (disable_introspect) {
+            *disable_introspect = p.disable_introspect;
+        }
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -1047,6 +1056,7 @@ int main(int, char **) {
         // once, else the default model when Settings asks for it at launch. A
         // plain launch otherwise loads nothing and opens the library.
         Live model_part;
+        bool disable_introspect = false;
         std::vector<std::string> args = read_lines(g_files.args);
         std::string path;
         if (!args.empty()) {
@@ -1071,7 +1081,7 @@ int main(int, char **) {
                 }
             }
             if (!path.empty()) {
-                args = models.args_for(path, model_part);
+                args = models.args_for(path, model_part, &disable_introspect);
             }
         }
         // A projector this llama.cpp cannot read stops the server (#15); the
@@ -1087,10 +1097,13 @@ int main(int, char **) {
         }
         log_memory("before loading");
         if (!args.empty()) {
-            // The introspection API is off unless the setting asks for it. The
-            // server reads LLAMA_INTROSPECT when its thread starts, below. The
-            // setting wins over env.txt, so the row always says what the server does.
-            setenv("LLAMA_INTROSPECT", models.settings.introspect ? "1" : "0", 1);
+            // The introspection API is off unless the setting asks for it, or the
+            // tight overflow plan needs its 256 MiB buffer to fit the model on GPU.
+            const bool use_introspect = models.settings.introspect && !disable_introspect;
+            if (models.settings.introspect && disable_introspect) {
+                ps5lm::log_line("disabling introspection API (-256 MiB) so %s fits safely on GPU\n", base_name(path).c_str());
+            }
+            setenv("LLAMA_INTROSPECT", use_introspect ? "1" : "0", 1);
             models.start(path, args, stats, model_part);
         } else {
             stats.set_state(ServerState::no_model);
@@ -1295,7 +1308,9 @@ int main(int, char **) {
             const Settings was = models.settings;
             models.settings = dash.settings();
             save_settings(g_files.settings.c_str(), models.settings);
-            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type
+                || was.disk_cache != models.settings.disk_cache || was.disk_cache_mib != models.settings.disk_cache_mib
+                || was.introspect != models.settings.introspect) {
                 models.rescan(stats);
             }
             ps5lm::log_line("settings saved\n");

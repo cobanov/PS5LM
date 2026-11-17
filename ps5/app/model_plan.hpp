@@ -99,6 +99,7 @@ struct Plan {
     double      state_gib    = 0;
     double      reserve_gib  = 0;   // compute buffers and the CPU side
     double      total_gib    = 0;
+    bool        disable_introspect = false; // dropped 256 MiB introspect budget to fit tight overflow plan
     std::string why;          // one line for the UI
     std::vector<std::string> args;  // full llama-server arguments
 };
@@ -107,7 +108,8 @@ struct Plan {
 // kv_force: one cache type ("f16", "q8_0", "q4_0") instead of the best that fits.
 // ubatch: the prompt batch for a language model (its compute buffers grow with it).
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr,
-                uint32_t ubatch = kPromptUbatch);
+                uint32_t ubatch = kPromptUbatch, const char * disk_cache_mode = "auto", uint32_t disk_cache_mib = 4096,
+                const char * disk_cache_dir = "/data/PS5LM/cache/prompts", bool introspect = false);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

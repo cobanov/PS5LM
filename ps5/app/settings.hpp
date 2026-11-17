@@ -13,8 +13,10 @@ namespace ps5lm {
 struct Settings {
     bool        auto_load = false;  // load default_model at launch
     std::string default_model;      // a path from the library, or empty
-    uint32_t    ctx_cap   = 65536;  // the planner's longest context
-    std::string kv_type   = "auto"; // "auto", "f16", "q8_0" or "q4_0"
+    uint32_t    ctx_cap        = 65536;  // the planner's longest context
+    std::string kv_type        = "auto"; // "auto", "f16", "q8_0" or "q4_0"
+    std::string disk_cache     = "auto"; // "auto" (switch to disk near full VRAM), "on", "off"
+    uint32_t    disk_cache_mib = 4096;   // prompt/KV spillover cache limit on SSD in MiB
     bool        sounds    = true;
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     bool        introspect = false;  // POST /v1/introspect: raw logits and activations (off by default)
