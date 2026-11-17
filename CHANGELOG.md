@@ -148,6 +148,24 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
+  (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
+  scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
+  reasoning budget or a tool-call grammar switched that off for the request ("backend
+  sampling is not compatible with reasoning budget, disabling"), and every agent
+  request has both: a PS5 wrote 16.3 tokens a second that way against 18.8 without
+  the budget. For such a request the worker now returns the top-k plus one candidate
+  and the host runs its chain, the budget and the grammar on those. The whole
+  vocabulary is fetched only for a token the budget forces, a token the grammar
+  rejects, and two equal scores among the candidates. The tokens are the ones host
+  sampling gives for the same seed. On a CPU worker with Qwen3.5-0.8B a token cost
+  184 bytes from the worker instead of 993,288, and 19,179 of 19,354 tokens of
+  budget-and-tools replies never needed more. It needs a top-k of at most 1024 as the
+  first active sampler (no logit bias or penalties before it), no mirostat, token
+  probabilities or speculative decoding; otherwise, and with
+  `LLAMA_BACKEND_SAMPLING_CHECKS=0`, a request is sampled on the host as before.
+  `tests/server_backend_sampling_test.py` checks it
+  ([FLEET.md](docs/FLEET.md#sampling-on-the-worker)).
 - **A reply sent back is not read again** (`patches/0017`): a chat client sends the
   previous reply back as a message, and the template and the tokeniser do not always
   give the tokens the model wrote. The same text can be split into other tokens
