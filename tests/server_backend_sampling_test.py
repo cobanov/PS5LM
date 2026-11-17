@@ -7,7 +7,7 @@ sampling is not compatible with ..., disabling") and fetched the scores of the w
 With the patch the worker keeps the top-k and the host does the rest; the whole vocabulary is fetched only for a
 token the budget forces, a token the grammar rejects, and equal scores among the candidates.
 
-Two servers of the same build, each with its own CPU ggml-rpc-server: one with LLAMA_BACKEND_SAMPLING_CHECKS=0
+Servers of the same build, each with its own CPU ggml-rpc-server: one with LLAMA_BACKEND_SAMPLING_CHECKS=0
 (sampling on the host, as before the patch) and one without. The same requests go to both:
 
   budget     reasoning budgets of 0 to 12 tokens, started by the <think> tokens the model writes, and hit:
@@ -21,6 +21,8 @@ Two servers of the same build, each with its own CPU ggml-rpc-server: one with L
   logs       the patched server never says "disabling" for a request the patch covers and reports how many
              tokens came from the worker's top-k; the other says it for every such request
   bytes      what the host receives from the worker for a reply, from the server's own count of rows fetched
+  verify     a third server with LLAMA_BACKEND_SAMPLING_CHECKS=verify chooses every token from the candidates and
+             again on the full scores of the same pass, alone and on two slots at once: none may differ
 
 The model is an untrained recurrent fixture with one token per character, so only token ids are compared, not
 words. With --model the budget and tool-call cases also run as chat requests on a real GGUF (Qwen3.5-0.8B has
@@ -42,6 +44,7 @@ from make_fleet_fixture import ROOT, make_recurrent_fixture
 MARKERS = ("<think>", "</think>")
 STATS = re.compile(r"backend sampling with host checks: (\d+) tokens from the backend's top-k, (\d+) from the full logits "
                    r"\((\d+) forced by the reasoning budget, (\d+) for the grammar, (\d+) equal logits, (\d+) other\)")
+VERIFIED = re.compile(r"backend sampling with host checks: (\d+) of those tokens chosen again on the full logits, (\d+) differed")
 DISABLING = "backend sampling is not compatible with"
 SWARM = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "repeat_penalty": 1.0}
 HOT = {"temperature": 2.5, "top_k": 20, "top_p": 1.0, "min_p": 0.0, "repeat_penalty": 1.0}
@@ -106,7 +109,7 @@ class Server:
         return len(rows), dict(zip(("top_k", "full", "forced", "grammar", "equal", "other"), total))
 
 
-def fixture_cases(off, on, report):
+def fixture_cases(off, on, check, report):
     (think,), (end,) = on.ids("<think>"), on.ids("</think>")
     letters = {on.ids(chr(c))[0]: chr(c) for c in range(97, 123)}
 
@@ -210,6 +213,23 @@ def fixture_cases(off, on, report):
     report["tokens_from_top_k"], report["tokens_from_full_logits"] = stats["top_k"], stats["full"]
     report["full_logits_by_cause"] = {k: stats[k] for k in ("forced", "grammar", "equal", "other")}
 
+    # verify: the third server chooses every token twice, from the candidates and on the full scores of the same
+    # pass, and counts the ones that differ; alone and two slots at once
+    requests = [dict(prompt=prompt, n=60, seed=400 + k, reasoning_budget_tokens=6, **BUDGET, **SWARM) for k in range(2)]
+    requests += [dict(prompt=prompt, n=60, seed=410, reasoning_budget_tokens=5, **BUDGET, **LAZY, **SWARM),
+                 dict(prompt=plain, n=40, seed=411, grammar=GRAMMAR, **HOT)]
+    for request in requests:
+        assert check.complete(**request) == on.complete(**request)
+    threads = [threading.Thread(target=lambda k=k: check.complete(slot=k, **requests[k])) for k in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    verified = VERIFIED.findall(check.log_text())
+    n_verified, n_differed = sum(int(v) for v, _ in verified), sum(int(d) for _, d in verified)
+    assert len(verified) == 6 and n_verified > 100 and n_differed == 0, (len(verified), n_verified, n_differed)
+    report["verified_tokens"], report["verified_tokens_that_differed"] = n_verified, n_differed
+
 
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city.",
           "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}]
@@ -244,22 +264,41 @@ def chat(server, question, budget, seed, sampling, stream=False):
     return reasoning or None, content or None, [tuple(calls[k]) for k in sorted(calls)], None
 
 
-def real_cases(off, on, report):
-    question = "Call the get_weather tool for Paris for 3 days."
+QUESTION = "Call the get_weather tool for Paris for 3 days."
+REAL_REQUESTS = [(stream, sampling, seed, budget) for stream in (False, True)
+                 for sampling, seed in ((GREEDY, 1), (SWARM, 11), (SWARM, 12)) for budget in (16, 1024)]
+
+
+def real_replies(server):
+    """The twelve chat replies of one server, each on a slot that holds nothing of the request before
+    (cache_prompt is off), so every server reads every prompt the same way."""
+    replies = [chat(server, QUESTION, budget, seed, sampling, stream) for stream, sampling, seed, budget in REAL_REQUESTS]
+    # how long the reasoning of each reply is, in tokens
+    return replies, [len(server.ids(reply[0] or "")) for reply in replies]
+
+
+def real_cases(build, output, model, report):
+    """One server at a time (a real model is not small): switched off, patched, then verify."""
+    def served(name, env):
+        with ExitStack() as stack:
+            server = Server(build, output, name, model, 1, env).start(stack)
+            replies, lengths = real_replies(server)
+            return server, replies, lengths
+
+    off, expected, _ = served("off", {"LLAMA_BACKEND_SAMPLING_CHECKS": "0"})
+    on, replies, lengths = served("on", {})
+    check, checked, _ = served("verify", {"LLAMA_BACKEND_SAMPLING_CHECKS": "verify"})
+
     n_calls = 0
-    for stream in (False, True):
-        for sampling, seed in ((GREEDY, 1), (SWARM, 11), (SWARM, 12)):
-            for budget in (16, 1024):
-                a = chat(off, question, budget, seed, sampling, stream)
-                b = chat(on, question, budget, seed, sampling, stream)
-                assert a == b, f"chat stream={stream} seed={seed} budget={budget}:\n  host sampling {a}\n  patched       {b}"
-                for _, arguments in b[2]:
-                    json.loads(arguments)
-                    n_calls += 1
-                if budget == 16:
-                    # the reasoning is 16 tokens; the reply carries it trimmed, which can cost a whitespace token
-                    n = len(on.ids(b[0] or ""))
-                    assert 14 <= n <= 16, (n, b[0])
+    for request, a, b, c, n in zip(REAL_REQUESTS, expected, replies, checked, lengths):
+        assert a == b, f"chat {request}:\n  host sampling {a}\n  patched       {b}"
+        assert a == c, f"chat {request}:\n  host sampling {a}\n  verify        {c}"
+        for _, arguments in b[2]:
+            json.loads(arguments)
+            n_calls += 1
+        if request[3] == 16:
+            # the reasoning is 16 tokens; the reply carries it trimmed, which can cost a whitespace token
+            assert 14 <= n <= 16, (n, b[0])
     assert n_calls > 0, "no reply called the tool"
     n_rows, stats = on.stats()
     assert n_rows == 12 and DISABLING not in on.log_text(), n_rows
@@ -267,6 +306,12 @@ def real_cases(off, on, report):
     assert stats["forced"] > 0 and stats["other"] == 0 and stats["top_k"] > 20 * stats["full"], stats
     report.update(chat_replies_compared=12, tool_calls=n_calls, tokens_from_top_k=stats["top_k"], tokens_from_full_logits=stats["full"],
                   full_logits_by_cause={k: stats[k] for k in ("forced", "grammar", "equal", "other")})
+
+    # verify: every token was chosen twice, from the candidates and on the full scores of the same pass
+    verified = VERIFIED.findall(check.log_text())
+    n_verified, n_differed = sum(int(v) for v, _ in verified), sum(int(d) for _, d in verified)
+    assert len(verified) == 12 and n_verified > 500 and n_differed == 0, (len(verified), n_verified, n_differed)
+    report["verified_tokens"], report["verified_tokens_that_differed"] = n_verified, n_differed
 
 
 def run(build, output, model):
@@ -276,11 +321,15 @@ def run(build, output, model):
         if not binary.is_file():
             raise FileNotFoundError(f"{binary}; first run scripts/build-fleet-host.sh")
     report = {}
-    with ExitStack() as stack:
-        slots = 1 if model else 2
-        off = Server(build, output, "off", model, slots, {"LLAMA_BACKEND_SAMPLING_CHECKS": "0"}).start(stack)
-        on = Server(build, output, "on", model, slots, {}).start(stack)
-        (real_cases if model else fixture_cases)(off, on, report)
+    if model:
+        real_cases(build, output, model, report)
+    else:
+        # the fixture is a few hundred kilobytes: three servers side by side
+        with ExitStack() as stack:
+            off = Server(build, output, "off", None, 2, {"LLAMA_BACKEND_SAMPLING_CHECKS": "0"}).start(stack)
+            on = Server(build, output, "on", None, 2, {}).start(stack)
+            check = Server(build, output, "verify", None, 2, {"LLAMA_BACKEND_SAMPLING_CHECKS": "verify"}).start(stack)
+            fixture_cases(off, on, check, report)
     result = dict(status="passed", scope="Linux CPU TCP RPC only; no PS5",
                   model=str(model) if model else "untrained recurrent fixture, one token per character", **report)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
