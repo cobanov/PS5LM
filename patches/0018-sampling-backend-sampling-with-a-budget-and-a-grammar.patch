@@ -775,7 +775,7 @@ diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -914,6 +914,22 @@
+@@ -1052,6 +1052,22 @@
                  "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                  llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
  
@@ -798,7 +798,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
          const int32_t n_draft_total       = stats.n_draft_tokens;
          const int32_t n_draft_accepted    = stats.n_draft_accepted;
          const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
-@@ -2207,6 +2223,11 @@
+@@ -2345,6 +2361,11 @@
  
          // initialize samplers
          if (task.need_sampling()) {
@@ -810,7 +810,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
              try {
                  slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
              } catch (std::exception & e) {
-@@ -2227,7 +2248,12 @@
+@@ -2365,7 +2386,12 @@
  
              // TODO: tmp until backend sampling is fully implemented
              if (use_backend_sampling) {
