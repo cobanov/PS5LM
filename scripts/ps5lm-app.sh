@@ -11,6 +11,7 @@
 #   scripts/ps5lm-app.sh press <button>      press a button (up, down, cross, l1, r1, ...)
 #   scripts/ps5lm-app.sh fetch <url>         probe: download over HTTPS (system TLS), see app.log
 #   scripts/ps5lm-app.sh bench-write         probe: write speed by method, see app.log
+#   scripts/ps5lm-app.sh bench-park [GiB]    probe: sustained writes the way parked state is written (4 GiB), see app.log
 #   scripts/ps5lm-app.sh memory              log the memory pools now, see app.log
 #   scripts/ps5lm-app.sh bench-read <file>   probe: sequential and random read speed of a model file, see app.log
 #   scripts/ps5lm-app.sh bench-memory        probe: the pools and the largest block that allocates, see app.log
@@ -80,6 +81,7 @@ case ${1:-} in
     unload) request unload ;;
     fetch) request fetch "${2:?https URL}" ;;
     bench-write) request bench-write ;;
+    bench-park) request bench-park "${2:-4}" ;;
     memory) request memory ;;
     bench-read) request bench-read "${2:?a model file on the console, several GiB}" ;;
     bench-memory) request bench-memory ;;
@@ -90,5 +92,5 @@ case ${1:-} in
     deploy) deploy ;;
     launch) launch ;;
     cycle) close; deploy; launch ;;
-    *) echo "usage: $0 close|deploy|launch|cycle|screenshot|load|unload|press|fetch|bench-write|bench-read|bench-memory|memory|search" >&2; exit 2 ;;
+    *) echo "usage: $0 close|deploy|launch|cycle|screenshot|load|unload|press|fetch|bench-write|bench-park|bench-read|bench-memory|memory|search" >&2; exit 2 ;;
 esac
