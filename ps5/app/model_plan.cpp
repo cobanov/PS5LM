@@ -351,7 +351,15 @@ const Preset * find_preset(const ModelInfo & m) {
     return nullptr;
 }
 
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch) {
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch,
+                const char * disk_cache_mode, uint32_t disk_cache_mib, const char * disk_cache_dir) {
+    if (kv_force && (*kv_force == '\0' || std::strcmp(kv_force, "auto") == 0)) {
+        kv_force = nullptr;
+    }
+    std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "off";
+    if (dmode != "auto" && dmode != "on" && dmode != "off") {
+        dmode = "off";
+    }
     Plan p;
     const Preset * preset = find_preset(m);
     if (preset && preset->max_ctx) {
@@ -425,16 +433,20 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         }
     }
 
-    char why[160];
+    char why[192];
     if (!p.fits) {
         p.total_gib = p.weights_gib + p.state_gib + p.reserve_gib;
         std::snprintf(why, sizeof(why), "needs %.1f GiB with a 4k context; %.1f GiB is free", p.total_gib, budget_gib);
         p.why = why;
         return p;
     }
-    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s: %.1f of %.1f GiB",
+    const double headroom_gib = std::max(0.0, budget_gib - p.total_gib);
+    const bool disk_enabled = m.decision.empty() && disk_cache_dir && *disk_cache_dir && disk_cache_mib > 0 &&
+                              (dmode == "on" || (dmode == "auto" && headroom_gib < 0.75));
+    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s%s: %.1f of %.1f GiB",
                   m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
-                  p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
+                  p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", disk_enabled ? " + disk" : "",
+                  p.total_gib, budget_gib);
     p.why = why;
 
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
@@ -445,6 +457,9 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
                "-ctxcp", "1", "-cram", "0",
                "--host", "0.0.0.0", "--port", "8081" };
+    if (disk_enabled) {
+        p.args.insert(p.args.end(), { "--cache-disk", disk_cache_dir, "--cache-disk-mib", std::to_string(disk_cache_mib) });
+    }
     if (!m.mmproj.empty()) {
         p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
     }
