@@ -166,6 +166,14 @@ v0.1.x are the upstream payload releases by cobanov.
   leave its visible reply empty in 4 of 6 Open WebUI follow-ups, so no empty block is rendered.
   `tests/test-chat.cpp` checks that a new message only appends and that no empty block is rendered.
   From @MCsumz's fork, [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix).
+- **A fleet worker no longer loses memory with every prompt batch**: llama.cpp's
+  RPC server kept a copy of every graph a host sent (about 4 MiB for a 27B
+  model) until 1,024 had come, and a host sends a new one for nearly every batch
+  of a prompt. A console serving Qwen3.8-27B lost 7.5 to 9 MiB per 1,000 prompt
+  tokens and died after about 175K. `patches/fleet/0006`: the host keeps the 8
+  graphs it used last on each device and tells the worker to free the others.
+  Both the host build and the title need the patch; either alone behaves as
+  before.
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
   submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
   lock held; each blocked print made the next one due, so generation stayed stopped until the app
