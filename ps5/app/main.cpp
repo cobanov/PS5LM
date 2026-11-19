@@ -696,7 +696,8 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, kPromptUbatch,
+                                      settings.disk_cache.c_str(), settings.disk_cache_mib);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -722,7 +723,8 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), kPromptUbatch,
+                                  settings.disk_cache.c_str(), settings.disk_cache_mib);
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -1374,7 +1376,8 @@ int main(int, char **) {
             const Settings was = models.settings;
             models.settings = dash.settings();
             save_settings(g_files.settings.c_str(), models.settings);
-            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
+                was.disk_cache != models.settings.disk_cache || was.disk_cache_mib != models.settings.disk_cache_mib) {
                 models.rescan(stats);
             }
             ps5lm::log_line("settings saved\n");
