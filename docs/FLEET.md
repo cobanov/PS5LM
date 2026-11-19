@@ -282,6 +282,11 @@ The free memory the worker reports to the host, on one PS5 on 11.60:
 |---|---|
 | With its screen | 11,854 MiB |
 | Without it | 12,217 MiB |
+| Without it, with the 256 MiB flexible pool ([CONSOLE.md](CONSOLE.md#the-native-app-on-the-gpu)) | 12,409 MiB |
+
+For Qwen3.8-27B-UD-Q4_K_XL split over that PS5 and an RTX 3080, llama.cpp's own
+projection (`llama-fit-params`) then fits a 192k context with a q4_0 cache, where
+160k fit before.
 
 ### The weight cache
 
