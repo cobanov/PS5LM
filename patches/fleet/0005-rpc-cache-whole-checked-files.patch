@@ -1,0 +1,152 @@
+Subject: [PATCH] rpc: the weight cache keeps whole files and checks them
+
+With a cache directory (rpc-server -c, or the PS5 worker's), the server saved a
+tensor straight to its final name and read any file of that name back as the
+tensor. A write cut short (a full disk, a crash, power lost) left a file that
+was later loaded as the weights, without an error. Now a file is written under
+a temporary name and renamed once whole, and a file is used only when its
+FNV-1a hash is the one the client sent and it fits the tensor's buffer;
+anything else is a miss, dropped, and sent again. A used file gets the time of
+its use, so a cache kept to a size can drop the least recently used first.
+Files are read through an 8 MiB buffer: a PS5 title's every read call takes
+about 1.4 ms, so the stream's small reads came to about 120 MB/s, slower than
+gigabit Ethernet; 8 MiB reads run at 2 GB/s.
+
+On a PS5, the console slows a title's own writes to /data to about 1.2 MB/s
+after the first 2 GB (PS5LM #41), while ftpsrv, a payload, writes at 80 MB/s
+and more: the first load of a model through the worker's cache would have
+taken about half an hour. A title that defines ps5lm_rpc_cache_write (PS5LM
+does) writes each file with it; -1 is "not cached this time", for a title
+without ftpsrv, which says why once instead of an error for every tensor. Other
+builds do not define it and write the files themselves.
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -27,6 +27,12 @@
+ 
+ namespace fs = std::filesystem;
+ 
++// PS5LM: a PS5 title's own writes to /data slow to about 1.2 MB/s after 2 GB, so
++// the title writes the cache's files through ftpsrv (ps5/app/rpc_cache_writer.cpp):
++// 1 written, 0 failed, -1 not cached this time (the title says why, once). Other
++// builds do not define it and write the files themselves.
++extern "C" __attribute__((weak)) int ps5lm_rpc_cache_write(const char * path, const void * data, size_t size);
++
+ // macro for nicer error messages on server crash
+ #define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+ 
+@@ -1424,7 +1430,7 @@
+ 
+ private:
+     void sync_all_backends();
+-    bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
++    bool get_cached_file(uint64_t hash, size_t max_size, std::vector<uint8_t> & data);
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+     ggml_tensor * create_node(uint64_t id,
+                               struct ggml_context * ctx,
+@@ -1743,11 +1749,38 @@
+         uint64_t hash = fnv_hash((const uint8_t*)data, size);
+         char hash_str[17];
+         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+-        // save to cache_dir/hash_str
++        // save to cache_dir/hash_str: written under a temporary name and renamed
++        // once whole, so a cut write (a full disk, a crash, power lost) never
++        // leaves a file that names a tensor it does not hold
+         fs::path cache_file = fs::path(cache_dir) / hash_str;
+-        std::ofstream ofs(cache_file, std::ios::binary);
+-        ofs.write((const char *)data, size);
+-        LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
++        char part_str[48];
++        snprintf(part_str, sizeof(part_str), "%s.%016" PRIx64 ".part", hash_str,
++                 (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count());
++        fs::path part_file = fs::path(cache_dir) / part_str;
++        std::error_code ec;
++        int written = 0;
++        if (ps5lm_rpc_cache_write) {
++            written = ps5lm_rpc_cache_write(part_file.string().c_str(), data, size);
++        } else {
++            std::ofstream ofs(part_file, std::ios::binary);
++            ofs.write((const char *)data, size);
++            ofs.close();
++            written = ofs ? 1 : 0;
++        }
++        if (written == 1) {
++            fs::rename(part_file, cache_file, ec);
++        } else {
++            ec = std::make_error_code(std::errc::io_error);
++        }
++        if (ec) {
++            const std::string why = ec.message();
++            fs::remove(part_file, ec);
++            if (written != -1) {
++                LOG_ERROR("[%s] could not save '%s' (%s); not cached\n", __func__, cache_file.string().c_str(), why.c_str());
++            }
++        } else {
++            LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
++        }
+     }
+     ggml_backend_tensor_set(tensor, data, offset, size);
+     return true;
+@@ -1815,7 +1848,7 @@
+     return true;
+ }
+ 
+-bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
++bool rpc_server::get_cached_file(uint64_t hash, size_t max_size, std::vector<uint8_t> & data) {
+     if (!cache_dir) {
+         return false;
+     }
+@@ -1826,12 +1859,31 @@
+     if (!fs::exists(cache_file, ec)) {
+         return false;
+     }
+-    std::ifstream ifs(cache_file, std::ios::binary);
+-    ifs.seekg(0, std::ios::end);
+-    size_t size = ifs.tellg();
+-    ifs.seekg(0, std::ios::beg);
+-    data.resize(size);
+-    ifs.read((char *)data.data(), size);
++    // used only when it holds what the client hashed: a file cut short, changed,
++    // or bigger than the room in the tensor's buffer is a miss and is dropped
++    // (the client then sends the data, and it is saved again)
++    const uintmax_t size = fs::file_size(cache_file, ec);
++    FILE * f = std::fopen(cache_file.string().c_str(), "rb");
++    if (f == nullptr) {
++        return false;   // gone since (a cache kept to a size dropped it): a miss
++    }
++    // in 8 MiB reads: a PS5 title's every read call takes about 1.4 ms, so a
++    // stream's small reads came to about 120 MB/s, and 8 MiB ones read 2 GB/s
++    std::setvbuf(f, nullptr, _IOFBF, 8u << 20);
++    bool ok = !ec && size > 0 && size <= max_size;
++    if (ok) {
++        data.resize((size_t) size);
++        ok = std::fread(data.data(), 1, data.size(), f) == data.size() && fnv_hash(data.data(), data.size()) == hash;
++    }
++    std::fclose(f);
++    if (!ok) {
++        LOG_ERROR("[%s] '%s' does not hold the tensor it names; dropped\n", __func__, cache_file.string().c_str());
++        data.clear();
++        fs::remove(cache_file, ec);
++        return false;
++    }
++    // the time of its last use, so a cache kept to a size can drop the least recently used
++    fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec);
+     return true;
+ }
+ 
+@@ -1852,8 +1904,13 @@
+         return false;
+     }
+ 
++    // the most a cached file can hold: from the tensor's data to the end of its
++    // buffer (the bounds are checked again below)
++    const size_t buf_start = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
++    const size_t buf_end   = buf_start + ggml_backend_buffer_get_size(tensor->buffer);
++    const size_t dst       = request.tensor.data + request.offset;
+     std::vector<uint8_t> cached_file;
+-    if (!get_cached_file(request.hash, cached_file)) {
++    if (!get_cached_file(request.hash, dst >= buf_start && dst < buf_end ? buf_end - dst : 0, cached_file)) {
+         LOG_DBG2("[%s] tensor: %s, offset: %" PRIu64 ", hash: 0x%" PRIx64 ", cache miss\n",
+                 __func__, rpc_log_format_tensor(tensor).c_str(), request.offset, request.hash);
+         response.result = 0;
