@@ -1,0 +1,101 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index aab602a..42e8421 100755
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -27,6 +27,7 @@
+ #include <cinttypes>
+ #include <exception>
+ #include <memory>
++#include <new>
+ #include <filesystem>
+ #include <random>
+ #include <utility>
+@@ -3440,6 +3441,12 @@ private:
+         for (auto & slot : slots) {
+             try {
+                 callback(slot);
++            } catch (const std::bad_alloc & e) {
++                SLT_ERR(slot, "got exception: %s\n", e.what());
++                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
++                slot.prompt_clear();
++                introspect_capture.clear();
++                slot.release();
+             } catch (const std::exception & e) {
+                 SLT_ERR(slot, "got exception: %s\n", e.what());
+                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+@@ -3452,6 +3459,12 @@ private:
+         for (auto & slot : slots) {
+             try {
+                 callback(*slot);
++            } catch (const std::bad_alloc & e) {
++                SLT_ERR(*slot, "got exception: %s\n", e.what());
++                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
++                slot->prompt_clear();
++                introspect_capture.clear();
++                slot->release();
+             } catch (const std::exception & e) {
+                 SLT_ERR(*slot, "got exception: %s\n", e.what());
+                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+@@ -3464,9 +3477,11 @@ private:
+         for (auto & slot : slots) {
+             if (slot.is_processing()) {
+                 send_error(slot, reason, ERROR_TYPE_SERVER);
++                slot.prompt_clear();
+                 slot.release();
+             }
+         }
++        introspect_capture.clear();
+     }
+ 
+     // @ngxson : for debugging only
+@@ -3660,6 +3675,18 @@ private:
+                     // try again with the updated n_batch
+                     continue;
+                 }
++            } catch (const std::bad_alloc & e) {
++                if (n_tokens > 1) {
++                    try_clear_idle_slots();
++                    introspect_capture.clear();
++                    n_batch = std::max<int32_t>(1, n_tokens / 2);
++                    SRV_WRN("batch.render/decode hit std::bad_alloc (%s), retrying with smaller batch size, off = %d, n_batch = %d\n",
++                            e.what(), off, n_batch);
++                    continue;
++                }
++                SRV_ERR("decode() failed: %s\n", e.what());
++                abort_all_slots("decode() failed: " + std::string(e.what()));
++                break; // stop any further processing
+             } catch (const std::exception & e) {
+                 SRV_ERR("decode() failed: %s\n", e.what());
+                 abort_all_slots("decode() failed: " + std::string(e.what()));
+@@ -4708,12 +4735,26 @@ private:
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+-        queue_tasks.yield_to_queue([&]() {
+-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+-            if (ret == 0 && has_output) {
+-                llama_synchronize(ctx_tgt);
++        try {
++            queue_tasks.yield_to_queue([&]() {
++                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++                if (ret == 0 && has_output) {
++                    llama_synchronize(ctx_tgt);
++                }
++            });
++        } catch (const std::bad_alloc & e) {
++            const int32_t active_batch = std::min<int32_t>(n_batch, batch.view.size());
++            if (active_batch > 1) {
++                try_clear_idle_slots();
++                introspect_capture.clear();
++                n_batch = std::max<int32_t>(1, active_batch / 2);
++                SRV_WRN("decode hit std::bad_alloc (%s), retrying with smaller batch size, off = %d, n_batch = %d\n",
++                        e.what(), off, n_batch);
++                return false;
+             }
+-        });
++            introspect_capture.clear();
++            throw;
++        }
+ 
+         if (ret != 0) {
+             {
