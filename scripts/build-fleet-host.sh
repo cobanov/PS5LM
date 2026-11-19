@@ -29,11 +29,12 @@ fi
 for patch in "$root"/patches/*.patch "$root"/patches/fleet/*.patch; do
     git -C "$llama" apply --reverse --check "$patch" 2>/dev/null || git -C "$llama" apply "$patch"
 done
-# patches/0007's request hooks are weak and only the PS5 title defines them; ELF
-# linkers leave them null, Apple's ld must be told they may stay undefined.
+# patches/0007's request hooks and patches/fleet/0005's cache writer are weak
+# and only the PS5 title defines them; ELF linkers leave them null, Apple's ld
+# must be told they may stay undefined.
 link_flags=()
 if [ "$(uname -s)" = Darwin ]; then
-    link_flags=("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-U,_ps5lm_activity_begin -Wl,-U,_ps5lm_activity_data -Wl,-U,_ps5lm_activity_end")
+    link_flags=("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-U,_ps5lm_activity_begin -Wl,-U,_ps5lm_activity_data -Wl,-U,_ps5lm_activity_end -Wl,-U,_ps5lm_rpc_cache_write")
 fi
 "$cmake_bin" -S "$llama" -B "$out" -G Ninja "${link_flags[@]}" \
     -DCMAKE_MAKE_PROGRAM="$(command -v "$ninja_bin")" \

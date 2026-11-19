@@ -27,9 +27,11 @@ def add_tokenizer(writer):
     return tokens
 
 
-def make_fixture(path: Path, head_dim: int = 8) -> Path:
+def make_fixture(path: Path, head_dim: int = 8, ffn: int = 0) -> Path:
     """4 query and 2 KV heads of head_dim. A head_dim of 64 or more lets llama.cpp rotate a
-    quantized KV cache (Hadamard), which the default of 8 does not."""
+    quantized KV cache (Hadamard), which the default of 8 does not.
+    `ffn` widens the feed-forward tensors (0: 8 * head_dim): 98304 makes each 12 MiB, over the
+    10 MiB from which the RPC client offers a tensor's hash to a worker's cache."""
     import numpy as np
     import gguf
 
@@ -37,7 +39,7 @@ def make_fixture(path: Path, head_dim: int = 8) -> Path:
     writer = gguf.GGUFWriter(path, "llama")
     writer.add_name("PS5LM deterministic fleet test fixture; untrained")
     writer.add_context_length(256)
-    embd, kv, ff = 4 * head_dim, 2 * head_dim, 8 * head_dim
+    embd, kv, ff = 4 * head_dim, 2 * head_dim, ffn or 8 * head_dim
     writer.add_embedding_length(embd)
     writer.add_block_count(4)
     writer.add_feed_forward_length(ff)
