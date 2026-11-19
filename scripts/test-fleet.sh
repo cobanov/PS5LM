@@ -25,6 +25,7 @@ if [[ ${1:-} == --rpc ]]; then
     "${CMAKE:-cmake}" -E env CTEST_OUTPUT_ON_FAILURE=1 \
         "$(dirname "$(command -v "${CMAKE:-cmake}")")/ctest" --test-dir "$out" -R '^test-rpc-multi-server$'
     python3 tests/fleet_rpc_no_comm_test.py --binary "$out/bin/ggml-rpc-server"
+    python3 tests/fleet_rpc_graph_free_test.py --binary "$out/bin/ggml-rpc-server"
     python3 tests/fleet_rpc_smoke.py --build "$out"
     python3 tests/fleet_rpc_cache_test.py --build "$out"
     python3 tests/server_system_messages_test.py --build "$out"
