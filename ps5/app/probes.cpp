@@ -3,6 +3,7 @@
 #include "log.hpp"
 
 #include "fetch.hpp"
+#include "ftp_writer.hpp"
 #include "storage.hpp"
 
 #include <fcntl.h>
@@ -91,6 +92,122 @@ void probe_write() {
         }
     }
     ps5lm::log_line("write-bench done\n");
+}
+
+namespace {
+
+void park_probe_memory(const char * when) {
+#ifdef __PROSPERO__
+    const int64_t pool = sceKernelGetDirectMemorySize();
+    int64_t start = 0;
+    size_t largest = 0, flex = 0, flex_free = 0;
+    sceKernelAvailableDirectMemorySize(0, pool, 2u << 20, &start, &largest);
+    sceKernelConfiguredFlexibleMemorySize(&flex);
+    sceKernelAvailableFlexibleMemorySize(&flex_free);
+    ps5lm::log_line("park-bench memory %s: largest free direct block %.1f MiB, flexible %zu MiB free of %zu\n", when,
+                    largest / 1048576.0, flex_free >> 20, flex >> 20);
+#else
+    (void) when;
+#endif
+}
+
+// Every 8 MiB piece is marked with its number, so a read-back knows what it should hold.
+void park_probe_fill(std::vector<char> & buf, uint64_t piece) {
+    uint64_t x = 0x9e3779b97f4a7c15ull * (piece + 1);
+    for (size_t i = 0; i + 8 <= buf.size(); i += 4096) {
+        x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+        std::memcpy(buf.data() + i, &x, 8);
+    }
+}
+
+}  // namespace
+
+// Probe: the write path of parked state, sustained (scripts/ps5lm-app.sh
+// bench-park [GiB]). One line per GiB, so a slowdown part of the way shows.
+void probe_park(std::string gib) {
+    const long asked = std::strtol(gib.c_str(), nullptr, 10);
+    const uint64_t total = (uint64_t) (asked >= 1 && asked <= 64 ? asked : 4) << 30;
+    const size_t piece = 8u << 20;
+    std::vector<char> buf(piece, 'p'), back(piece);
+    park_probe_memory("before");
+    for (const std::string & dir : { data_root(), std::string("/mnt/usb0"), std::string("/mnt/ext0") }) {
+        struct stat st = {};
+        if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            ps5lm::log_line("park-bench %s: not there\n", dir.c_str());
+            continue;
+        }
+        const std::string path = dir + "/park-bench.tmp";
+        for (const bool ftp : { true, false }) {
+            if (!ftp && dir == data_root()) {
+                continue;  // known: a title's own writes to /data fall to about 1.2 MB/s after 2 GB (#41)
+            }
+            const char * how = ftp ? "ftpsrv 8M" : "write 8M";
+            unlink(path.c_str());
+            FtpWriter   writer;
+            std::string error;
+            int         fd = -1;
+            bool        ok = true;
+            if (ftp) {
+                ok = connect_ftp_writer(writer, error) && writer.begin(path, 0, error);
+            } else {
+                fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                ok = fd >= 0;
+            }
+            uint64_t done = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto t_gib = t0;
+            bool slow = false;
+            while (ok && !slow && done < total) {
+                park_probe_fill(buf, done / piece);
+                ok = ftp ? writer.send(buf.data(), piece, error) : write(fd, buf.data(), piece) == (ssize_t) piece;
+                done += ok ? piece : 0;
+                if (ok && done % (1ull << 30) == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double s = std::chrono::duration<double>(now - t_gib).count();
+                    ps5lm::log_line("park-bench %s %s: GiB %llu at %.1f MB/s\n", dir.c_str(), how,
+                                    (unsigned long long) (done >> 30), s > 0 ? (1ull << 30) / 1e6 / s : 0.0);
+                    slow = !ftp && s > 0 && (1ull << 30) / 1e6 / s < 5.0;
+                    t_gib = now;
+                }
+            }
+            if (ftp) {
+                ok = ok && writer.end(error);  // true once ftpsrv confirmed the whole file
+            } else if (fd >= 0) {
+                ok = ok && fsync(fd) == 0;
+                close(fd);
+            }
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            ps5lm::log_line("park-bench %s %s: %s, %.2f GiB in %.1f s, %.1f MB/s%s%s%s\n", dir.c_str(), how,
+                            ok ? (slow ? "stopped (under 5 MB/s)" : "ok") : "failed", done / 1073741824.0, s,
+                            s > 0 ? done / 1e6 / s : 0.0, ok ? "" : ": ", ok ? "" : (ftp ? error.c_str() : strerror(errno)),
+                            ftp && ok ? ", confirmed by ftpsrv" : "");
+            // Read back in 8 MiB reads, as a restore reads, and checked.
+            if (ok && done > 0) {
+                const int rd = open(path.c_str(), O_RDONLY);
+                uint64_t got_all = 0, wrong = 0;
+                const auto r0 = std::chrono::steady_clock::now();
+                while (rd >= 0 && got_all < done) {
+                    const ssize_t got = read(rd, back.data(), piece);
+                    if (got != (ssize_t) piece) {
+                        break;
+                    }
+                    park_probe_fill(buf, got_all / piece);
+                    wrong += std::memcmp(buf.data(), back.data(), piece) != 0;
+                    got_all += piece;
+                }
+                const double rs = std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count();
+                ps5lm::log_line("park-bench %s read back 8M: %.2f GiB in %.1f s, %.0f MB/s, %llu of %llu pieces wrong\n", dir.c_str(),
+                                got_all / 1073741824.0, rs, rs > 0 ? got_all / 1e6 / rs : 0.0, (unsigned long long) wrong,
+                                (unsigned long long) (done / piece));
+                if (rd >= 0) {
+                    close(rd);
+                }
+            }
+            unlink(path.c_str());
+        }
+    }
+    park_probe_memory("after");
+    ps5lm::log_line("park-bench done\n");
 }
 
 // The read probe's pieces, on one thread or several: random offsets in the

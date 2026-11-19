@@ -1,0 +1,359 @@
+Subject: [PATCH] llama: a sequence's state in parts, the tensor data left on the device
+
+llama_state_seq_park_get/set write and read one part of a sequence's state,
+the attention cells or the recurrent state, with the tensor data handed to a
+callback range by range instead of copied through the caller: the caller keeps
+only the small part (cell positions, layout) and leaves the data where it is
+(ggml_backend_rpc_park).
+
+- The attention part takes a position: only the cells at and after it are
+  written, so a caller that saved a conversation before writes what was added
+  since. Set with append adds such cells to those the sequence already holds.
+- The recurrent part is whole: it has a fixed size and cannot be extended. The
+  callback is told how much of the small part comes before each tensor, so a
+  caller that writes both in that order after llama_state_seq_park_header has
+  written a context checkpoint without holding it.
+- For the hybrid, attention-only and recurrent-only memories; the others
+  answer that they have no parts.
+
+diff --git a/include/llama.h b/include/llama.h
+index 3af6e22..924d155 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -952,6 +952,52 @@ extern "C" {
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+ 
++    // PS5LM device parking. A sequence's state in parts, with the tensor data handed to the caller range by
++    // range instead of copied: the caller leaves it where it is, on the device (ggml_backend_rpc_park), and
++    // keeps only the small part (cell positions, layout) that these write to dst and read from src.
++    //   LLAMA_STATE_PARK_ATTN  the attention cells at positions >= pos_min. Set with append adds the cells to
++    //                          those the sequence already holds (at lower positions); without, it replaces them.
++    //   LLAMA_STATE_PARK_RECR  the recurrent state, whole (it has a fixed size and cannot be extended).
++    // llama_state_seq_park_parts: a bit per part this context's memory has, 0 when it cannot be parked.
++    // get: dst == NULL only measures. Returns the size of the small part, 0 on failure; *n_tensor_bytes gets
++    //      the bytes handed to tensor_fn.
++    // set: returns the bytes of src used, 0 on failure. After a failure the sequence holds no usable state:
++    //      the caller clears it.
++    // tensor_fn returns false to stop; the call then fails. meta_pos is how many bytes of the small part
++    // come before this tensor range: a caller that writes them in that order, after the 8 bytes of
++    // llama_state_seq_park_header, has written what llama_state_seq_get_data_ext gives for a state that
++    // is recurrent only (a context checkpoint), without the data passing through it.
++#define LLAMA_STATE_PARK_ATTN 0
++#define LLAMA_STATE_PARK_RECR 1
++
++    typedef bool (*llama_state_park_tensor_fn)(void * user_data, struct ggml_tensor * tensor, size_t offset, size_t size, size_t meta_pos);
++
++    LLAMA_API uint32_t llama_state_seq_park_parts(struct llama_context * ctx);
++
++    // The 8 bytes a sequence state from llama_state_seq_get_data_ext starts with.
++    LLAMA_API size_t llama_state_seq_park_header(struct llama_context * ctx, llama_seq_id seq_id, uint8_t * dst);
++
++    LLAMA_API size_t llama_state_seq_park_get(
++            struct llama_context * ctx,
++                    llama_seq_id   seq_id,
++                             int   part,
++                       llama_pos   pos_min,
++                         uint8_t * dst,
++                          size_t   size,
++      llama_state_park_tensor_fn   tensor_fn,
++                            void * user_data,
++                          size_t * n_tensor_bytes);
++
++    LLAMA_API size_t llama_state_seq_park_set(
++            struct llama_context * ctx,
++                    llama_seq_id   dest_seq_id,
++                             int   part,
++                            bool   append,
++                   const uint8_t * src,
++                          size_t   size,
++      llama_state_park_tensor_fn   tensor_fn,
++                            void * user_data);
++
+     //
+     // Decoding
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ca84fc4..1bf8837 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,9 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-recurrent.h"
++#include "llama-kv-cache.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -3415,6 +3418,165 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+ 
+ static constexpr uint32_t io_magic = 0xaf143cd8;
+ 
++// PS5LM device parking: the small parts of a state go to a host buffer and the tensor data to a callback,
++// which leaves it on the device. With no buffer the writer only measures.
++class llama_io_write_park : public llama_io_write_i {
++public:
++    llama_io_write_park(uint8_t * p, size_t len, llama_state_park_tensor_fn fn, void * user_data)
++        : ptr(p), buf_size(len), fn(fn), user_data(user_data) {}
++
++    void write(const void * src, size_t size) override {
++        if (ptr != nullptr) {
++            if (size > buf_size) {
++                throw std::runtime_error("unexpectedly reached end of buffer");
++            }
++            memcpy(ptr, src, size);
++            ptr += size;
++            buf_size -= size;
++        }
++        size_written += size;
++    }
++
++    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        if (ptr != nullptr && size > 0 && !fn(user_data, tensor, offset, size, size_written)) {
++            throw std::runtime_error("the tensor data could not be parked");
++        }
++        size_tensors += size;
++    }
++
++    size_t n_bytes() override {
++        return size_written;
++    }
++
++    size_t n_tensor_bytes() const {
++        return size_tensors;
++    }
++
++private:
++    uint8_t * ptr;
++    size_t buf_size = 0;
++    size_t size_written = 0;
++    size_t size_tensors = 0;
++    llama_state_park_tensor_fn fn;
++    void * user_data;
++};
++
++class llama_io_read_park : public llama_io_read_i {
++public:
++    llama_io_read_park(const uint8_t * p, size_t len, llama_state_park_tensor_fn fn, void * user_data)
++        : ptr(p), buf_size(len), fn(fn), user_data(user_data) {}
++
++    void read(void * dst, size_t size) override {
++        if (size > buf_size) {
++            throw std::runtime_error("unexpectedly reached end of buffer");
++        }
++        memcpy(dst, ptr, size);
++        ptr += size;
++        buf_size -= size;
++        size_read += size;
++    }
++
++    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        if (size > 0 && !fn(user_data, tensor, offset, size, size_read)) {
++            throw std::runtime_error("the parked tensor data could not be loaded");
++        }
++    }
++
++    size_t n_bytes() override {
++        return size_read;
++    }
++
++private:
++    const uint8_t * ptr;
++    size_t buf_size = 0;
++    size_t size_read = 0;
++    llama_state_park_tensor_fn fn;
++    void * user_data;
++};
++
++// the attention cells and the recurrent state of a memory that can be parked in parts
++static bool llama_park_split(llama_memory_i * memory, llama_kv_cache *& attn, llama_memory_recurrent *& recr) {
++    attn = nullptr;
++    recr = nullptr;
++    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
++        attn = hybrid->get_mem_attn();
++        recr = hybrid->get_mem_recr();
++    } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
++        attn = kv;
++    } else if (auto * rs = dynamic_cast<llama_memory_recurrent *>(memory)) {
++        recr = rs;
++    }
++    return attn != nullptr || recr != nullptr;
++}
++
++uint32_t llama_context::state_seq_park_parts() {
++    llama_kv_cache * attn;
++    llama_memory_recurrent * recr;
++    llama_park_split(memory.get(), attn, recr);
++    return (attn ? 1u << LLAMA_STATE_PARK_ATTN : 0) | (recr ? 1u << LLAMA_STATE_PARK_RECR : 0);
++}
++
++size_t llama_context::state_seq_park_get(llama_seq_id seq_id, int part, llama_pos pos_min, uint8_t * dst, size_t size,
++                                         llama_state_park_tensor_fn tensor_fn, void * user_data, size_t * n_tensor_bytes) {
++    llama_kv_cache * attn;
++    llama_memory_recurrent * recr;
++    llama_park_split(memory.get(), attn, recr);
++
++    llama_io_write_park io(dst, size, tensor_fn, user_data);
++    try {
++        if (part == LLAMA_STATE_PARK_ATTN && attn) {
++            attn->state_park(pos_min, false);
++            try {
++                attn->state_write(io, seq_id, 0);
++            } catch (...) {
++                attn->state_park(0, false);
++                throw;
++            }
++            attn->state_park(0, false);
++        } else if (part == LLAMA_STATE_PARK_RECR && recr) {
++            recr->state_write(io, seq_id, 0);
++        } else {
++            return 0;
++        }
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error parking state: %s\n", __func__, err.what());
++        return 0;
++    }
++    if (n_tensor_bytes) {
++        *n_tensor_bytes = io.n_tensor_bytes();
++    }
++    return io.n_bytes();
++}
++
++size_t llama_context::state_seq_park_set(llama_seq_id seq_id, int part, bool append, const uint8_t * src, size_t size,
++                                         llama_state_park_tensor_fn tensor_fn, void * user_data) {
++    llama_kv_cache * attn;
++    llama_memory_recurrent * recr;
++    llama_park_split(memory.get(), attn, recr);
++
++    llama_io_read_park io(src, size, tensor_fn, user_data);
++    try {
++        if (part == LLAMA_STATE_PARK_ATTN && attn) {
++            attn->state_park(0, append);
++            try {
++                attn->state_read(io, seq_id, 0);
++            } catch (...) {
++                attn->state_park(0, false);
++                throw;
++            }
++            attn->state_park(0, false);
++        } else if (part == LLAMA_STATE_PARK_RECR && recr) {
++            recr->state_read(io, seq_id, 0);
++        } else {
++            return 0;
++        }
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error loading parked state: %s\n", __func__, err.what());
++        return 0;
++    }
++    return io.n_bytes();
++}
++
+ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+     try {
+@@ -4590,6 +4752,30 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+     return ctx->state_seq_set_data(seq_id, src, size, flags);
+ }
+ 
++size_t llama_state_seq_park_header(llama_context * /*ctx*/, llama_seq_id seq_id, uint8_t * dst) {
++    memcpy(dst, &io_magic, sizeof(io_magic));
++    memcpy(dst + sizeof(io_magic), &seq_id, sizeof(seq_id));
++    return sizeof(io_magic) + sizeof(seq_id);
++}
++
++uint32_t llama_state_seq_park_parts(llama_context * ctx) {
++    return ctx->state_seq_park_parts();
++}
++
++size_t llama_state_seq_park_get(llama_context * ctx, llama_seq_id seq_id, int part, llama_pos pos_min, uint8_t * dst, size_t size,
++                                llama_state_park_tensor_fn tensor_fn, void * user_data, size_t * n_tensor_bytes) {
++    ctx->synchronize();
++
++    return ctx->state_seq_park_get(seq_id, part, pos_min, dst, size, tensor_fn, user_data, n_tensor_bytes);
++}
++
++size_t llama_state_seq_park_set(llama_context * ctx, llama_seq_id seq_id, int part, bool append, const uint8_t * src, size_t size,
++                                llama_state_park_tensor_fn tensor_fn, void * user_data) {
++    ctx->synchronize();
++
++    return ctx->state_seq_park_set(seq_id, part, append, src, size, tensor_fn, user_data);
++}
++
+ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..ebe554c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -165,6 +165,13 @@ struct llama_context {
+     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
++    // PS5LM device parking (llama.h)
++    uint32_t state_seq_park_parts();
++    size_t   state_seq_park_get(llama_seq_id seq_id, int part, llama_pos pos_min, uint8_t * dst, size_t size,
++                                llama_state_park_tensor_fn tensor_fn, void * user_data, size_t * n_tensor_bytes);
++    size_t   state_seq_park_set(llama_seq_id seq_id, int part, bool append, const uint8_t * src, size_t size,
++                                llama_state_park_tensor_fn tensor_fn, void * user_data);
++
+     bool state_load_file(
+             const char * filepath,
+            llama_token * tokens_out,
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 6f0e3f7..1f98ed3 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2102,6 +2102,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+             add_cell = add_cell && !cells.is_empty(i);
+             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+ 
++            // PS5LM device parking: only the cells added since the last save (state_park)
++            add_cell = add_cell && (seq_id == -1 || park_pos_min <= 0 || cells.pos_get(i) >= park_pos_min);
++
+             // check the cell is not SWA-masked
+             if (add_cell && seq_id != -1) {
+                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+@@ -2368,7 +2371,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+             return false;
+         }
+ 
+-        seq_rm(dest_seq_id, -1, -1);
++        // PS5LM device parking: a later part of a state parked in pieces joins the cells already restored
++        if (!park_append) {
++            seq_rm(dest_seq_id, -1, -1);
++        }
+ 
+         llama_batch_allocr balloc(hparams.n_pos_per_embd());
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9bfb8f2..8088a62 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -151,6 +151,14 @@ public:
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+ 
++    // PS5LM device parking (llama_state_seq_park_get/set): while set, state_write() of one sequence writes only
++    // its cells at positions >= pos_min, and state_read() into one sequence with append adds the cells to
++    // those it holds instead of replacing them. The caller sets (0, false) again afterwards.
++    void state_park(llama_pos pos_min, bool append) {
++        park_pos_min = pos_min;
++        park_append  = append;
++    }
++
+     //
+     // llama_kv_cache specific API
+     //
+@@ -346,6 +354,9 @@ private:
+         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
+     };
+ 
++    llama_pos park_pos_min = 0;
++    bool      park_append  = false;
++
+     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
+     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+ 

@@ -962,10 +962,21 @@ int main(int, char **) {
         } else if (fleet.state == FleetWorkerConfig::enabled) {
             log_cache(prune_rpc_cache(cache, true), "at start");
         }
+        // Parked state: on unless env.txt says PS5LM_PARK_GB=0. The RPC server
+        // keeps the folder to its size itself (it knows which key is in use).
+        const RpcPark park = rpc_park_config(getenv("PS5LM_PARK_GB"), "/data/PS5LM/park");
+        if (!park.error.empty()) {
+            ps5lm::log_line("fleet: %s\n", park.error.c_str());
+        } else if (park.dir.empty()) {
+            ps5lm::log_line("fleet: no parked state (PS5LM_PARK_GB=0 in env.txt)\n");
+        } else {
+            ps5lm::log_line("fleet: parked state in %s, up to %u GiB, now %.2f GiB\n", park.dir.c_str(), park.gib,
+                            folder_bytes(park.dir) / 1073741824.0);
+        }
         std::atomic<bool> stopped{ false };
         std::string worker_error = fleet.error;
         std::function<void()> worker = [&] {
-            worker_error = run_fleet_worker(fleet, cache);
+            worker_error = run_fleet_worker(fleet, cache, park);
             std::printf("ps5lm-fleet: %s\n", worker_error.c_str());
             stopped.store(true, std::memory_order_release);
         };
@@ -1022,6 +1033,13 @@ int main(int, char **) {
                 // (fleet's memory request, with a model loaded by the host).
                 // The pool figures only; asking ggml here could race the worker.
                 log_memory(n == 120 ? "worker started" : "worker asked", false);
+            }
+            // The write path parked state takes, measured beside a running worker
+            // (scripts/ps5lm-app.sh bench-park [GiB]).
+            if (n % 60 == 40) {
+                if (std::string g = take_request_file("/data/PS5LM/bench-park"); !g.empty()) {
+                    std::thread(probe_park, g).detach();
+                }
             }
             // Every 30 s: what the host's loads saved goes over the limit until then.
             if (n % 1800 == 900 && !cache.dir.empty() && !failed) {
@@ -1469,6 +1487,8 @@ int main(int, char **) {
                 std::thread(probe_fetch, u).detach();
             } else if (!take_request_file(data_path("bench-write")).empty()) {
                 std::thread(probe_write).detach();
+            } else if (std::string g = take_request_file(data_path("bench-park")); !g.empty()) {
+                std::thread(probe_park, g).detach();
             } else if (!take_request_file(data_path("memory")).empty()) {
                 log_memory("asked");  // scripts/bench-ubatch.py: what a prompt left allocated
             } else if (std::string f = take_request_file(data_path("bench-read")); !f.empty()) {

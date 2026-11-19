@@ -26,9 +26,7 @@ if [ "$actual" != "$expected" ]; then
 fi
 # Keep the same patch set on the controller and the PS5 title (scripts/build-app.sh
 # applies patches/fleet too), with no protocol fork.
-for patch in "$root"/patches/*.patch "$root"/patches/fleet/*.patch; do
-    git -C "$llama" apply --reverse --check "$patch" 2>/dev/null || git -C "$llama" apply "$patch"
-done
+"$root/scripts/apply-patches.sh" "$llama" "$root"/patches/*.patch "$root"/patches/fleet/*.patch
 # patches/0007's request hooks and patches/fleet/0005's cache writer are weak
 # and only the PS5 title defines them; ELF linkers leave them null, Apple's ld
 # must be told they may stay undefined.

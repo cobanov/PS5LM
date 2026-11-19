@@ -1,0 +1,1185 @@
+Subject: [PATCH] rpc: a client parks state in files on the server
+
+A host that serves many conversations on one slot has to keep the state of the
+ones not in it. Fetching it costs the network both ways (2.8 GiB each way for a
+153K history of Qwen3.8-27B, 50 s out and 65 s back at gigabit) and the host's
+memory. RPC_CMD_PARK lets the client leave it on the server's own storage: a
+key is a folder under GGML_RPC_PARK_DIR, and the client appends tensor ranges
+(or bytes of its own) to a file there, loads a file back into tensor ranges,
+lists keys and files, deletes them and asks for the room left (ggml-rpc.h,
+ggml-rpc/park.h).
+
+- A file is written once, in order, under a temporary name and renamed when
+  whole: a reader sees it completely or not at all. The commit answers with its
+  size and a checksum, and a read with the checksum of what was read.
+- Every byte moves through one 8 MiB buffer, in either direction and for any
+  size of state: a PS5 worker has about 70 MiB to spare.
+- The folder is kept under GGML_RPC_PARK_GB (default 128) and the disk above
+  GGML_RPC_PARK_RESERVE_GB free (default 16, where the system says how much is
+  free): before a write the keys used longest ago are dropped, never one with
+  a file open and never the one restored last. The server keeps the order of
+  use itself, in the file .used of the folder, as a save or a restore happens:
+  a PS5's file times move when a key is saved and not when it is read, so by
+  them a small save dropped a 100K-token state that had been restored minutes
+  before.
+- Files are read with open() and read(): the console's libc reads a stream
+  without a buffer a byte per call.
+- A title that defines ps5lm_rpc_park_write (PS5LM does) writes the files with
+  it: a PS5 title's own writes slow to about 1.2 MB/s after 2 GB.
+- A server with a park folder sets bit 1 in the fourth byte of its HELLO answer
+  (bit 0 is GRAPH_FREE). A client sends the command only to such a server, as
+  an older one drops a client whose command it does not know; an older client
+  never sends it. A park command that fails answers with a status and does not
+  drop the client.
+- GGML_RPC_PARK_DIE_AT=ext:bytes ends the server in the middle of a file, for
+  the test of that.
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index ecf0a3a..684abd0 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -30,6 +30,79 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
++// PS5LM device parking: a client keeps the state of a conversation in files on
++// the worker's own storage (ggml-rpc/park.h) instead of fetching it. A key is a
++// folder; each file in it is written once, in order, and exists only once whole.
++// A worker says in its HELLO answer whether it takes these.
++#define GGML_RPC_PARK_KEY_SIZE  96
++#define GGML_RPC_PARK_FILE_SIZE 32
++#define GGML_RPC_PARK_MAX_DATA  (8u << 20) // the most bytes one command carries either way
++
++enum ggml_rpc_park_op {
++    GGML_RPC_PARK_STAT = 1,     // -> v: free bytes on the disk, bytes parked, the cap, keys
++    GGML_RPC_PARK_LIST,         // arg: first key; size: room in bytes -> ggml_rpc_park_key_entry[]; v: entries, keys in all
++    GGML_RPC_PARK_LIST_FILES,   // key; arg: first file; size: room -> ggml_rpc_park_file_entry[]; v: entries, files in all
++    GGML_RPC_PARK_DELETE,       // key, file ("" = the whole key) -> v: bytes freed, 1 if it was there
++    GGML_RPC_PARK_WRITE_BEGIN,  // key, file; size: bytes to come (to make room) -> v: keys dropped to make room
++    GGML_RPC_PARK_WRITE_TENSOR, // tensor, offset, size: appends that range of the tensor
++    GGML_RPC_PARK_WRITE_DATA,   // size + that many bytes: appends them
++    GGML_RPC_PARK_WRITE_COMMIT, // the file takes its name -> v: its size, its checksum
++    GGML_RPC_PARK_WRITE_ABORT,
++    GGML_RPC_PARK_READ_BEGIN,   // key, file; offset: where to start -> v: the file's size
++    GGML_RPC_PARK_READ_TENSOR,  // tensor, offset, size: the next size bytes go to that range of the tensor
++    GGML_RPC_PARK_READ_DATA,    // size -> the next size bytes
++    GGML_RPC_PARK_READ_END,     // -> v: bytes read, their checksum
++};
++
++enum ggml_rpc_park_status {
++    GGML_RPC_PARK_OK = 0,
++    GGML_RPC_PARK_BAD,        // a bad name, tensor or order of commands
++    GGML_RPC_PARK_NOT_FOUND,
++    GGML_RPC_PARK_IO,
++    GGML_RPC_PARK_NO_SPACE,   // over the cap or the disk is full, with nothing left to drop
++    GGML_RPC_PARK_NO_WRITER,  // a console without its file writer
++    GGML_RPC_PARK_SHORT,      // the file ends before the bytes asked for
++};
++
++struct ggml_rpc_park_req {
++    uint32_t op;
++    uint32_t flags;
++    char     key[GGML_RPC_PARK_KEY_SIZE];
++    char     file[GGML_RPC_PARK_FILE_SIZE];
++    uint64_t offset;
++    uint64_t size;
++    uint64_t arg;
++};
++
++struct ggml_rpc_park_rsp {
++    int32_t  status;
++    uint32_t pad;
++    uint64_t v[4];
++    char     msg[160];
++};
++
++struct ggml_rpc_park_key_entry {
++    char     key[GGML_RPC_PARK_KEY_SIZE];
++    uint64_t bytes;
++    uint32_t n_files;
++    uint32_t pad;
++    int64_t  mtime;   // its last use, seconds since 1970
++};
++
++struct ggml_rpc_park_file_entry {
++    char     file[GGML_RPC_PARK_FILE_SIZE];
++    uint64_t bytes;
++    int64_t  mtime;
++};
++
++// One command to the worker that holds `tensor`, or with no tensor to `endpoint`.
++// False when that worker has no parking (an older worker, or none set up) or the
++// request cannot be sent as it is; otherwise rsp holds the worker's answer.
++// data_in: the bytes of WRITE_DATA; data_out: room for req->size bytes (READ_DATA, LIST, LIST_FILES).
++GGML_BACKEND_API bool ggml_backend_rpc_park(const char * endpoint, const struct ggml_tensor * tensor,
++                                            const struct ggml_rpc_park_req * req, const void * data_in,
++                                            void * data_out, struct ggml_rpc_park_rsp * rsp);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e8dc5fc..a0d5d70 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -26,6 +26,8 @@
+ #include <algorithm>
+ #include <atomic>
+ 
++#include "park.h"
++
+ namespace fs = std::filesystem;
+ 
+ // PS5LM: a PS5 title's own writes to /data slow to about 1.2 MB/s after 2 GB, so
+@@ -86,6 +88,7 @@ enum rpc_cmd {
+     RPC_CMD_COMM_ALLREDUCE,
+     RPC_CMD_COMM_FREE,
+     RPC_CMD_GRAPH_FREE,
++    RPC_CMD_PARK,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -118,6 +121,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+         case RPC_CMD_GRAPH_FREE:        return "GRAPH_FREE";
++        case RPC_CMD_PARK:              return "PARK";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -141,6 +145,11 @@ const size_t GRAPH_CACHE_MAX = 1024;
+ const uint8_t RPC_FEATURE_GRAPH_FREE = 1;
+ const size_t  GRAPH_CACHE_KEEP       = 8;
+ 
++// PS5LM: a server that sets this bit takes RPC_CMD_PARK (ggml-rpc.h, park.h): it
++// has a folder for parked state. A client sends the command only to such a server,
++// as an older one drops a client that sends a command it does not know.
++const uint8_t RPC_FEATURE_PARK = 2;
++
+ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+@@ -265,6 +274,13 @@ struct rpc_msg_graph_free_req {
+     uint64_t uid;
+ };
+ 
++// followed by req.size bytes for GGML_RPC_PARK_WRITE_DATA; answered with a
++// ggml_rpc_park_rsp, followed by req.size bytes for READ_DATA, LIST and LIST_FILES
++struct rpc_msg_park_req {
++    ggml_rpc_park_req req;
++    rpc_tensor        tensor;
++};
++
+ struct rpc_msg_get_tensor_2d_req {
+     rpc_tensor tensor;
+     uint64_t offset;
+@@ -541,6 +557,9 @@ public:
+ 
+     ~rpc_dispatcher();
+ 
++    // the server takes RPC_CMD_PARK
++    bool park = false;
++
+ private:
+     struct rpc_msg {
+         rpc_cmd                       cmd;
+@@ -683,6 +702,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
+     graph_free = (features & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
++    park = (features & RPC_FEATURE_PARK) != 0;
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+     running = true;
+     thread = std::thread(rpc_dispatcher_trampoline, this);
+@@ -1483,6 +1503,46 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+     *total = response.total_mem;
+ }
+ 
++bool ggml_backend_rpc_park(const char * endpoint, const ggml_tensor * tensor, const ggml_rpc_park_req * req,
++                           const void * data_in, void * data_out, ggml_rpc_park_rsp * rsp) {
++    std::shared_ptr<rpc_dispatcher> dispatcher;
++    if (tensor != nullptr) {
++        if (tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
++            return false;
++        }
++        dispatcher = ((ggml_backend_rpc_buffer_context *) tensor->buffer->context)->dispatcher;
++    } else if (endpoint != nullptr) {
++        dispatcher = get_dispatcher(endpoint);
++    }
++    if (!dispatcher || !dispatcher->park) {
++        return false;
++    }
++    const bool has_in  = req->op == GGML_RPC_PARK_WRITE_DATA;
++    const bool has_out = req->op == GGML_RPC_PARK_READ_DATA || req->op == GGML_RPC_PARK_LIST || req->op == GGML_RPC_PARK_LIST_FILES;
++    if ((has_in || has_out) && (req->size > GGML_RPC_PARK_MAX_DATA || (has_in ? data_in : data_out) == nullptr)) {
++        return false;
++    }
++    const size_t in_size = sizeof(rpc_msg_park_req) + (has_in ? req->size : 0);
++    std::shared_ptr<uint8_t> input(new uint8_t[in_size], std::default_delete<uint8_t[]>());
++    rpc_msg_park_req head;
++    memset(&head, 0, sizeof(head));
++    head.req    = *req;
++    head.tensor = serialize_tensor(tensor);
++    memcpy(input.get(), &head, sizeof(head));
++    if (has_in) {
++        memcpy(input.get() + sizeof(head), data_in, req->size);
++    }
++    if (!has_out) {
++        dispatcher->send(RPC_CMD_PARK, input, in_size, rsp, sizeof(*rsp));
++        return true;
++    }
++    std::vector<uint8_t> output(sizeof(*rsp) + req->size);
++    dispatcher->send(RPC_CMD_PARK, input, in_size, output.data(), output.size());
++    memcpy(rsp, output.data(), sizeof(*rsp));
++    memcpy(data_out, output.data() + sizeof(*rsp), req->size);
++    return true;
++}
++
+ // RPC server-side implementation
+ 
+ class rpc_server {
+@@ -1496,6 +1556,8 @@ public:
+ 
+     void hello(rpc_msg_hello_rsp & response);
+     bool graph_free(const rpc_msg_graph_free_req & request);
++    bool park_cmd(const rpc_msg_park_req & request, size_t payload_size, ggml_rpc_park_rsp & response, size_t & out_size);
++    uint8_t * park_buffer() { return park.buffer(); }
+     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
+     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
+     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
+@@ -1550,6 +1612,8 @@ private:
+     // computed graphs cached per backend, keyed by uid
+     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+     std::vector<comm_state> comm_states;
++    // PS5LM device parking: the files this client parks here
++    ggml_rpc_park::store park;
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+@@ -1557,6 +1621,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
+     response.features = std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr ? RPC_FEATURE_GRAPH_FREE : 0;
++    if (park.enabled()) {
++        response.features |= RPC_FEATURE_PARK;
++    }
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -2378,6 +2445,155 @@ bool rpc_server::graph_free(const rpc_msg_graph_free_req & request) {
+     return true;
+ }
+ 
++// PS5LM device parking (park.h). Every answer is a status: a park command that
++// fails does not drop the client. Tensor data moves between the device and the
++// file through the store's one buffer, PARK_BUF_SIZE at a time, so a save or a
++// load of any size takes no more memory than that. The bytes of WRITE_DATA come
++// in that buffer and the data of an answer leaves in it. False only for a request
++// whose answer would not have the size the client waits for.
++bool rpc_server::park_cmd(const rpc_msg_park_req & request, size_t payload_size, ggml_rpc_park_rsp & rsp, size_t & out_size) {
++    using namespace ggml_rpc_park;
++    ggml_rpc_park_req req = request.req;
++    req.key[sizeof(req.key) - 1]   = '\0';
++    req.file[sizeof(req.file) - 1] = '\0';
++    memset(&rsp, 0, sizeof(rsp));
++    out_size = 0;
++    const bool has_out = req.op == GGML_RPC_PARK_READ_DATA || req.op == GGML_RPC_PARK_LIST || req.op == GGML_RPC_PARK_LIST_FILES;
++    if (has_out) {
++        if (req.size > PARK_BUF_SIZE) {
++            return false;
++        }
++        out_size = req.size;
++        memset(park.buffer(), 0, out_size);
++    }
++    const auto done = [&](int status, const std::string & text) {
++        rsp.status = status;
++        snprintf(rsp.msg, sizeof(rsp.msg), "%s", text.c_str());
++        return true;
++    };
++    if (!park.enabled()) {
++        return done(GGML_RPC_PARK_BAD, "this worker has no folder for parked state");
++    }
++    uint8_t * buf = park.buffer();
++    switch (req.op) {
++        case GGML_RPC_PARK_STAT: {
++            park.stat(rsp.v[0], rsp.v[1], rsp.v[2], rsp.v[3]);
++            return true;
++        }
++        case GGML_RPC_PARK_LIST: {
++            const auto keys = park.keys();
++            auto * out = (ggml_rpc_park_key_entry *) buf;
++            const size_t room = out_size / sizeof(*out);
++            size_t n = 0;
++            for (size_t i = req.arg; i < keys.size() && n < room; i++, n++) {
++                snprintf(out[n].key, sizeof(out[n].key), "%s", keys[i].name.c_str());
++                out[n].bytes   = keys[i].bytes;
++                out[n].n_files = keys[i].n_files;
++                out[n].mtime   = keys[i].mtime;
++            }
++            rsp.v[0] = n;
++            rsp.v[1] = keys.size();
++            return true;
++        }
++        case GGML_RPC_PARK_LIST_FILES: {
++            if (!name_ok(req.key, sizeof(req.key), sizeof(req.key) - 1)) {
++                return done(GGML_RPC_PARK_BAD, "invalid key");
++            }
++            const auto files = park.files(req.key);
++            auto * out = (ggml_rpc_park_file_entry *) buf;
++            const size_t room = out_size / sizeof(*out);
++            size_t n = 0;
++            for (size_t i = req.arg; i < files.size() && n < room; i++, n++) {
++                snprintf(out[n].file, sizeof(out[n].file), "%s", files[i].name.c_str());
++                out[n].bytes = files[i].bytes;
++                out[n].mtime = files[i].mtime;
++            }
++            rsp.v[0] = n;
++            rsp.v[1] = files.size();
++            return true;
++        }
++        case GGML_RPC_PARK_DELETE: {
++            return done(park.remove(req.key, req.file, rsp.v[0], rsp.v[1]), park.error());
++        }
++        case GGML_RPC_PARK_WRITE_BEGIN: {
++            uint32_t n_pruned = 0;
++            const int status = park.write_begin(req.key, req.file, req.size, n_pruned);
++            rsp.v[0] = n_pruned;
++            return done(status, park.error());
++        }
++        case GGML_RPC_PARK_WRITE_DATA: {
++            if (payload_size != req.size) {
++                return done(GGML_RPC_PARK_BAD, "WRITE_DATA without its bytes");
++            }
++            return done(park.write(buf, payload_size), park.error());
++        }
++        case GGML_RPC_PARK_WRITE_COMMIT: {
++            return done(park.write_commit(rsp.v[0], rsp.v[1]), park.error());
++        }
++        case GGML_RPC_PARK_WRITE_ABORT: {
++            park.write_abort();
++            return true;
++        }
++        case GGML_RPC_PARK_READ_BEGIN: {
++            return done(park.read_begin(req.key, req.file, req.offset, rsp.v[0]), park.error());
++        }
++        case GGML_RPC_PARK_READ_DATA: {
++            const int status = park.read(buf, req.size);
++            if (status != GGML_RPC_PARK_OK) {
++                memset(buf, 0, out_size);
++            }
++            return done(status, park.error());
++        }
++        case GGML_RPC_PARK_READ_END: {
++            return done(park.read_end(rsp.v[0], rsp.v[1]), park.error());
++        }
++        case GGML_RPC_PARK_WRITE_TENSOR:
++        case GGML_RPC_PARK_READ_TENSOR: {
++            // a compute still running may be writing the tensor
++            sync_all_backends();
++            struct ggml_init_params params {
++                /*.mem_size   =*/ ggml_tensor_overhead(),
++                /*.mem_buffer =*/ NULL,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context_ptr ctx_ptr { ggml_init(params) };
++            GGML_ASSERT(ctx_ptr != nullptr);
++            ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
++            if (tensor == nullptr || tensor->buffer == nullptr) {
++                return done(GGML_RPC_PARK_BAD, "not a tensor of this worker");
++            }
++            const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
++            const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
++            if (request.tensor.data + req.offset < p0 || request.tensor.data + req.offset >= p1 ||
++                req.size > (p1 - request.tensor.data - req.offset)) {
++                return done(GGML_RPC_PARK_BAD, "tensor range out of its buffer");
++            }
++            const bool writing = req.op == GGML_RPC_PARK_WRITE_TENSOR;
++            for (uint64_t at = 0; at < req.size; ) {
++                const size_t n = (size_t) std::min<uint64_t>(PARK_BUF_SIZE, req.size - at);
++                int status;
++                if (writing) {
++                    ggml_backend_tensor_get(tensor, buf, req.offset + at, n);
++                    status = park.write(buf, n);
++                } else {
++                    status = park.read(buf, n);
++                    if (status == GGML_RPC_PARK_OK) {
++                        ggml_backend_tensor_set(tensor, buf, req.offset + at, n);
++                    }
++                }
++                if (status != GGML_RPC_PARK_OK) {
++                    return done(status, park.error());
++                }
++                at += n;
++            }
++            rsp.v[0] = req.size;
++            return true;
++        }
++        default:
++            return done(GGML_RPC_PARK_BAD, "unknown park command");
++    }
++}
++
+ // graph compute is asynchronous; commands that read or write buffer data synchronize first
+ void rpc_server::sync_all_backends() {
+     for (ggml_backend_t backend : backends) {
+@@ -2886,6 +3102,36 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_PARK: {
++                // not recv_msg: the bytes of a WRITE_DATA go straight to the park buffer
++                uint64_t size;
++                if (!sock->recv_data(&size, sizeof(size))) {
++                    return;
++                }
++                if (size < sizeof(rpc_msg_park_req) || size - sizeof(rpc_msg_park_req) > GGML_RPC_PARK_MAX_DATA) {
++                    LOG_ERROR("PARK request of %" PRIu64 " bytes\n", size);
++                    return;
++                }
++                rpc_msg_park_req request;
++                if (!sock->recv_data(&request, sizeof(request))) {
++                    return;
++                }
++                const size_t payload_size = size - sizeof(request);
++                if (payload_size > 0 && !sock->recv_data(server.park_buffer(), payload_size)) {
++                    return;
++                }
++                ggml_rpc_park_rsp response;
++                size_t out_size = 0;
++                if (!server.park_cmd(request, payload_size, response, out_size)) {
++                    return;
++                }
++                const uint64_t response_size = sizeof(response) + out_size;
++                if (!sock->send_data(&response_size, sizeof(response_size)) || !sock->send_data(&response, sizeof(response)) ||
++                    (out_size > 0 && !sock->send_data(server.park_buffer(), out_size)) || !sock->flush()) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_COMM_INIT: {
+                 rpc_msg_comm_init_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -3285,6 +3531,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++    if (std::strcmp(name, "ggml_backend_rpc_park") == 0) {
++        return (void *)ggml_backend_rpc_park;
++    }
+     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_rpc_comm_init;
+     }
+diff --git a/ggml/src/ggml-rpc/park.h b/ggml/src/ggml-rpc/park.h
+new file mode 100644
+index 0000000..dc60b2a
+--- /dev/null
++++ b/ggml/src/ggml-rpc/park.h
+@@ -0,0 +1,708 @@
++// PS5LM device parking: the files an RPC worker keeps for its clients.
++//
++// A client (llama-server) parks the state of a conversation on the worker's own
++// storage instead of fetching it: for each key a folder of files under
++// GGML_RPC_PARK_DIR, each written once, in order, under a temporary name and
++// renamed when whole, so a reader sees a file completely or not at all. Every
++// byte goes through one buffer of PARK_BUF_SIZE: nothing here grows with the
++// size of the state. The folder is kept under GGML_RPC_PARK_GB (default 128) and
++// the disk above GGML_RPC_PARK_RESERVE_GB free (default 16) by dropping whole
++// keys, least recently used first, never one with a file open and never the one
++// restored last. "Used" is a save or a restore, and the server keeps that order
++// itself, in the file .used of the folder: a PS5's file times move when a key is
++// saved but not when it is read, so by them a neuron restored a minute ago
++// looked older than one saved an hour ago and was dropped for it.
++//
++// A PS5 title's own writes to /data slow to about 1.2 MB/s after 2 GB, so a title
++// that defines ps5lm_rpc_park_write (PS5LM does) writes the files through it:
++// op 0 begin (path), 1 data, 2 end, 3 abort; 1 done, 0 failed, -1 no writer.
++#pragma once
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <map>
++#include <string>
++#include <vector>
++
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++extern "C" __attribute__((weak)) int ps5lm_rpc_park_write(int op, const char * path, const void * data, size_t size);
++
++namespace ggml_rpc_park {
++
++namespace pfs = std::filesystem;
++
++constexpr size_t PARK_BUF_SIZE = 8u << 20;
++
++// a checksum of a stream, the same however the stream is cut into pieces:
++// FNV-1a over 8-byte words (a byte at a time would cost seconds per GiB)
++struct hash64 {
++    uint64_t h = 0xcbf29ce484222325ULL;
++    uint64_t total = 0;
++    uint8_t  carry[8];
++    size_t   n = 0;
++
++    void word(uint64_t w) {
++        h = (h ^ w) * 0x100000001b3ULL;
++        h ^= h >> 29;
++    }
++    void add(const void * data, size_t len) {
++        const uint8_t * p = (const uint8_t *) data;
++        total += len;
++        while (n > 0 && n < 8 && len > 0) {
++            carry[n++] = *p++;
++            len--;
++        }
++        if (n == 8) {
++            uint64_t w;
++            memcpy(&w, carry, 8);
++            word(w);
++            n = 0;
++        }
++        while (len >= 8) {
++            uint64_t w;
++            memcpy(&w, p, 8);
++            word(w);
++            p += 8;
++            len -= 8;
++        }
++        while (len > 0) {
++            carry[n++] = *p++;
++            len--;
++        }
++    }
++    uint64_t done() const {
++        hash64 c = *this;
++        for (size_t i = 0; i < n; i++) {
++            c.word(carry[i]);
++        }
++        c.word(total);
++        return c.h;
++    }
++};
++
++// strnlen, which the PS5 SDK's libc does not have
++inline size_t bounded_len(const char * s, size_t max) {
++    size_t n = 0;
++    while (n < max && s[n] != '\0') {
++        n++;
++    }
++    return n;
++}
++
++// letters, digits, '.', '_' and '-', not starting with '.', shorter than the field
++inline bool name_ok(const char * s, size_t field, size_t max_len) {
++    const size_t n = bounded_len(s, field);
++    if (n == 0 || n >= field || n > max_len || s[0] == '.') {
++        return false;
++    }
++    for (size_t i = 0; i < n; i++) {
++        const char c = s[i];
++        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
++        if (!ok) {
++            return false;
++        }
++    }
++    return true;
++}
++
++inline int64_t unix_time(pfs::file_time_type t) {
++    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
++        t - pfs::file_time_type::clock::now() + std::chrono::system_clock::now());
++    return std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
++}
++
++struct key_info {
++    std::string name;
++    uint64_t    bytes   = 0;
++    uint32_t    n_files = 0;
++    int64_t     mtime   = 0;   // of the folder or its newest file: about when it was last saved
++    uint64_t    used    = 0;   // its place in the order of use (higher is later); 0: not in the record
++};
++
++struct file_info {
++    std::string name;
++    uint64_t    bytes = 0;
++    int64_t     mtime = 0;
++};
++
++class store {
++public:
++    store() {
++        const char * d = std::getenv("GGML_RPC_PARK_DIR");
++        if (d == nullptr || d[0] == '\0') {
++            return;
++        }
++        dir = d;
++        cap     = gib(std::getenv("GGML_RPC_PARK_GB"), 128.0);
++        // for tests: "rs:64" ends the process once 64 bytes of a .rs file are written
++        if (const char * die = std::getenv("GGML_RPC_PARK_DIE_AT")) {
++            const char * colon = std::strchr(die, ':');
++            if (colon != nullptr) {
++                die_ext = "." + std::string(die, colon - die);
++                die_at  = std::strtoull(colon + 1, nullptr, 10);
++            }
++        }
++        reserve = gib(std::getenv("GGML_RPC_PARK_RESERVE_GB"), 16.0);
++        std::error_code ec;
++        pfs::create_directories(dir, ec);
++        if (!pfs::is_directory(dir, ec)) {
++            dir.clear();
++            return;
++        }
++        // nothing is being written when a client connects: a .part file is what a
++        // crash or a dropped client left
++        for (pfs::directory_iterator kit(dir, ec), kend; !ec && kit != kend; kit.increment(ec)) {
++            std::error_code e;
++            if (!kit->is_directory(e)) {
++                continue;
++            }
++            for (pfs::directory_iterator fit(kit->path(), e), fend; !e && fit != fend; fit.increment(e)) {
++                if (fit->path().extension() == ".part") {
++                    std::error_code e2;
++                    pfs::remove(fit->path(), e2);
++                }
++            }
++        }
++        used_load();
++    }
++
++    ~store() {
++        write_abort();
++        read_close();
++    }
++
++    store(const store &)             = delete;
++    store & operator=(const store &) = delete;
++
++    bool enabled() const { return !dir.empty(); }
++
++    uint8_t * buffer() {
++        if (buf.empty()) {
++            buf.resize(PARK_BUF_SIZE);
++        }
++        return buf.data();
++    }
++
++    const std::string & error() const { return err; }
++
++    // ---- writing: one file at a time, from its start ----
++
++    int write_begin(const char * key, const char * file, uint64_t expect, uint32_t & n_pruned) {
++        n_pruned = 0;
++        if (!names_ok(key, file)) {
++            return fail(GGML_RPC_PARK_BAD, "invalid key or file name");
++        }
++        write_abort();
++        std::error_code ec;
++        const pfs::path kdir = pfs::path(dir) / key;
++        pfs::create_directories(kdir, ec);
++        if (ec) {
++            return fail(GGML_RPC_PARK_IO, "cannot create " + kdir.string() + ": " + ec.message());
++        }
++        const int st = prune(expect, key, n_pruned);
++        if (st != GGML_RPC_PARK_OK) {
++            return st;
++        }
++        w_final = (kdir / file).string();
++        w_part  = w_final + ".part";
++        pfs::remove(w_part, ec);
++        if (ps5lm_rpc_park_write) {
++            const int r = ps5lm_rpc_park_write(0, w_part.c_str(), nullptr, 0);
++            if (r != 1) {
++                return fail(r < 0 ? GGML_RPC_PARK_NO_WRITER : GGML_RPC_PARK_IO, "cannot begin " + w_part);
++            }
++        } else {
++            w_fp = std::fopen(w_part.c_str(), "wb");
++            if (w_fp == nullptr) {
++                return fail(errno == ENOSPC ? GGML_RPC_PARK_NO_SPACE : GGML_RPC_PARK_IO, "cannot create " + w_part + ": " + std::strerror(errno));
++            }
++            std::setvbuf(w_fp, nullptr, _IONBF, 0);
++        }
++        w_open  = true;
++        w_key   = key;
++        w_bytes = 0;
++        w_hash  = hash64();
++        return GGML_RPC_PARK_OK;
++    }
++
++    int write(const void * data, size_t n) {
++        if (!w_open) {
++            return fail(GGML_RPC_PARK_BAD, "no file is being written");
++        }
++        bool ok;
++        int  e = 0;
++        if (ps5lm_rpc_park_write) {
++            ok = ps5lm_rpc_park_write(1, w_part.c_str(), data, n) == 1;
++        } else {
++            ok = std::fwrite(data, 1, n, w_fp) == n;
++            e  = errno;
++        }
++        if (!ok) {
++            const std::string part = w_part;
++            write_abort();
++            return fail(e == ENOSPC ? GGML_RPC_PARK_NO_SPACE : GGML_RPC_PARK_IO, "write to " + part + " failed" + (e ? std::string(": ") + std::strerror(e) : ""));
++        }
++        w_hash.add(data, n);
++        w_bytes += n;
++        if (!die_ext.empty() && w_bytes >= die_at && pfs::path(w_final).extension() == die_ext) {
++            LOG_ERROR("[park] GGML_RPC_PARK_DIE_AT: stopping in the middle of %s\n", w_final.c_str());
++            std::_Exit(3);
++        }
++        return GGML_RPC_PARK_OK;
++    }
++
++    // the file takes its name only here, once every byte is in it
++    int write_commit(uint64_t & size, uint64_t & hash) {
++        if (!w_open) {
++            return fail(GGML_RPC_PARK_BAD, "no file is being written");
++        }
++        bool ok;
++        if (ps5lm_rpc_park_write) {
++            ok = ps5lm_rpc_park_write(2, w_part.c_str(), nullptr, 0) == 1;
++        } else {
++            ok = std::fflush(w_fp) == 0;
++#ifndef _WIN32
++            ok = ok && fsync(fileno(w_fp)) == 0;
++#endif
++            ok = std::fclose(w_fp) == 0 && ok;
++            w_fp = nullptr;
++        }
++        w_open = false;
++        std::error_code ec;
++        if (ok) {
++            const uintmax_t on_disk = pfs::file_size(w_part, ec);
++            ok = !ec && on_disk == w_bytes;
++        }
++        if (ok) {
++            pfs::rename(w_part, w_final, ec);
++            ok = !ec;
++        }
++        if (!ok) {
++            pfs::remove(w_part, ec);
++            w_key.clear();
++            return fail(GGML_RPC_PARK_IO, "could not finish " + w_final);
++        }
++        touch(w_key, false);
++        w_key.clear();
++        size = w_bytes;
++        hash = w_hash.done();
++        return GGML_RPC_PARK_OK;
++    }
++
++    void write_abort() {
++        if (!w_open) {
++            return;
++        }
++        if (ps5lm_rpc_park_write) {
++            ps5lm_rpc_park_write(3, w_part.c_str(), nullptr, 0);
++        } else if (w_fp != nullptr) {
++            std::fclose(w_fp);
++            w_fp = nullptr;
++        }
++        std::error_code ec;
++        pfs::remove(w_part, ec);
++        w_open = false;
++        w_key.clear();
++    }
++
++    // ---- reading: one file at a time, in order from an offset ----
++
++    int read_begin(const char * key, const char * file, uint64_t offset, uint64_t & size) {
++        if (!names_ok(key, file)) {
++            return fail(GGML_RPC_PARK_BAD, "invalid key or file name");
++        }
++        read_close();
++        const std::string path = (pfs::path(dir) / key / file).string();
++        std::error_code ec;
++        const uintmax_t on_disk = pfs::file_size(path, ec);
++        if (ec) {
++            return fail(GGML_RPC_PARK_NOT_FOUND, "no file " + path);
++        }
++        if (offset > on_disk) {
++            return fail(GGML_RPC_PARK_SHORT, path + " is shorter than the offset");
++        }
++        // Each read below is one read call of up to PARK_BUF_SIZE: a PS5 title's every read call takes about
++        // 1.4 ms. Not through a stream without a buffer: the console's libc then reads a byte per call, and a
++        // 150 MiB state would take days.
++#ifdef _WIN32
++        r_fp = std::fopen(path.c_str(), "rb");
++        const bool opened  = r_fp != nullptr;
++        const bool seek_ok = opened && (offset == 0 || _fseeki64(r_fp, (long long) offset, SEEK_SET) == 0);
++#else
++        r_fd = ::open(path.c_str(), O_RDONLY);
++        const bool opened  = r_fd >= 0;
++        const bool seek_ok = opened && (offset == 0 || ::lseek(r_fd, (off_t) offset, SEEK_SET) == (off_t) offset);
++#endif
++        if (!opened) {
++            return fail(GGML_RPC_PARK_NOT_FOUND, "cannot open " + path);
++        }
++        if (!seek_ok) {
++            read_close();
++            return fail(GGML_RPC_PARK_IO, "cannot seek in " + path);
++        }
++        r_key   = key;
++        r_path  = path;
++        r_bytes = 0;
++        r_hash  = hash64();
++        touch(r_key, true);
++        size = on_disk;
++        return GGML_RPC_PARK_OK;
++    }
++
++    int read(void * data, size_t n) {
++        if (!reading()) {
++            return fail(GGML_RPC_PARK_BAD, "no file is being read");
++        }
++        size_t got = 0;
++        bool   eof = false;
++#ifdef _WIN32
++        got = std::fread(data, 1, n, r_fp);
++        eof = std::feof(r_fp) != 0;
++#else
++        while (got < n) {
++            const ssize_t k = ::read(r_fd, (char *) data + got, n - got);
++            if (k < 0 && errno == EINTR) {
++                continue;
++            }
++            if (k <= 0) {
++                eof = k == 0;
++                break;
++            }
++            got += (size_t) k;
++        }
++#endif
++        if (got != n) {
++            return fail(eof ? GGML_RPC_PARK_SHORT : GGML_RPC_PARK_IO, r_path + (eof ? " ends early" : " could not be read"));
++        }
++        r_hash.add(data, n);
++        r_bytes += n;
++        return GGML_RPC_PARK_OK;
++    }
++
++    int read_end(uint64_t & bytes, uint64_t & hash) {
++        if (!reading()) {
++            return fail(GGML_RPC_PARK_BAD, "no file is being read");
++        }
++        bytes = r_bytes;
++        hash  = r_hash.done();
++        read_close();
++        return GGML_RPC_PARK_OK;
++    }
++
++    void read_close() {
++#ifdef _WIN32
++        if (r_fp != nullptr) {
++            std::fclose(r_fp);
++            r_fp = nullptr;
++        }
++#else
++        if (r_fd >= 0) {
++            ::close(r_fd);
++            r_fd = -1;
++        }
++#endif
++        r_key.clear();
++    }
++
++    // ---- keys ----
++
++    // a file of a key, or with no file name the whole key
++    int remove(const char * key, const char * file, uint64_t & freed, uint64_t & existed) {
++        freed   = 0;
++        existed = 0;
++        const bool whole = file[0] == '\0';
++        if (!name_ok(key, GGML_RPC_PARK_KEY_SIZE, GGML_RPC_PARK_KEY_SIZE - 1) ||
++            (!whole && !name_ok(file, GGML_RPC_PARK_FILE_SIZE, GGML_RPC_PARK_FILE_SIZE - 6))) {
++            return fail(GGML_RPC_PARK_BAD, "invalid key or file name");
++        }
++        std::error_code ec;
++        const pfs::path kdir = pfs::path(dir) / key;
++        if (whole) {
++            if (key == w_key || key == r_key) {
++                return fail(GGML_RPC_PARK_BAD, std::string("key ") + key + " has a file open");
++            }
++            for (const auto & f : files(key)) {
++                freed += f.bytes;
++            }
++            existed = pfs::exists(kdir, ec) ? 1 : 0;
++            pfs::remove_all(kdir, ec);
++            forget(key);
++            used_store();
++        } else {
++            const pfs::path path = kdir / file;
++            const uintmax_t n = pfs::file_size(path, ec);
++            if (!ec) {
++                existed = 1;
++                freed   = n;
++                pfs::remove(path, ec);
++            }
++        }
++        return GGML_RPC_PARK_OK;
++    }
++
++    std::vector<key_info> keys() const {
++        std::vector<key_info> out;
++        std::error_code ec;
++        for (pfs::directory_iterator kit(dir, ec), kend; !ec && kit != kend; kit.increment(ec)) {
++            std::error_code e;
++            if (!kit->is_directory(e)) {
++                continue;
++            }
++            key_info k;
++            k.name = kit->path().filename().string();
++            if (!name_ok(k.name.c_str(), GGML_RPC_PARK_KEY_SIZE, GGML_RPC_PARK_KEY_SIZE - 1)) {
++                continue;
++            }
++            const auto dt = pfs::last_write_time(kit->path(), e);
++            k.mtime = e ? 0 : unix_time(dt);
++            const auto u = used.find(k.name);
++            k.used = u == used.end() ? 0 : u->second;
++            for (const auto & f : files(k.name)) {
++                k.bytes += f.bytes;
++                k.n_files++;
++                k.mtime = std::max(k.mtime, f.mtime);
++            }
++            out.push_back(std::move(k));
++        }
++        std::sort(out.begin(), out.end(), [](const key_info & a, const key_info & b) { return a.name < b.name; });
++        return out;
++    }
++
++    // whole files only: one still being written has no name yet
++    std::vector<file_info> files(const std::string & key) const {
++        std::vector<file_info> out;
++        std::error_code ec;
++        for (pfs::directory_iterator fit(pfs::path(dir) / key, ec), fend; !ec && fit != fend; fit.increment(ec)) {
++            std::error_code e;
++            if (!fit->is_regular_file(e) || fit->path().extension() == ".part") {
++                continue;
++            }
++            file_info f;
++            f.name  = fit->path().filename().string();
++            f.bytes = fit->file_size(e);
++            if (e) {
++                continue;
++            }
++            const auto ft = fit->last_write_time(e);
++            f.mtime = e ? 0 : unix_time(ft);
++            out.push_back(std::move(f));
++        }
++        std::sort(out.begin(), out.end(), [](const file_info & a, const file_info & b) { return a.name < b.name; });
++        return out;
++    }
++
++    void stat(uint64_t & free_bytes, uint64_t & used, uint64_t & cap_bytes, uint64_t & n_keys) const {
++        used = 0;
++        const auto all = keys();
++        for (const auto & k : all) {
++            used += k.bytes;
++        }
++        n_keys     = all.size();
++        cap_bytes  = cap;
++        free_bytes = disk_free();
++    }
++
++    // room for `need` more bytes: under the cap and with the reserve left free on
++    // the disk, dropping the keys used longest ago, never `keep` or one with a file open
++    int prune(uint64_t need, const std::string & keep, uint32_t & n_pruned) {
++        auto all = keys();
++        uint64_t used = 0;
++        for (const auto & k : all) {
++            used += k.bytes;
++        }
++        uint64_t free_bytes = disk_free();
++        // by the record of use; keys it does not know (parked by a build without it) come first, by their file times
++        std::sort(all.begin(), all.end(), [](const key_info & a, const key_info & b) {
++            return a.used != b.used ? a.used < b.used : a.mtime < b.mtime;
++        });
++        const auto enough = [&]() {
++            return used + need <= cap && (free_bytes == UINT64_MAX || free_bytes >= need + reserve);
++        };
++        for (const auto & k : all) {
++            if (enough()) {
++                break;
++            }
++            if (k.name == keep || k.name == w_key || k.name == r_key || k.name == last_restored) {
++                continue;
++            }
++            std::error_code ec;
++            pfs::remove_all(pfs::path(dir) / k.name, ec);
++            forget(k.name);
++            LOG_INFO("[park] dropped key '%s' (%.1f MiB, least recently used) to make room\n", k.name.c_str(), k.bytes / 1048576.0);
++            used -= std::min(used, k.bytes);
++            if (free_bytes != UINT64_MAX) {
++                free_bytes += k.bytes;
++            }
++            n_pruned++;
++        }
++        if (n_pruned > 0) {
++            used_store();
++        }
++        if (!enough()) {
++            char text[160];
++            snprintf(text, sizeof(text), "no room for %.1f MiB: %.1f MiB used of %.1f MiB, %.1f MiB free on the disk",
++                     need / 1048576.0, used / 1048576.0, cap / 1048576.0, free_bytes == UINT64_MAX ? -1.0 : free_bytes / 1048576.0);
++            return fail(GGML_RPC_PARK_NO_SPACE, text);
++        }
++        return GGML_RPC_PARK_OK;
++    }
++
++private:
++    static uint64_t gib(const char * text, double fallback) {
++        double v = fallback;
++        if (text != nullptr && text[0] != '\0') {
++            char * end = nullptr;
++            const double parsed = std::strtod(text, &end);
++            if (end != text && parsed >= 0) {
++                v = parsed;
++            }
++        }
++        return (uint64_t) (v * 1024.0 * 1024.0 * 1024.0);
++    }
++
++    static bool names_ok(const char * key, const char * file) {
++        // a file name leaves room for ".part"
++        return name_ok(key, GGML_RPC_PARK_KEY_SIZE, GGML_RPC_PARK_KEY_SIZE - 1) &&
++               name_ok(file, GGML_RPC_PARK_FILE_SIZE, GGML_RPC_PARK_FILE_SIZE - 6) &&
++               pfs::path(file).extension() != ".part";
++    }
++
++    // UINT64_MAX when the system does not say
++    uint64_t disk_free() const {
++        std::error_code ec;
++        const auto sp = pfs::space(dir, ec);
++        // a PS5 title's statvfs is a stub that answers zeros: unknown, like an error
++        return ec || sp.capacity == 0 || sp.available == (uintmax_t) -1 ? UINT64_MAX : (uint64_t) sp.available;
++    }
++
++    // ---- the order the keys were used in, for prune() ----
++
++    // a key was saved or restored just now
++    void touch(const std::string & key, bool restored) {
++        used[key] = ++used_clock;
++        if (restored) {
++            last_restored = key;
++        }
++        used_store();
++    }
++
++    void forget(const std::string & key) {
++        used.erase(key);
++        if (last_restored == key) {
++            last_restored.clear();
++        }
++    }
++
++    // .used: a line "<place> <key>" per key, and "R <key>" for the one restored last
++    void used_load() {
++        FILE * f = std::fopen((pfs::path(dir) / ".used").string().c_str(), "rb");
++        if (f == nullptr) {
++            return;
++        }
++        char line[GGML_RPC_PARK_KEY_SIZE + 40];
++        while (std::fgets(line, sizeof(line), f) != nullptr) {
++            std::string text(line);
++            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
++                text.pop_back();
++            }
++            const size_t space = text.find(' ');
++            if (space == std::string::npos) {
++                continue;
++            }
++            const std::string key = text.substr(space + 1);
++            std::error_code ec;
++            if (!name_ok(key.c_str(), GGML_RPC_PARK_KEY_SIZE, GGML_RPC_PARK_KEY_SIZE - 1) || !pfs::is_directory(pfs::path(dir) / key, ec)) {
++                continue;   // a key that is gone
++            }
++            if (text[0] == 'R') {
++                last_restored = key;
++            } else {
++                const uint64_t place = std::strtoull(text.c_str(), nullptr, 10);
++                used[key]  = place;
++                used_clock = std::max(used_clock, place);
++            }
++        }
++        std::fclose(f);
++    }
++
++    // Written whole under another name and renamed, through the title's writer where there is one. While a
++    // parked file is being written the writer is taken: the record goes out with the next change then, and
++    // until it does only this process knows the order (a worker restarted in between falls back to file times
++    // for what it missed).
++    void used_store() {
++        if (w_open) {
++            return;
++        }
++        std::string text;
++        for (const auto & [key, place] : used) {
++            text += std::to_string(place) + " " + key + "\n";
++        }
++        if (!last_restored.empty()) {
++            text += "R " + last_restored + "\n";
++        }
++        const std::string whole = (pfs::path(dir) / ".used").string();
++        const std::string part  = whole + ".part";
++        bool ok;
++        if (ps5lm_rpc_park_write) {
++            ok = ps5lm_rpc_park_write(0, part.c_str(), nullptr, 0) == 1 &&
++                 (text.empty() || ps5lm_rpc_park_write(1, part.c_str(), text.data(), text.size()) == 1) &&
++                 ps5lm_rpc_park_write(2, part.c_str(), nullptr, 0) == 1;
++        } else {
++            FILE * f = std::fopen(part.c_str(), "wb");
++            ok = f != nullptr && std::fwrite(text.data(), 1, text.size(), f) == text.size();
++            ok = f != nullptr && std::fclose(f) == 0 && ok;
++        }
++        std::error_code ec;
++        if (ok) {
++            pfs::rename(part, whole, ec);
++        }
++        if (!ok || ec) {
++            pfs::remove(part, ec);
++            LOG_ERROR("[park] could not write %s: the order of use is kept in memory only\n", whole.c_str());
++        }
++    }
++
++    int fail(int status, const std::string & text) {
++        err = text;
++        if (status != GGML_RPC_PARK_NOT_FOUND) {
++            LOG_ERROR("[park] %s\n", text.c_str());
++        }
++        return status;
++    }
++
++    std::string dir;
++    uint64_t    cap     = 0;
++    uint64_t    reserve = 0;
++    std::string err;
++    std::vector<uint8_t> buf;
++    std::map<std::string, uint64_t> used;   // key -> its place in the order of use
++    uint64_t    used_clock = 0;
++    std::string last_restored;
++    std::string die_ext;
++    uint64_t    die_at  = 0;
++
++    bool        w_open  = false;
++    FILE *      w_fp    = nullptr;
++    std::string w_key, w_part, w_final;
++    uint64_t    w_bytes = 0;
++    hash64      w_hash;
++
++    FILE *      r_fp    = nullptr;   // Windows
++    int         r_fd    = -1;        // elsewhere
++    bool reading() const { return r_fp != nullptr || r_fd >= 0; }
++    std::string r_key, r_path;
++    uint64_t    r_bytes = 0;
++    hash64      r_hash;
++};
++
++} // namespace ggml_rpc_park

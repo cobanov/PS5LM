@@ -320,6 +320,180 @@ Q4_K_M (5.4 GiB; 4.2 GiB of it in tensors the cache keeps) from a PC's CPU:
 
 Every load gave the same answer at temperature 0.
 
+### Parked state
+
+A host that serves many conversations on one slot (a swarm of agents taking
+turns) has to put the state of the one leaving somewhere. llama-server's own
+answers keep it on the host: the prompt cache in memory, or a slot file. For
+Qwen3.8-27B at 153K tokens that is 2.8 GiB per conversation, fetched over the
+network at about 94 MiB/s and sent back the same way: 50 s out and 65 s back,
+and a 12 GB host holds two.
+
+With device parking the state stays on the console. The worker keeps it in
+files in `/data/PS5LM/park`, the host keeps the token list and a manifest, a few
+MB per conversation, and a save writes only what was added since the last one.
+
+On the console: `PS5LM_PARK_GB=N` in env.txt (whole GiB, 1 to 4096; 128 when
+not set, 0 turns it off; PS5LM after v0.11.0). The worker tells hosts in its
+handshake that it takes park commands, so an older host or an older worker
+serves as before.
+
+On the host: `--slot-park-path DIR` (a folder for the bookkeeping, not in
+`/tmp`) and `--cache-ram 0`: the automatic prompt cache would still fetch the
+state of every conversation that loses the slot. The client parks and resumes
+by name:
+
+| Request | Does |
+|---|---|
+| `POST /slots/0?action=save` `{"filename": "n17"}` | Parks the slot under the key `n17` |
+| `POST /slots/0?action=restore` `{"filename": "n17"}` | Puts that state back in the slot |
+| `POST /slots/0?action=park-list` | The keys, their sizes and state, the room left |
+| `POST /slots/0?action=park-delete` `{"filename": "n17"}` | Drops a key, on the console and on the host |
+| `POST /slots/0?action=park-status` | Free space, bytes parked, the cap |
+
+A key is 1 to 64 letters, digits, `.`, `_` or `-`. With `--slot-save-path` also
+set, `"device": false` in the body makes the same two actions use a host file
+as before.
+
+A save or a restore is never refused because the slot is busy, and never runs
+beside a request: it waits for the slot, and the server does one thing on a
+slot at a time.
+
+- Sent while a request generates, a save parks what that request leaves when
+  it ends, and a restore replaces it then. The request itself is not disturbed.
+- Saves, restores and requests that name the slot (`"id_slot": 0`, as the
+  swarm's do) run in the order they were sent. A request that names no slot is
+  taken up after the park actions that wait, whenever it came.
+- Two saves of one key at once: the first parks, the second answers
+  `"mode": "unchanged"`. A save and a restore of one key at once run one after
+  the other in the order sent; either way the key is whole.
+- A client that gives up on a save or a restore that is still waiting cannot
+  count on it being dropped: the server notices a closed connection about
+  once a second and drops the action then, but one whose turn comes first is
+  run all the same, and once started it runs to its end. After giving up on a
+  restore, look at the slot (`GET /slots`) or send the restore again.
+- `park-list`, `park-delete` and `park-status` do not wait for the slot; they
+  run between the batches of a request in progress.
+
+A save answers with what it wrote (Qwen3.5-0.8B on a CPU worker, the fourth
+firing of a conversation):
+
+```json
+{"id_slot": 0, "filename": "n17", "device": true, "mode": "append",
+ "n_saved": 10063, "n_appended": 2516,
+ "n_written": 28897228, "n_written_kv": 8695296, "n_written_state": 20201932, "n_written_checkpoint": 0,
+ "n_parked_bytes": 75181592, "n_segments": 4,
+ "checkpoint_n_tokens": 7547, "checkpoint_kind": "previous_save",
+ "pruned": [], "timings": {"save_ms": 104.2}}
+```
+
+- `mode` is `new` (the key's first save, or one that could not be added to:
+  `reason` says why), `append`, `rewrite` or `unchanged`.
+- **Append only.** The attention cells of the tokens added since the key's last
+  save go to a new file (18 KiB a token for Qwen3.8-27B with a q4_0 cache). The
+  recurrent state has a fixed size (150 MiB for that model) and is written
+  whole each time: that is the fixed cost of a save.
+- **A changed history is never resumed as it was.** The host compares the
+  slot's tokens with the parked ones. If they differ before the parked end (the
+  client compacted or edited the history), the save keeps the files that end
+  before the difference and writes the rest again: `"mode": "rewrite"`,
+  `"rewritten_from": N`.
+- **Going back.** A recurrent state cannot be rewound, so a request that
+  returns and differs from the parked tokens before their end needs an earlier
+  state. That is the recurrent state of the save before, which stays on the
+  console (`"checkpoint_kind": "previous_save"`): such a request reads again
+  what the last save added. A client whose requests usually stop short of the
+  parked end (it does not send the last reply back as it was written) sends
+  `"checkpoint": true` with the save: the slot's own checkpoint, 4 tokens before
+  the end of its last prompt, is parked too, and the return reads a handful of
+  tokens, at the price of a second 150 MiB block per save. A key's first save
+  always does this.
+- `pruned` names the keys the console dropped to make room for this save.
+
+A restore answers `{"n_restored": tokens, "n_read": bytes, "n_segments": files,
+"checkpoint_n_tokens": ..., "timings": {"restore_ms": ...}}`. When it fails, the
+slot is left empty, never half restored, and the body's `error.park_error` says
+why:
+
+| Status | `park_error` | Means |
+|---|---|---|
+| 404 | (llama-server's own "File Not Found" body) | No such key |
+| 410 | `park_pruned` | The console dropped the key to make room, or its storage was cleared. The history has to be read again |
+| 409 | `park_torn` | The files and the bookkeeping do not agree (a size or a checksum). Delete the key |
+| 409 | `park_incompatible` | Parked by another model, or it does not fit this context |
+| 507 | `park_no_space` | (save) Over the cap or the disk is full, with nothing left to drop |
+| 501 | `park_unsupported` | The worker has no parking (older, or `PS5LM_PARK_GB=0`), there is more than one worker, or the model has a draft model or media in the slot |
+| 400 | `park_empty`, `park_bad_request` | Nothing in the slot; a bad key |
+| 500 | `park_io` | Anything else, with the worker's message |
+
+How it holds together:
+
+- A key is a folder on the console. Every file in it is written once, in order,
+  under a temporary name, and renamed when whole: `NNNNNN.kv` (the cells one
+  save added), `NNNNNN.rs` (the recurrent state at the end of that save; the
+  newest two are kept), `NNNNNN.ck` (a parked checkpoint). The host's manifest
+  names the files that make up the state, with their sizes and checksums, and is
+  replaced only after the console has the new files whole. A save that dies
+  half way (the worker killed in it) leaves the previous state loadable; what it
+  left behind is removed by the next save.
+- The worker moves the data between the GPU and the file through one 8 MiB
+  buffer, whatever the size of the state. The files are written through ftpsrv,
+  as the weight cache's are, and read in 8 MiB reads. Without an ftpsrv a save
+  is refused (`park_io`): it is never written the slow way.
+- The worker keeps the folder to N GiB: before a save it drops whole keys, the
+  one used longest ago first, never one with a file open and never the one
+  restored last. It keeps the order of use itself (`/data/PS5LM/park/.used`,
+  rewritten at every save and restore), because the console's file times move
+  when a key is saved but not when it is read. 128 GiB holds forty
+  conversations at a full 155K window (3.1 GiB each) or a hundred at about 60K.
+  There is no free-space floor on a console: a title's free-space call answers
+  a fixed 16 GiB, so only N bounds the folder.
+- On the host a key is `manifest.json`, `tokens.NNNNNN.bin` (4 bytes a token)
+  and `meta.NNNNNN.bin` (24 bytes a token): 4.3 MB at 153K tokens. They survive
+  a server restart and a reboot; a parked key is resumed by a new server process
+  as by the old one. A save that adds appends to the two files past what the
+  manifest covers; a save that rewrites starts a new pair and drops the old one
+  after the manifest is replaced. So if the server or the PC dies in a save,
+  append or rewrite, the key is as its last finished save left it.
+- One worker only: with several, a slot's state is spread over them, and
+  parking is refused.
+
+Measured on 2026-11-15 on one PS5 on 11.60 serving Qwen3.8-27B (GSQ-RCO
+IQ3_XXS, every layer on the console, one slot of 155,648 tokens, q4_0 cache)
+from a PC over gigabit Ethernet. Neurons of real source code, each firing 200
+new tokens and a 16-token reply; times are the server's own for the whole
+action:
+
+| | 20K tokens | 100K | 153K |
+|---|---|---|---|
+| First save | 651 MiB, 10.4 s | 2,057 MiB, 30.6 s | |
+| Save after growing to this size | | 1,552 MiB for 79,784 new tokens, 22.1 s | 1,059 MiB for 51,704 new tokens, 15.0 s |
+| Save after a firing (216 new tokens) | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s |
+| Restore | 2.2 s | 3.6 s | 4.6 s |
+| The same return through the host prompt cache | 14 s | 46 s | 65 s |
+
+- A save writes 149.6 MiB (the recurrent state) plus 18.0 KiB per new token,
+  at 72 to 74 MB/s; with `"checkpoint": true` 303 MiB in 5.7 s. A first save
+  includes the checkpoint.
+- Four neurons at 100K took turns on the slot, twelve hand-overs: each reply
+  was the one the same neuron gave without leaving the slot, 201 tokens were
+  read for the 200 new ones, and a hand-over (restore, firing, save) took about
+  18 s. The host's llama-server stayed at 1.1 GiB.
+- A request that differed from the parked tokens 3 tokens before their end
+  read 414 tokens after a default save (217 with the neuron still in the slot,
+  and 217 after a save with `"checkpoint": true`), at 101K and at 153K alike.
+- The console's free memory did not move during saves and restores (never
+  under 71.7 MiB in 306 samples), and the keys were restored by a new server
+  process and a restarted worker with the same replies.
+- At 5 hand-overs an hour that is 18 GiB written to the console's SSD a day,
+  at 48 an hour 173 GiB, for firings this small; a firing that adds 3,000
+  tokens writes 202 MiB (24 and 228 GiB a day).
+
+`scripts/ps5lm-app.sh bench-park [GiB]` measures the write path first: that
+many GiB (4) in 8 MiB pieces through ftpsrv to the data folder and to
+`/mnt/usb0` and `/mnt/ext0` when they are there, with the speed of every GiB,
+then the file read back and checked. It works beside a running worker.
+
 **Restart the worker title between different model runs and after errors.**
 PS5LM documents retained Vulkan memory after in-process unload; this increment
 does not promise safe hot reload. Stop through the normal title-close / existing
@@ -655,6 +829,14 @@ serve` CLI. It checks token IDs, assigned layers and per-worker computation.
 This proves a real distributed execution path on host CPUs, not useful language
 quality, PS5 GPU operation, large-model scaling or network speed. Tests use
 loopback only and clean up their child processes.
+
+`tests/fleet_rpc_park_test.py` covers parked state the same way (a CPU worker
+with a park folder): a swap, five appending firings, several keys, restarts, a
+worker killed in a save, a changed history, the cap, a worker without parking,
+and the worker's memory. With `PS5LM_PARK_TEST_MODEL` set to a GGUF it runs a
+second time with that model: Qwen3.5-0.8B has the attention cells plus
+recurrent state of the models the consoles serve, which the untrained fixture
+(attention only) has not.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
 on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only

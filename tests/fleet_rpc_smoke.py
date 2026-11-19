@@ -45,9 +45,23 @@ def stop(process):
             process.wait(timeout=10)
 
 
+def no_core_dump():
+    """For a test's servers: some end by aborting (a controller interrupted twice, a host whose worker a test
+    killed), and none of that should leave a core dump. 1, not 0: where dumps are piped to a program (WSL), a
+    limit of 0 is ignored and 1 means none."""
+    try:
+        import resource
+        hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+        limit = 1 if hard == resource.RLIM_INFINITY else min(1, hard)
+        resource.setrlimit(resource.RLIMIT_CORE, (limit, limit))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def spawn(stack, command, logfile, env):
     stream = stack.enter_context(logfile.open("w"))
-    process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                               preexec_fn=no_core_dump)
     stack.callback(stop, process)
     return process
 
