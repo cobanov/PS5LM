@@ -19,8 +19,20 @@ Settings load_settings(const char * path) {
     }
     s.auto_load     = j.value("auto_load", s.auto_load);
     s.default_model = j.value("default_model", s.default_model);
-    s.ctx_cap       = j.value("ctx_cap", s.ctx_cap);
-    s.kv_type       = j.value("kv_type", s.kv_type);
+    s.ctx_cap        = j.value("ctx_cap", s.ctx_cap);
+    s.kv_type        = j.value("kv_type", s.kv_type);
+    s.disk_cache     = j.value("disk_cache", s.disk_cache);
+    if (s.disk_cache != "auto" && s.disk_cache != "on" && s.disk_cache != "off") {
+        s.disk_cache = "auto";
+    }
+    s.disk_cache_mib = j.value("disk_cache_mib", s.disk_cache_mib);
+    if (s.disk_cache_mib == 0) {
+        s.disk_cache_mib = 4096;
+    } else if (s.disk_cache_mib < 512) {
+        s.disk_cache_mib = 512;
+    } else if (s.disk_cache_mib > 32768) {
+        s.disk_cache_mib = 32768;
+    }
     s.sounds        = j.value("sounds", s.sounds);
     s.tools         = j.value("tools", s.tools);
     s.introspect    = j.value("introspect", s.introspect);
@@ -34,7 +46,8 @@ Settings load_settings(const char * path) {
 bool save_settings(const char * path, const Settings & s) {
     const nlohmann::json j = {
         { "auto_load", s.auto_load }, { "default_model", s.default_model }, { "ctx_cap", s.ctx_cap },
-        { "kv_type", s.kv_type },     { "sounds", s.sounds },       { "tools", s.tools },
+        { "kv_type", s.kv_type },     { "disk_cache", s.disk_cache }, { "disk_cache_mib", s.disk_cache_mib },
+        { "sounds", s.sounds },       { "tools", s.tools },
         { "introspect", s.introspect },
         { "scratch_limit_gib", s.scratch_limit_gib }, { "download_dir", s.download_dir },
         { "report_kernel_log", s.report_kernel_log }, { "report_explained", s.report_explained },

@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "model_plan.hpp"
 
+#include <cmath>
+
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
@@ -156,6 +158,176 @@ int main(int argc, char ** argv) {
         rmdir(dir);
     }
 
+    // Headroom-based RAM prompt cache (-cram) & checkpoints (-ctxcp):
+    // spare headroom enables RAM caching (capped at <= 512 MiB); tight headroom switches automatically to disk caching (--cache-disk).
+    const ps5lm::Plan roomy = ps5lm::plan_model(c, budget, 65536);
+    assert(roomy.fits && has_args(roomy, "-cram", "256") && has_args(roomy, "-ctxcp", "4"));
+    assert(has_args(roomy, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    ps5lm::ModelInfo small2b = c;
+    small2b.file_bytes = 2ull << 30;
+    const ps5lm::Plan p_small2b = ps5lm::plan_model(small2b, budget, 65536);
+    assert(p_small2b.fits && has_args(p_small2b, "-cram", "512") && has_args(p_small2b, "-ctxcp", "4"));
+    const ps5lm::Plan tight = ps5lm::plan_model(c, c.file_bytes / (1024.0 * 1024.0 * 1024.0) + 1.1, 4096);
+    assert(tight.fits && has_args(tight, "-cram", "0") && has_args(tight, "-ctxcp", "1"));
+    assert(has_args(tight, "--cache-disk", "/data/PS5LM/cache/prompts") && has_args(tight, "--cache-disk-mib", "4096"));
+
+    // Disk cache off leaves out --cache-disk and preserves strict fixed kv_type without expansion.
+    const ps5lm::Plan no_disk = ps5lm::plan_model(c, budget, 65536, "q8_0", ps5lm::kPromptUbatch, "off");
+    assert(no_disk.fits && std::find(no_disk.args.begin(), no_disk.args.end(), "--cache-disk") == no_disk.args.end());
+
+    // Near-full VRAM with fixed q8_0 honors q8_0 when >= 8k fits in "auto" mode, and expands
+    // via q4_0 when q8_0 cannot reach 8k or when disk_cache == "on".
+    const double tight_budget = 6.05;
+    const ps5lm::Plan strict_q8 = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, "off");
+    const ps5lm::Plan auto_exp  = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, "auto", 4096);
+    assert(auto_exp.fits && (!strict_q8.fits || auto_exp.ctx > strict_q8.ctx) && auto_exp.kv_type == "q4_0");
+    assert(has_args(auto_exp, "-cram", "0") && has_args(auto_exp, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    const ps5lm::Plan keep_q8_auto = ps5lm::plan_model(c, 6.55, 65536, "q8_0", ps5lm::kPromptUbatch, "auto", 4096);
+    const ps5lm::Plan max_ctx_on   = ps5lm::plan_model(c, 6.55, 65536, "q8_0", ps5lm::kPromptUbatch, "on", 4096);
+    assert(keep_q8_auto.fits && keep_q8_auto.ctx == 8192 && keep_q8_auto.kv_type == "q8_0");
+    assert(max_ctx_on.fits && max_ctx_on.ctx == 16384 && max_ctx_on.kv_type == "q4_0");
+
+    // 18B MoE (~10.59 GiB) on 11.56 GiB free pool: "auto"/"on" fit >= 8k via tight disk packing;
+    // "off" keeps standard RAM buffers (-ub 64, -ctxcp 1) without --cache-disk.
+    ps5lm::ModelInfo moe18 = c;
+    moe18.arch       = "qwen35moe";
+    moe18.file_name  = "qwen3.5-18b-a3b-reap-coding-heretic-v0.i1-Q4_K_M.gguf";
+    moe18.file_bytes = 11375418272ull;
+    moe18.n_expert   = 256;
+    moe18.full_attn_every = 4;
+    moe18.state_bytes = 64ull << 20;
+    const ps5lm::Plan p18_auto = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, "auto", 4096);
+    const ps5lm::Plan p18_on   = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, "on", 4096);
+    const ps5lm::Plan p18_off  = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, "off", 4096,
+                                                   "/data/PS5LM/cache/prompts", false);
+    assert(p18_auto.fits && p18_auto.ctx >= 8192 && p18_auto.kv_type == "q8_0" && (11.56 - p18_auto.total_gib) >= 0.15 &&
+           has_args(p18_auto, "-cram", "0") &&
+           has_args(p18_auto, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    assert(p18_on.fits && p18_on.ctx >= 8192 && p18_on.kv_type == "q8_0" && (11.56 - p18_on.total_gib) >= 0.15 &&
+           has_args(p18_on, "-cram", "0") &&
+           has_args(p18_on, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    assert(p18_on.why.find(" + disk") != std::string::npos && p18_on.why.find("(expanded)") == std::string::npos);
+    assert(p18_off.fits && p18_off.ctx <= p18_auto.ctx && p18_off.kv_type == "q8_0" && !p18_off.disable_introspect &&
+           has_args(p18_off, "-ub", "64") &&
+           std::find(p18_off.args.begin(), p18_off.args.end(), "--cache-disk") == p18_off.args.end() &&
+           p18_off.why.find("(expanded)") == std::string::npos && p18_off.why.find("+ disk") == std::string::npos);
+    assert(has_args(p18_auto, "-b", "128") && has_args(p18_on, "-b", "128") && has_args(p18_off, "-b", "128"));
+
+    // Verify state_gib is counted exactly once (not doubled in base_reserve + try_fit).
+    {
+        ps5lm::ModelInfo no_state = moe18;
+        no_state.file_bytes  = 8ull << 30;
+        no_state.state_bytes = 0;
+        ps5lm::ModelInfo with_state = no_state;
+        with_state.state_bytes = 256ull << 20;  // 0.25 GiB
+        const ps5lm::Plan p_ns = ps5lm::plan_model(no_state, 11.56, 8192);
+        const ps5lm::Plan p_ws = ps5lm::plan_model(with_state, 11.56, 8192);
+        assert(p_ns.fits && p_ws.fits && p_ns.ctx == p_ws.ctx && p_ns.kv_type == p_ws.kv_type);
+        assert(std::fabs((p_ws.total_gib - p_ns.total_gib) - 0.25) < 1e-6);
+    }
+
+    // Introspect adds +0.25 GiB to base_reserve, and tight_plan enforces >= 0.15 GiB
+    // safety margin below budget_gib while capping logical batch -b to 128.
+    {
+        const ps5lm::Plan cp_intro = ps5lm::plan_model(c, budget, 65536, nullptr, ps5lm::kPromptUbatch,
+                                                        "auto", 4096, "/data/PS5LM/cache/prompts", true);
+        assert(cp_intro.fits && std::fabs((cp_intro.reserve_gib - cp.reserve_gib) - 0.25) < 1e-6);
+
+        ps5lm::ModelInfo near_full = moe18;
+        near_full.file_bytes = (uint64_t) (10.58 * 1073741824.0);  // 10.58 GiB weights on 11.54 GiB pool
+        near_full.state_bytes = 160ull << 20;
+        const ps5lm::Plan safe_p = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch,
+                                                      "auto", 4096, "/data/PS5LM/cache/prompts", false);
+        assert(safe_p.fits && safe_p.ctx <= 16384 && (11.54 - safe_p.total_gib) >= 0.15);
+        if (safe_p.ctx >= 16384) {
+            assert((11.54 - safe_p.total_gib) >= 0.32);
+        }
+        assert(has_args(safe_p, "-ub", "32") && has_args(safe_p, "-b", "128"));
+
+        // An 18B-style tight fit cannot promote 16k without preserving >= 0.32 GiB planner headroom.
+        ps5lm::ModelInfo near_16k = moe18;
+        near_16k.file_bytes = (uint64_t) (10.55 * 1073741824.0);
+        near_16k.state_bytes = 64ull << 20;
+        const ps5lm::Plan p16 = ps5lm::plan_model(near_16k, 11.54, 65536, "q8_0", ps5lm::kPromptUbatch,
+                                                  "auto", 8192, "/data/PS5LM/cache/prompts", false);
+        assert(p16.fits && (p16.ctx < 16384 || (11.54 - p16.total_gib) >= 0.32));
+
+        // When introspect already reaches >= 32k, keep introspect enabled (reserve +0.25 GiB,
+        // context steps down, both preserve >= 0.15 GiB). When introspect caps a model at 8k,
+        // auto-disable introspect to unlock >= 16k / 32k.
+        near_full.file_bytes = (uint64_t) (10.00 * 1073741824.0);
+        near_full.state_bytes = 64ull << 20;
+        const ps5lm::Plan safe_no_intro = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch,
+                                                             "auto", 4096, "/data/PS5LM/cache/prompts", false);
+        const ps5lm::Plan safe_intro    = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch,
+                                                             "auto", 4096, "/data/PS5LM/cache/prompts", true);
+        assert(safe_no_intro.fits && safe_intro.fits);
+        assert(!safe_intro.disable_introspect);
+        assert(safe_intro.reserve_gib > safe_no_intro.reserve_gib + 0.24);
+        assert((11.54 - safe_no_intro.total_gib) >= 0.15 && (11.54 - safe_intro.total_gib) >= 0.15);
+        assert(safe_intro.ctx < safe_no_intro.ctx);
+
+        // With 256 MiB flexibleMemorySize (~11.75 GiB free Direct Memory), real 18B-A3B (40 layers,
+        // 2 KV heads, 10 KV layers) clearly distinguishes all 3 modes: "off" (8k q8_0) < "auto"
+        // (16k q8_0 + disk) < "on" (32k q4_0 expanded + disk).
+        ps5lm::ModelInfo real18 = moe18;
+        real18.n_layer = 40;
+        real18.n_head_kv = 2;
+        real18.state_bytes = 65863680ull;  // ~62.81 MiB
+        const ps5lm::Plan p18_32k_auto = ps5lm::plan_model(real18, 11.7475, 65536, nullptr, ps5lm::kPromptUbatch,
+                                                             "auto", 2048, "/data/PS5LM/cache/prompts", true);
+        const ps5lm::Plan p18_16k_q8   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch,
+                                                             "auto", 2048, "/data/PS5LM/cache/prompts", true);
+        const ps5lm::Plan p18_8k_off   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch,
+                                                             "off", 2048, "/data/PS5LM/cache/prompts", true);
+        const ps5lm::Plan p18_32k_on   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch,
+                                                             "on", 2048, "/data/PS5LM/cache/prompts", true);
+        assert(p18_32k_auto.fits && p18_32k_auto.disable_introspect && p18_32k_auto.ctx == 32768 && p18_32k_auto.kv_type == "q4_0");
+        assert(p18_16k_q8.fits && p18_16k_q8.disable_introspect && p18_16k_q8.ctx == 16384 && p18_16k_q8.kv_type == "q8_0");
+        assert(p18_8k_off.fits && !p18_8k_off.disable_introspect && p18_8k_off.ctx == 8192 && p18_8k_off.kv_type == "q8_0");
+        assert(p18_8k_off.why.find("+ disk") == std::string::npos);
+        assert(p18_32k_on.fits && p18_32k_on.disable_introspect && p18_32k_on.ctx == 32768 && p18_32k_on.kv_type == "q4_0");
+        assert(p18_32k_on.why.find(" (expanded) + disk") != std::string::npos);
+
+        // Even with introspect enabled in Settings, 18B MoE fits on 11.56 GiB by reclaiming the unused
+        // -ctxcp 0 checkpoint and dropping the 256 MiB introspect buffer when needed.
+        ps5lm::ModelInfo moe18_intro = moe18;
+        moe18_intro.state_bytes = 160ull << 20;
+        const ps5lm::Plan p18_intro = ps5lm::plan_model(moe18_intro, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch,
+                                                          "auto", 8192, "/data/PS5LM/cache/prompts", true);
+        assert(p18_intro.fits && p18_intro.disable_introspect && p18_intro.ctx >= 8192);
+        assert((11.56 - p18_intro.total_gib) >= 0.15);
+        assert(has_args(p18_intro, "-b", "128") && has_args(p18_intro, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    }
+
+    // Nothing fits in too little memory.
+    ps5lm::ModelInfo big;
+    big.ok = true; big.file_bytes = 20ull << 30; big.n_layer = 32; big.n_head_kv = 8;
+    big.key_length = big.value_length = 128;
+    assert(!ps5lm::plan_model(big, budget).fits);
+    // "auto" / "" kv_force normalizes to best-fit even when disk cache is off.
+    const ps5lm::Plan auto_kv_off = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, "off");
+    assert(auto_kv_off.fits && auto_kv_off.ctx == cp.ctx && auto_kv_off.kv_type == cp.kv_type);
+    // Invalid disk_cache_mode falls back to auto; disk_cache_mib == 0 omits --cache-disk.
+    const ps5lm::Plan fb = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, "bogus", 2048);
+    assert(fb.fits && fb.kv_type == cp.kv_type && has_args(fb, "--cache-disk", "/data/PS5LM/cache/prompts") &&
+           has_args(fb, "--cache-disk-mib", "2048"));
+    const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, "on", 0);
+    assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
+    // Large or small disk cache limits strictly honor Longest context (ctx_cap) and keep spillover enabled across 2..32 GB.
+    const ps5lm::Plan big_disk = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, "auto", 32768);
+    assert(big_disk.fits && big_disk.ctx == 65536 && has_args(big_disk, "--cache-disk-mib", "32768"));
+    const ps5lm::Plan cap_128k = ps5lm::plan_model(c, budget, 131072, "auto", ps5lm::kPromptUbatch, "auto", 4096);
+    assert(cap_128k.fits && cap_128k.ctx == 131072 && has_args(cap_128k, "--cache-disk-mib", "4096"));
+    // When p.ctx < ctx_cap even with >0.5 GiB initial headroom, tight compute compaction unlocks longer context.
+    ps5lm::ModelInfo iq2_27b;
+    iq2_27b.ok = true; iq2_27b.file_bytes = 10243816864ull; iq2_27b.n_layer = 64; iq2_27b.full_attn_every = 4;
+    iq2_27b.n_head_kv = 4; iq2_27b.key_length = iq2_27b.value_length = 256; iq2_27b.state_bytes = 160ull << 20;
+    const ps5lm::Plan p27_q8 = ps5lm::plan_model(iq2_27b, 11.74, 65536, "q8_0", ps5lm::kPromptUbatch, "auto", 2048, "/data/PS5LM/cache/prompts", true);
+    assert(p27_q8.fits && p27_q8.ctx == 32768 && p27_q8.kv_type == "q8_0" && p27_q8.disable_introspect);
+    const ps5lm::Plan p27_auto = ps5lm::plan_model(iq2_27b, 11.74, 65536, "auto", ps5lm::kPromptUbatch, "auto", 2048, "/data/PS5LM/cache/prompts", true);
+    assert(p27_auto.fits && p27_auto.ctx == 32768 && p27_auto.kv_type == "q4_0");
+
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
         return 0;
@@ -188,10 +360,5 @@ int main(int argc, char ** argv) {
         }
     }
     assert(saw_q2k && saw_iq2xxs);
-    // Nothing fits in too little memory.
-    ps5lm::ModelInfo big;
-    big.ok = true; big.file_bytes = 20ull << 30; big.n_layer = 32; big.n_head_kv = 8;
-    big.key_length = big.value_length = 128;
-    assert(!ps5lm::plan_model(big, budget).fits);
     std::puts("model_plan_test: ok");
 }

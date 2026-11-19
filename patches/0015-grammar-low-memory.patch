@@ -1,0 +1,141 @@
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+index 0a8a61e7e..92994a0fb 100644
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -31,15 +31,13 @@ static std::pair<uint32_t, const char *> decode_utf8(const char * src) {
+     return std::make_pair(value, pos);
+ }
+ 
+-static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
++static llama_partial_utf8 decode_utf8_into(
+         const std::string & src,
+-        llama_partial_utf8 partial_start) {
++        llama_partial_utf8 partial_start,
++        std::vector<uint32_t> & code_points) {
+     static const int      lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
+     const char          * pos      = src.c_str();
+-    std::vector<uint32_t> code_points;
+-
+-    // common english strings have the same number of codepoints and bytes. `+ 1` for the terminating 0.
+-    code_points.reserve(src.size() + 1);
++    const size_t          start_sz = code_points.size();
+     uint32_t value    = partial_start.value;
+     int      n_remain = partial_start.n_remain;
+ 
+@@ -48,8 +46,9 @@ static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
+         uint8_t next_byte = static_cast<uint8_t>(*pos);
+         if ((next_byte >> 6) != 2) {
+             // invalid sequence, abort
++            code_points.resize(start_sz);
+             code_points.push_back(0);
+-            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, -1 });
++            return llama_partial_utf8{ 0, -1 };
+         }
+         value = (value << 6) + (next_byte & 0x3F);
+         ++pos;
+@@ -68,9 +67,9 @@ static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
+ 
+         if (n_remain < 0) {
+             // invalid sequence, abort
+-            code_points.clear();
++            code_points.resize(start_sz);
+             code_points.push_back(0);
+-            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, n_remain });
++            return llama_partial_utf8{ 0, n_remain };
+         }
+ 
+         uint8_t mask  = (1 << (7 - n_remain)) - 1;
+@@ -88,7 +87,17 @@ static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
+     }
+     code_points.push_back(0);
+ 
+-    return std::make_pair(std::move(code_points), llama_partial_utf8{ value, n_remain });
++    return llama_partial_utf8{ value, n_remain };
++}
++
++static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
++        const std::string & src,
++        llama_partial_utf8 partial_start) {
++    std::vector<uint32_t> code_points;
++    // common english strings have the same number of codepoints and bytes. `+ 1` for the terminating 0.
++    code_points.reserve(src.size() + 1);
++    const auto partial = decode_utf8_into(src, partial_start, code_points);
++    return std::make_pair(std::move(code_points), partial);
+ }
+ 
+ static bool is_digit_char(char c) {
+@@ -1064,7 +1073,7 @@ llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
+         const llama_grammar_candidates & candidates) {
+ 
+     llama_grammar_candidates rejects;
+-    rejects.reserve(candidates.size());
++    rejects.reserve(std::min<size_t>(candidates.size(), 64));
+ 
+     if (stack.empty()) {
+         for (const auto & tok : candidates) {
+@@ -1094,7 +1103,7 @@ llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
+     }
+ 
+     llama_grammar_candidates next_candidates;
+-    next_candidates.reserve(candidates.size());
++    next_candidates.reserve(std::min<size_t>(candidates.size(), 64));
+ 
+     for (const auto & tok : candidates) {
+         if (*tok.code_points == 0) {
+@@ -1111,6 +1120,10 @@ llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
+         }
+     }
+ 
++    if (next_candidates.empty()) {
++        return rejects;
++    }
++
+     const auto * stack_pos_after = llama_grammar_match_char(stack_pos, 0).second;
+ 
+     // update top of stack to next element, if any
+@@ -1371,11 +1384,19 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
+         }
+     }
+ 
+-    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
+-    candidates_decoded.reserve(cur_p->size);
++    struct decoded_candidate {
++        size_t             index;
++        size_t             cp_offset;
++        llama_partial_utf8 partial_utf8;
++        llama_token        id;
++    };
+ 
+-    llama_grammar_candidates candidates_grammar;
+-    candidates_grammar.reserve(cur_p->size);
++    // Pack all candidate codepoints into one contiguous buffer instead of cur_p->size separate heap vectors.
++    std::vector<uint32_t> decoded_cp_buf;
++    decoded_cp_buf.reserve(cur_p->size * 4);
++
++    std::vector<decoded_candidate> decoded_meta;
++    decoded_meta.reserve(cur_p->size);
+ 
+     for (size_t i = 0; i < cur_p->size; ++i) {
+         const llama_token id      = cur_p->data[i].id;
+@@ -1388,11 +1409,19 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
+         } else if (piece.empty() || piece[0] == 0) {
+             cur_p->data[i].logit = -INFINITY;
+         } else {
+-            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
+-            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
++            const size_t cp_offset = decoded_cp_buf.size();
++            const auto   partial   = decode_utf8_into(piece, grammar.partial_utf8, decoded_cp_buf);
++            decoded_meta.push_back({ i, cp_offset, partial, id });
+         }
+     }
+ 
++    llama_grammar_candidates candidates_grammar;
++    candidates_grammar.reserve(decoded_meta.size());
++    for (const auto & meta : decoded_meta) {
++        candidates_grammar.push_back({ meta.index, decoded_cp_buf.data() + meta.cp_offset, meta.partial_utf8, meta.id });
++    }
++    std::vector<decoded_candidate>().swap(decoded_meta);
++
+     const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+     for (const auto & reject : rejects) {
+         cur_p->data[reject.index].logit = -INFINITY;

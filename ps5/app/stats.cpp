@@ -36,6 +36,7 @@ namespace {
 
 constexpr size_t kHistory = 120;  // seconds of history in the charts
 constexpr double kGiB     = 1073741824.0;
+constexpr int    kLlamaPollTimeoutS = 8;  // exceeds ~4.7s synchronous .seq prompt_save in llama-server
 
 void push(std::vector<float> & v, float x) {
     v.push_back(x);
@@ -134,7 +135,7 @@ std::string http_post(int port, const char * path, const std::string & body, int
     if (fd < 0) {
         return {};
     }
-    timeval tv = { timeout_s, 0 };
+    timeval tv = { std::max(timeout_s, 1), 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     sockaddr_in addr = {};
@@ -347,7 +348,7 @@ void StatsCollector::run() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         const double wall = now_s(), cpu = cpu_seconds();
 
-        const std::string m = http_get(port_, "/metrics");
+        const std::string m = http_get(port_, "/metrics", kLlamaPollTimeoutS);
         // Only real metrics: while the model loads the server already answers,
         // with 503 "Loading model", and that is not ready.
         const bool        up = m.find("llamacpp:") != std::string::npos;
@@ -357,7 +358,7 @@ void StatsCollector::run() {
         const bool   working = metric(m, "requests_processing") > 0;
         std::string  slots;
         if (up) {
-            slots = http_get(port_, "/slots");
+            slots = http_get(port_, "/slots", kLlamaPollTimeoutS);
         }
 
         double pool = 0, free = 0, heap = 0;
@@ -487,7 +488,8 @@ void StatsCollector::run() {
                 const double dgen = gen_s - last_gen_s;
                 live_.gen_tps = dgen > 0.05 ? (float) ((tokens - last_tokens) / dgen) : 0.0f;
             }
-            live_.ctx_used = (uint32_t) (json_int(slots, "n_prompt_tokens") + json_int(slots, "n_decoded"));
+            // /slots n_prompt_tokens is prompt.tokens.size(), which already includes generated tokens.
+            live_.ctx_used = (uint32_t) json_int(slots, "n_prompt_tokens");
             // The server's counters move only when a request ends, so during a
             // long reply the speed comes from the slot's decoded count.
             const double decoded = (double) json_int(slots, "n_decoded");
