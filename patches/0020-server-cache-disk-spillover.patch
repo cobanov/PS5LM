@@ -1,0 +1,1766 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1724,6 +1724,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_explicit = true;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--cache-disk"}, "DIR",
++        "directory on disk to spill/store prompt cache states when RAM/VRAM is full or disabled (default: disabled)",
++        [](common_params & params, const std::string & value) {
++            params.cache_disk_dir = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-disk-mib"}, "N",
++        string_format("set the maximum disk prompt cache size in MiB (default: %d, 0 - no limit, -1 - disable)", params.cache_disk_mib),
++        [](common_params & params, int value) {
++            params.cache_disk_mib = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -645,6 +645,8 @@ struct common_params {
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
++    std::string cache_disk_dir  = "";    // optional SSD directory for overflowing / low-VRAM prompt cache
++    int32_t cache_disk_mib      = 4096;  // 0 = no limit, -1 = disable, >0 = MiB budget on disk
+ 
+     // llama-connect params
+     bool        server_connect      = false;
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -919,6 +919,26 @@ extern "C" {
+                           size_t   n_token_capacity,
+                           size_t * n_token_count_out);
+ 
++    typedef bool (*llama_state_write_cb)(const void * data, size_t size, void * user_data);
++    typedef bool (*llama_state_read_cb)(void * data, size_t size, void * user_data);
++
++    LLAMA_API size_t llama_state_seq_save_stream(
++            struct llama_context * ctx,
++                    llama_seq_id   seq_id,
++               const llama_token * tokens,
++                          size_t   n_token_count,
++            llama_state_write_cb   write_cb,
++                          void *   user_data);
++
++    LLAMA_API size_t llama_state_seq_load_stream(
++            struct llama_context * ctx,
++                    llama_seq_id   dest_seq_id,
++                     llama_token * tokens_out,
++                          size_t   n_token_capacity,
++                          size_t * n_token_count_out,
++             llama_state_read_cb   read_cb,
++                          void *   user_data);
++
+ #define LLAMA_STATE_SEQ_FLAGS_NONE 0
+ 
+ // for backwards-compat
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3078,6 +3078,74 @@ private:
+     std::vector<uint8_t> temp_buffer;
+ };
+ 
++class llama_io_write_stream : public llama_io_write_i {
++public:
++    llama_io_write_stream(llama_state_write_cb cb, void * ud) : write_cb(cb), user_data(ud) {}
++
++    void write(const void * src, size_t size) override {
++        if (size > 0 && !write_cb(src, size, user_data)) {
++            throw std::runtime_error("failed to write sequence state stream");
++        }
++        size_written += size;
++    }
++
++    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        constexpr size_t kChunk = 4u << 20;
++        temp_buffer.resize(std::min(size, kChunk));
++        size_t done = 0;
++        while (done < size) {
++            const size_t n = std::min(kChunk, size - done);
++            ggml_backend_tensor_get(tensor, temp_buffer.data(), offset + done, n);
++            write(temp_buffer.data(), n);
++            done += n;
++        }
++    }
++
++    size_t n_bytes() override {
++        return size_written;
++    }
++
++private:
++    llama_state_write_cb write_cb;
++    void *               user_data;
++    size_t               size_written = 0;
++    std::vector<uint8_t> temp_buffer;
++};
++
++class llama_io_read_stream : public llama_io_read_i {
++public:
++    llama_io_read_stream(llama_state_read_cb cb, void * ud) : read_cb(cb), user_data(ud) {}
++
++    void read(void * dst, size_t size) override {
++        if (size > 0 && !read_cb(dst, size, user_data)) {
++            throw std::runtime_error("failed to read sequence state stream");
++        }
++        size_read += size;
++    }
++
++    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        constexpr size_t kChunk = 4u << 20;
++        temp_buffer.resize(std::min(size, kChunk));
++        size_t done = 0;
++        while (done < size) {
++            const size_t n = std::min(kChunk, size - done);
++            read(temp_buffer.data(), n);
++            ggml_backend_tensor_set(tensor, temp_buffer.data(), offset + done, n);
++            done += n;
++        }
++    }
++
++    size_t n_bytes() override {
++        return size_read;
++    }
++
++private:
++    llama_state_read_cb  read_cb;
++    void *               user_data;
++    size_t               size_read = 0;
++    std::vector<uint8_t> temp_buffer;
++};
++
+ class llama_io_write_device : public llama_io_write_i {
+ public:
+     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
+@@ -3783,6 +3851,75 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
+     return res;
+ }
+ 
++size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_read_cb read_cb, void * user_data) {
++    if (!read_cb) {
++        return 0;
++    }
++    llama_io_read_stream io(read_cb, user_data);
++
++    auto read_u32 = [&io]() {
++        uint32_t v = 0;
++        io.read(&v, sizeof(v));
++        return v;
++    };
++
++    const uint32_t magic   = read_u32();
++    const uint32_t version = read_u32();
++    if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
++        LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state stream: %08x, %08x\n", __func__, magic, version);
++        return 0;
++    }
++
++    const uint32_t n_token_count = read_u32();
++    if (tokens_out == nullptr) {
++        if (n_token_count_out) {
++            *n_token_count_out = n_token_count;
++        }
++        return io.n_bytes();
++    }
++    if (n_token_count > n_token_capacity) {
++        LLAMA_LOG_ERROR("%s: token count in sequence state stream exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
++        return 0;
++    }
++    if (n_token_count > 0) {
++        io.read(tokens_out, sizeof(llama_token) * n_token_count);
++    }
++    if (n_token_count_out) {
++        *n_token_count_out = n_token_count;
++    }
++
++    const size_t hdr_bytes = io.n_bytes();
++    const size_t nread = state_seq_read_data(io, seq_id, 0);
++    if (nread <= hdr_bytes || nread != io.n_bytes()) {
++        LLAMA_LOG_ERROR("%s: failed to restore sequence state (nread=%zu, io=%zu)\n", __func__, nread, io.n_bytes());
++        return 0;
++    }
++    return io.n_bytes();
++}
++
++size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, llama_state_write_cb write_cb, void * user_data) {
++    if (!write_cb) {
++        return 0;
++    }
++    llama_io_write_stream io(write_cb, user_data);
++
++    const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
++    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
++    const uint32_t n_tok   = (uint32_t) n_token_count;
++
++    io.write(&magic,   sizeof(magic));
++    io.write(&version, sizeof(version));
++    io.write(&n_tok,   sizeof(n_tok));
++    if (n_token_count > 0) {
++        io.write(tokens, sizeof(llama_token) * n_token_count);
++    }
++
++    state_seq_write_data(io, seq_id, 0);
++    const size_t res = io.n_bytes();
++    GGML_ASSERT(res >= sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count);
++    return res;
++}
++
+ size_t llama_context::state_write_data(llama_io_write_i & io) {
+     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
+ 
+@@ -4798,6 +4935,28 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
+     }
+ }
+ 
++size_t llama_state_seq_save_stream(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, llama_state_write_cb write_cb, void * user_data) {
++    ctx->synchronize();
++
++    try {
++        return ctx->state_seq_save_stream(seq_id, tokens, n_token_count, write_cb, user_data);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error saving sequence state stream: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
++size_t llama_state_seq_load_stream(llama_context * ctx, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_read_cb read_cb, void * user_data) {
++    ctx->synchronize();
++
++    try {
++        return ctx->state_seq_load_stream(dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, read_cb, user_data);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error loading sequence state stream: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
+ // compat: llama_batch -> llama_batch_ext -> encode/decode
+ 
+ int llama_context::encode(const llama_batch & batch_inp) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -196,6 +196,21 @@ struct llama_context {
+      const llama_token * tokens,
+                 size_t   n_token_count);
+ 
++    size_t state_seq_load_stream(
++            llama_seq_id   seq_id,
++           llama_token *   tokens_out,
++                  size_t   n_token_capacity,
++                  size_t * n_token_count_out,
++     llama_state_read_cb   read_cb,
++                  void *   user_data);
++
++    size_t state_seq_save_stream(
++            llama_seq_id   seq_id,
++     const llama_token *   tokens,
++                  size_t   n_token_count,
++    llama_state_write_cb   write_cb,
++                  void *   user_data);
++
+     //
+     // perf
+     //
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -350,25 +350,7 @@ struct server_slot {
+             return false;
+         }
+ 
+-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+-
+-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+-
+-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+-
+-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+-        if (cur == nullptr) {
+-            return false;
+-        }
+-
+-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        if (ctx_dft) {
+-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        }
+-
+-        return true;
++        return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id);
+     }
+ 
+     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+@@ -1631,17 +1613,27 @@ private:
+             params_base.cache_idle_slots = false;
+         }
+ 
+-        if (params_base.cache_ram_mib != 0) {
++        const bool has_disk_cache = !params_base.cache_disk_dir.empty() && params_base.cache_disk_mib >= 0;
++
++        if (params_base.cache_ram_mib != 0 || has_disk_cache) {
+             if (params_base.cache_ram_mib < 0) {
+-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
++                SRV_TRC("prompt cache is enabled, RAM limit: %s\n", "no limit");
++            } else if (params_base.cache_ram_mib == 0) {
++                SRV_TRC("prompt cache RAM limit: 0 MiB (disk-only cache at %s)\n", params_base.cache_disk_dir.c_str());
+             } else {
+-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
++                SRV_TRC("prompt cache is enabled, RAM limit: %d MiB\n", params_base.cache_ram_mib);
++            }
++            if (has_disk_cache) {
++                SRV_TRC("disk prompt cache spillover enabled at %s (limit: %d MiB)\n",
++                        params_base.cache_disk_dir.c_str(), params_base.cache_disk_mib);
+             }
+-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
++            SRV_TRC("%s", "use `--cache-ram 0` to disable the RAM prompt cache\n");
+ 
+-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++            prompt_cache = std::make_unique<server_prompt_cache>(
++                    params_base.cache_ram_mib, n_ctx,
++                    params_base.cache_disk_dir, params_base.cache_disk_mib);
+         } else {
+-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
++            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` or `--cache-disk DIR` to enable it\n");
+         }
+         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+ 
+@@ -1701,8 +1693,9 @@ private:
+         metrics.init();
+ 
+         if (params_base.cache_idle_slots) {
+-            if (params_base.cache_ram_mib == 0) {
+-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
++            const bool has_disk_cache = !params_base.cache_disk_dir.empty() && params_base.cache_disk_mib >= 0;
++            if (params_base.cache_ram_mib == 0 && !has_disk_cache) {
++                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk, disabling\n");
+                 params_base.cache_idle_slots = false;
+             } else {
+                 if (params_base.kv_unified) {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -10,7 +10,26 @@
+ #include "speculative.h"
+ #include "server-common.h"
+ 
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
+ #include <sstream>
++#include <vector>
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++#if defined(__GNUC__) || defined(__clang__)
++extern "C" __attribute__((weak)) int ps5lm_prompt_cache_write(int op, const char * path, const void * data, size_t size);
++#endif
+ 
+ //
+ // task_params
+@@ -1727,6 +1746,449 @@ json server_task_result_apply_lora::to_json() {
+ //
+ // server_prompt_cache
+ //
++namespace {
++
++constexpr uint32_t kPchkMagic   = 0x4B484350u; // "PCHK"
++constexpr uint32_t kPchkVersion = 1;
++constexpr uint64_t kFnv1aOffset = 14695981039346656037ull;
++constexpr uint64_t kFnv1aPrime  = 1099511628211ull;
++
++uint64_t fnv1a_update(uint64_t h, const void * data, size_t size) {
++    const uint8_t * p = static_cast<const uint8_t *>(data);
++    for (size_t i = 0; i < size; ++i) {
++        h ^= uint64_t(p[i]);
++        h *= kFnv1aPrime;
++    }
++    return h;
++}
++
++bool posix_write_all(int fd, const void * data, size_t size) {
++    const uint8_t * p = static_cast<const uint8_t *>(data);
++    size_t left = size;
++    while (left > 0) {
++#ifdef _WIN32
++        const unsigned int chunk = (unsigned int) std::min<size_t>(left, 1u << 24);
++        const int n = ::_write(fd, p, chunk);
++#else
++        const ssize_t n = ::write(fd, p, left);
++#endif
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return false;
++        }
++        if (n == 0) {
++            return false;
++        }
++        p += n;
++        left -= (size_t) n;
++    }
++    return true;
++}
++
++class disk_stream_writer {
++public:
++    explicit disk_stream_writer(size_t buf_cap = (8u << 20)) : buf_cap_(std::max<size_t>(buf_cap, 4096)) {}
++
++    ~disk_stream_writer() {
++        if (open_) {
++            abort();
++        }
++    }
++
++    disk_stream_writer(const disk_stream_writer &)             = delete;
++    disk_stream_writer & operator=(const disk_stream_writer &) = delete;
++
++    bool open(const std::string & final_path) {
++        final_path_ = final_path;
++        part_path_  = final_path + ".part";
++        std::error_code ec;
++        std::filesystem::remove(part_path_, ec);
++
++        use_ftp_   = false;
++        fd_        = -1;
++        committed_ = false;
++        bytes_     = 0;
++        hash_      = kFnv1aOffset;
++
++#if defined(__GNUC__) || defined(__clang__)
++        if (ps5lm_prompt_cache_write) {
++            const int r = ps5lm_prompt_cache_write(0, part_path_.c_str(), nullptr, 0);
++            if (r == 1) {
++                use_ftp_ = true;
++            } else if (r == 0) {
++                return false;
++            }
++        }
++#endif
++        if (!use_ftp_) {
++#ifdef _WIN32
++            fd_ = ::_open(part_path_.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0644);
++#else
++            fd_ = ::open(part_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++#endif
++            if (fd_ < 0) {
++                return false;
++            }
++        }
++
++        buf_.clear();
++        buf_.reserve(buf_cap_);
++        open_ = true;
++        return true;
++    }
++
++    bool write(const void * data, size_t size) {
++        if (!open_) {
++            return false;
++        }
++        if (size == 0) {
++            return true;
++        }
++        hash_ = fnv1a_update(hash_, data, size);
++        const uint8_t * p = static_cast<const uint8_t *>(data);
++        while (size > 0) {
++            if (buf_.empty() && size >= buf_cap_) {
++                const size_t chunk = (size / buf_cap_) * buf_cap_;
++                if (!flush_raw(p, chunk)) {
++                    return false;
++                }
++                p += chunk;
++                size -= chunk;
++                bytes_ += chunk;
++                continue;
++            }
++            const size_t avail = buf_cap_ - buf_.size();
++            const size_t take  = std::min(size, avail);
++            buf_.insert(buf_.end(), p, p + take);
++            p += take;
++            size -= take;
++            bytes_ += take;
++            if (buf_.size() == buf_cap_ && !flush_buf()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool finish() {
++        if (!open_) {
++            return committed_;
++        }
++        bool ok = flush_buf();
++        std::vector<uint8_t>().swap(buf_);
++        if (use_ftp_) {
++#if defined(__GNUC__) || defined(__clang__)
++            if (ok) {
++                ok = (ps5lm_prompt_cache_write(2, part_path_.c_str(), nullptr, 0) == 1);
++            } else {
++                ps5lm_prompt_cache_write(3, part_path_.c_str(), nullptr, 0);
++            }
++#endif
++        } else if (fd_ >= 0) {
++#ifdef _WIN32
++            if (::_close(fd_) != 0) {
++                ok = false;
++            }
++#else
++            if (::close(fd_) != 0) {
++                ok = false;
++            }
++#endif
++            fd_ = -1;
++        }
++        open_ = false;
++        if (ok) {
++            std::error_code ec;
++            std::filesystem::rename(part_path_, final_path_, ec);
++            ok = !ec;
++        }
++        if (!ok) {
++            std::error_code ec;
++            std::filesystem::remove(part_path_, ec);
++            std::filesystem::remove(final_path_, ec);
++            return false;
++        }
++        committed_ = true;
++        return true;
++    }
++
++    void abort() {
++        std::vector<uint8_t>().swap(buf_);
++        if (!open_) {
++            return;
++        }
++        if (use_ftp_) {
++#if defined(__GNUC__) || defined(__clang__)
++            ps5lm_prompt_cache_write(3, part_path_.c_str(), nullptr, 0);
++#endif
++        } else if (fd_ >= 0) {
++#ifdef _WIN32
++            ::_close(fd_);
++#else
++            ::close(fd_);
++#endif
++            fd_ = -1;
++        }
++        open_ = false;
++        std::error_code ec;
++        std::filesystem::remove(part_path_, ec);
++    }
++
++    size_t bytes_written() const {
++        return bytes_;
++    }
++
++    uint64_t checksum() const {
++        return hash_;
++    }
++
++private:
++    bool flush_raw(const void * data, size_t size) {
++        if (size == 0) {
++            return true;
++        }
++        if (use_ftp_) {
++#if defined(__GNUC__) || defined(__clang__)
++            return ps5lm_prompt_cache_write(1, part_path_.c_str(), data, size) == 1;
++#else
++            return false;
++#endif
++        }
++        return fd_ >= 0 && posix_write_all(fd_, data, size);
++    }
++
++    bool flush_buf() {
++        if (buf_.empty()) {
++            return true;
++        }
++        const bool ok = flush_raw(buf_.data(), buf_.size());
++        buf_.clear();
++        return ok;
++    }
++
++    std::string          final_path_;
++    std::string          part_path_;
++    size_t               buf_cap_;
++    std::vector<uint8_t> buf_;
++    int                  fd_        = -1;
++    bool                 use_ftp_   = false;
++    bool                 open_      = false;
++    bool                 committed_ = false;
++    size_t               bytes_     = 0;
++    uint64_t             hash_      = kFnv1aOffset;
++};
++
++class disk_stream_reader {
++public:
++    explicit disk_stream_reader(size_t buf_cap = (4u << 20)) : buf_cap_(std::max<size_t>(buf_cap, 4096)) {}
++
++    ~disk_stream_reader() {
++        close();
++    }
++
++    disk_stream_reader(const disk_stream_reader &)             = delete;
++    disk_stream_reader & operator=(const disk_stream_reader &) = delete;
++
++    bool open(const std::string & path) {
++        close();
++#ifdef _WIN32
++        fd_ = ::_open(path.c_str(), _O_RDONLY | _O_BINARY);
++#else
++        fd_ = ::open(path.c_str(), O_RDONLY);
++#endif
++        if (fd_ < 0) {
++            return false;
++        }
++        buf_.resize(buf_cap_);
++        pos_        = 0;
++        len_        = 0;
++        bytes_read_ = 0;
++        hash_       = kFnv1aOffset;
++        return true;
++    }
++
++    bool read(void * dst, size_t size) {
++        if (fd_ < 0) {
++            return false;
++        }
++        uint8_t * out = static_cast<uint8_t *>(dst);
++        while (size > 0) {
++            if (pos_ < len_) {
++                const size_t avail = len_ - pos_;
++                const size_t take  = std::min(size, avail);
++                std::memcpy(out, buf_.data() + pos_, take);
++                hash_        = fnv1a_update(hash_, out, take);
++                bytes_read_ += take;
++                pos_        += take;
++                out         += take;
++                size        -= take;
++                continue;
++            }
++            if (size >= buf_cap_) {
++                const size_t got = read_some(out, size);
++                if (got == 0) {
++                    return false;
++                }
++                hash_        = fnv1a_update(hash_, out, got);
++                bytes_read_ += got;
++                out         += got;
++                size        -= got;
++                continue;
++            }
++            pos_ = 0;
++            len_ = read_some(buf_.data(), buf_cap_);
++            if (len_ == 0) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool at_eof() {
++        if (fd_ < 0) {
++            return true;
++        }
++        if (pos_ < len_) {
++            return false;
++        }
++        pos_ = 0;
++        len_ = read_some(buf_.data(), buf_cap_);
++        return len_ == 0;
++    }
++
++    size_t bytes_read() const {
++        return bytes_read_;
++    }
++
++    uint64_t checksum() const {
++        return hash_;
++    }
++
++    void close() {
++        std::vector<uint8_t>().swap(buf_);
++        pos_ = 0;
++        len_ = 0;
++        if (fd_ >= 0) {
++#ifdef _WIN32
++            ::_close(fd_);
++#else
++            ::close(fd_);
++#endif
++            fd_ = -1;
++        }
++    }
++
++private:
++    size_t read_some(void * dst, size_t size) {
++#ifdef _WIN32
++        const unsigned int req = (unsigned int) std::min<size_t>(size, 1u << 24);
++        while (true) {
++            const int n = ::_read(fd_, dst, req);
++            if (n < 0 && errno == EINTR) {
++                continue;
++            }
++            return n > 0 ? (size_t) n : 0;
++        }
++#else
++        while (true) {
++            const ssize_t n = ::read(fd_, dst, size);
++            if (n < 0 && errno == EINTR) {
++                continue;
++            }
++            return n > 0 ? (size_t) n : 0;
++        }
++#endif
++    }
++
++    size_t               buf_cap_;
++    std::vector<uint8_t> buf_;
++    int                  fd_         = -1;
++    size_t               pos_        = 0;
++    size_t               len_        = 0;
++    size_t               bytes_read_ = 0;
++    uint64_t             hash_       = kFnv1aOffset;
++};
++
++size_t estimate_checkpoints_bytes(const std::list<common_prompt_checkpoint> & ckpts) {
++    if (ckpts.empty()) {
++        return 0;
++    }
++    size_t total = sizeof(uint32_t) * 3 + sizeof(uint64_t);
++    for (const auto & ckpt : ckpts) {
++        total += sizeof(int64_t) + sizeof(llama_pos) * 2 + sizeof(uint64_t) * 3
++               + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
++    }
++    return total;
++}
++
++} // namespace
++
++server_prompt_cache::server_prompt_cache(
++        int32_t limit_size_mib, size_t limit_tokens,
++        std::string disk_dir, int32_t limit_disk_mib) {
++    this->ram_disabled = (limit_size_mib == 0);
++    this->limit_size   = limit_size_mib > 0 ? 1024ull * 1024ull * uint64_t(limit_size_mib) : 0;
++    this->limit_tokens = limit_tokens;
++    this->disk_dir     = std::move(disk_dir);
++    this->disk_disabled = this->disk_dir.empty() || limit_disk_mib < 0;
++    this->limit_disk_size = limit_disk_mib > 0 ? 1024ull * 1024ull * uint64_t(limit_disk_mib) : 0;
++
++    if (!this->disk_disabled) {
++        std::error_code ec;
++        std::filesystem::create_directories(this->disk_dir, ec);
++        if (ec) {
++            SRV_WRN("failed to create disk prompt cache directory %s: %s\n",
++                    this->disk_dir.c_str(), ec.message().c_str());
++            this->disk_disabled = true;
++        } else {
++            const auto ends_with = [](const std::string & s, const char * suf) {
++                const size_t n = std::strlen(suf);
++                return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
++            };
++            // Sweep stale checkpoint and partial temp files left by any prior hard crash.
++            for (const auto & entry : std::filesystem::directory_iterator(this->disk_dir, ec)) {
++                if (ec) {
++                    break;
++                }
++                const std::string name = entry.path().filename().string();
++                if (name.rfind("ps5lm_ckpt_", 0) == 0 &&
++                    (ends_with(name, ".bin") || ends_with(name, ".seq") || ends_with(name, ".chk") || ends_with(name, ".part"))) {
++                    std::error_code rm_ec;
++                    std::filesystem::remove(entry.path(), rm_ec);
++                }
++            }
++        }
++    }
++}
++
++server_prompt_cache::~server_prompt_cache() {
++    for (auto & state : states) {
++        remove_disk_file(state);
++    }
++}
++
++size_t server_prompt_cache::ram_size() const {
++    size_t res = 0;
++
++    for (const auto & state : states) {
++        res += state.ram_size();
++    }
++
++    return res;
++}
++
++size_t server_prompt_cache::disk_size() const {
++    size_t res = 0;
++
++    for (const auto & state : states) {
++        res += state.disk_size();
++    }
++
++    return res;
++}
++
+ size_t server_prompt_cache::size() const {
+     size_t res = 0;
+ 
+@@ -1747,7 +2209,333 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
++void server_prompt_cache::remove_disk_file(server_prompt_cache_state & state) {
++    if (!state.disk_path.empty()) {
++        std::remove(state.disk_path.c_str());
++        state.disk_path.clear();
++    }
++    if (!state.disk_path_dft.empty()) {
++        std::remove(state.disk_path_dft.c_str());
++        state.disk_path_dft.clear();
++    }
++    if (!state.disk_ckpt_path.empty()) {
++        std::remove(state.disk_ckpt_path.c_str());
++        state.disk_ckpt_path.clear();
++    }
++    state.disk_size_tgt     = 0;
++    state.disk_size_dft     = 0;
++    state.disk_header_bytes = 0;
++    state.disk_ckpt_size    = 0;
++    state.disk_hash_tgt     = 0;
++    state.disk_hash_dft     = 0;
++    state.disk_hash_ckpt    = 0;
++    state.disk_is_seq_file  = false;
++}
++
++bool server_prompt_cache::write_disk_blob(
++        const std::string & path,
++        const uint8_t * tgt, size_t tgt_size,
++        const uint8_t * dft, size_t dft_size,
++        size_t * out_header_bytes,
++        uint64_t * out_hash) {
++    disk_stream_writer writer(8u << 20);
++    if (!writer.open(path)) {
++        return false;
++    }
++    const char magic[4] = {'P', 'C', 'K', '1'};
++    const uint64_t hdr[2] = {uint64_t(tgt_size), uint64_t(dft_size)};
++    bool ok = writer.write(magic, sizeof(magic))
++           && writer.write(hdr, sizeof(hdr))
++           && (tgt_size == 0 || writer.write(tgt, tgt_size))
++           && (dft_size == 0 || writer.write(dft, dft_size));
++    const uint64_t payload_hash = writer.checksum();
++    ok = ok && writer.write(&payload_hash, sizeof(payload_hash)) && writer.finish();
++    if (!ok) {
++        writer.abort();
++        return false;
++    }
++    if (out_header_bytes) {
++        *out_header_bytes = sizeof(magic) + sizeof(hdr) + sizeof(payload_hash);
++    }
++    if (out_hash) {
++        *out_hash = payload_hash;
++    }
++    return true;
++}
++
++bool server_prompt_cache::read_disk_blob(
++        const std::string & path, size_t tgt_size, size_t dft_size,
++        uint64_t expected_hash,
++        std::vector<uint8_t> & tgt_out, std::vector<uint8_t> & dft_out) {
++    disk_stream_reader reader(4u << 20);
++    if (!reader.open(path)) {
++        return false;
++    }
++    char magic[4] = {};
++    uint64_t hdr[2] = {};
++    bool ok = reader.read(magic, sizeof(magic))
++           && std::memcmp(magic, "PCK1", 4) == 0
++           && reader.read(hdr, sizeof(hdr))
++           && hdr[0] == uint64_t(tgt_size)
++           && hdr[1] == uint64_t(dft_size);
++    if (ok) {
++        try {
++            tgt_out.resize(tgt_size);
++            if (tgt_size > 0 && !reader.read(tgt_out.data(), tgt_size)) {
++                ok = false;
++            }
++            if (ok && dft_size > 0) {
++                dft_out.resize(dft_size);
++                if (!reader.read(dft_out.data(), dft_size)) {
++                    ok = false;
++                }
++            }
++        } catch (const std::bad_alloc & e) {
++            SRV_WRN("failed to allocate transient buffer reading disk cache %s: %s\n", path.c_str(), e.what());
++            ok = false;
++        }
++    }
++    if (ok) {
++        const uint64_t computed_hash = reader.checksum();
++        uint64_t footer_hash = 0;
++        ok = reader.read(&footer_hash, sizeof(footer_hash))
++          && computed_hash == footer_hash
++          && (expected_hash == 0 || computed_hash == expected_hash)
++          && reader.at_eof();
++    }
++    reader.close();
++    if (!ok) {
++        tgt_out.clear();
++        tgt_out.shrink_to_fit();
++        dft_out.clear();
++        dft_out.shrink_to_fit();
++    }
++    return ok;
++}
++
++bool server_prompt_cache::write_checkpoints_file(
++        const std::string & path,
++        const std::list<common_prompt_checkpoint> & ckpts,
++        size_t * out_bytes,
++        uint64_t * out_hash) {
++    disk_stream_writer writer(1u << 20);
++    if (!writer.open(path)) {
++        return false;
++    }
++    const uint32_t magic   = kPchkMagic;
++    const uint32_t version = kPchkVersion;
++    const uint32_t count   = (uint32_t) ckpts.size();
++    bool ok = writer.write(&magic, sizeof(magic))
++           && writer.write(&version, sizeof(version))
++           && writer.write(&count, sizeof(count));
++    for (const auto & ckpt : ckpts) {
++        if (!ok) {
++            break;
++        }
++        const int64_t   n_tokens = ckpt.n_tokens;
++        const llama_pos pos_min  = ckpt.pos_min;
++        const llama_pos pos_max  = ckpt.pos_max;
++        const uint64_t  sz_tgt   = ckpt.data_tgt.size();
++        const uint64_t  sz_dft   = ckpt.data_dft.size();
++        const uint64_t  sz_spec  = ckpt.data_spec.size();
++        ok = writer.write(&n_tokens, sizeof(n_tokens))
++          && writer.write(&pos_min, sizeof(pos_min))
++          && writer.write(&pos_max, sizeof(pos_max))
++          && writer.write(&sz_tgt, sizeof(sz_tgt))
++          && writer.write(&sz_dft, sizeof(sz_dft))
++          && writer.write(&sz_spec, sizeof(sz_spec))
++          && (sz_tgt == 0 || writer.write(ckpt.data_tgt.data(), sz_tgt))
++          && (sz_dft == 0 || writer.write(ckpt.data_dft.data(), sz_dft))
++          && (sz_spec == 0 || writer.write(ckpt.data_spec.data(), sz_spec));
++    }
++    const uint64_t payload_hash = writer.checksum();
++    ok = ok && writer.write(&payload_hash, sizeof(payload_hash)) && writer.finish();
++    if (!ok) {
++        writer.abort();
++        return false;
++    }
++    if (out_bytes) {
++        *out_bytes = writer.bytes_written();
++    }
++    if (out_hash) {
++        *out_hash = payload_hash;
++    }
++    return true;
++}
++
++bool server_prompt_cache::read_checkpoints_file(
++        const std::string & path,
++        uint64_t expected_hash,
++        std::list<common_prompt_checkpoint> & out) {
++    out.clear();
++    disk_stream_reader reader(1u << 20);
++    if (!reader.open(path)) {
++        return false;
++    }
++    uint32_t magic = 0, version = 0, count = 0;
++    bool ok = reader.read(&magic, sizeof(magic))
++           && reader.read(&version, sizeof(version))
++           && reader.read(&count, sizeof(count))
++           && magic == kPchkMagic
++           && version == kPchkVersion
++           && count <= 4096;
++    for (uint32_t i = 0; ok && i < count; ++i) {
++        common_prompt_checkpoint ckpt;
++        ckpt.id_task = -1;
++        uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
++        ok = reader.read(&ckpt.n_tokens, sizeof(ckpt.n_tokens))
++          && reader.read(&ckpt.pos_min, sizeof(ckpt.pos_min))
++          && reader.read(&ckpt.pos_max, sizeof(ckpt.pos_max))
++          && reader.read(&sz_tgt, sizeof(sz_tgt))
++          && reader.read(&sz_dft, sizeof(sz_dft))
++          && reader.read(&sz_spec, sizeof(sz_spec));
++        if (!ok || sz_tgt > (8ull << 30) || sz_dft > (8ull << 30) || sz_spec > (1ull << 30)) {
++            ok = false;
++            break;
++        }
++        try {
++            ckpt.data_tgt.resize(sz_tgt);
++            ckpt.data_dft.resize(sz_dft);
++            ckpt.data_spec.resize(sz_spec);
++        } catch (const std::bad_alloc & e) {
++            SRV_WRN("failed to allocate buffer reading checkpoints %s: %s\n", path.c_str(), e.what());
++            ok = false;
++            break;
++        }
++        ok = (sz_tgt == 0 || reader.read(ckpt.data_tgt.data(), sz_tgt))
++          && (sz_dft == 0 || reader.read(ckpt.data_dft.data(), sz_dft))
++          && (sz_spec == 0 || reader.read(ckpt.data_spec.data(), sz_spec));
++        if (ok) {
++            out.push_back(std::move(ckpt));
++        }
++    }
++    if (ok) {
++        const uint64_t computed_hash = reader.checksum();
++        uint64_t footer_hash = 0;
++        ok = reader.read(&footer_hash, sizeof(footer_hash))
++          && computed_hash == footer_hash
++          && (expected_hash == 0 || computed_hash == expected_hash)
++          && reader.at_eof();
++    }
++    reader.close();
++    if (!ok) {
++        out.clear();
++    }
++    return ok;
++}
++
++void server_prompt_cache::evict_disk_for(size_t incoming_bytes) {
++    if (disk_disabled || limit_disk_size == 0) {
++        return;
++    }
++    size_t cur_disk = disk_size();
++    while (cur_disk + incoming_bytes > limit_disk_size) {
++        auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) {
++            return s.on_disk();
++        });
++        if (it == states.end()) {
++            break;
++        }
++        const size_t evicted = it->disk_size();
++        SRV_WRN(" - disk cache limit reached, removing oldest disk entry (size = %.3f MiB)\n",
++                evicted / (1024.0 * 1024.0));
++        remove_disk_file(*it);
++        states.erase(it);
++        cur_disk = cur_disk >= evicted ? cur_disk - evicted : 0;
++    }
++}
++
++bool server_prompt_cache::ensure_disk_free_space(size_t incoming_bytes) {
++    if (disk_disabled) {
++        return false;
++    }
++    std::error_code ec;
++    const auto sp = std::filesystem::space(disk_dir, ec);
++    if (ec || sp.available == static_cast<uintmax_t>(-1)) {
++        return true;
++    }
++    constexpr size_t kMinFreeHeadroom = 128ull << 20;
++    const uint64_t need = uint64_t(incoming_bytes) + kMinFreeHeadroom;
++    uint64_t avail = sp.available;
++    while (avail < need) {
++        auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) {
++            return s.on_disk();
++        });
++        if (it == states.end()) {
++            break;
++        }
++        const size_t evicted = it->disk_size();
++        SRV_WRN(" - low free disk space (%.1f MiB available), removing oldest disk entry (size = %.3f MiB)\n",
++                avail / (1024.0 * 1024.0), evicted / (1024.0 * 1024.0));
++        remove_disk_file(*it);
++        states.erase(it);
++        avail += evicted;
++    }
++    const auto sp_after = std::filesystem::space(disk_dir, ec);
++    if (!ec && sp_after.available != static_cast<uintmax_t>(-1) && sp_after.available < need) {
++        SRV_WRN("prompt-cache: insufficient free disk space in %s (%.1f MiB available, need %.1f MiB), skipping disk save\n",
++                disk_dir.c_str(), sp_after.available / (1024.0 * 1024.0), need / (1024.0 * 1024.0));
++        return false;
++    }
++    return true;
++}
++
++bool server_prompt_cache::spill_state_to_disk(server_prompt_cache_state & state) {
++    if (disk_disabled || state.on_disk()) {
++        return false;
++    }
++    const size_t ckpt_est = estimate_checkpoints_bytes(state.prompt.checkpoints);
++    const size_t total = state.data.size() + 28 + ckpt_est;
++    if (limit_disk_size > 0 && total > limit_disk_size) {
++        return false;
++    }
++    evict_disk_for(total);
++    if (!ensure_disk_free_space(total)) {
++        return false;
++    }
++    const uint64_t fid = next_disk_id++;
++    const std::string path = (std::filesystem::path(disk_dir) / ("ps5lm_ckpt_" + std::to_string(fid) + ".bin")).string();
++    size_t hdr_bytes = 0;
++    uint64_t blob_hash = 0;
++    if (!write_disk_blob(path, state.data.main.data(), state.data.main.size(), state.data.drft.data(), state.data.drft.size(), &hdr_bytes, &blob_hash)) {
++        return false;
++    }
++    std::string ckpt_path;
++    size_t ckpt_bytes = 0;
++    uint64_t ckpt_hash = 0;
++    if (!state.prompt.checkpoints.empty()) {
++        ckpt_path = (std::filesystem::path(disk_dir) / ("ps5lm_ckpt_" + std::to_string(fid) + ".chk")).string();
++        if (!write_checkpoints_file(ckpt_path, state.prompt.checkpoints, &ckpt_bytes, &ckpt_hash)) {
++            std::remove(path.c_str());
++            return false;
++        }
++    }
++    state.disk_path         = path;
++    state.disk_path_dft.clear();
++    state.disk_ckpt_path    = ckpt_path;
++    state.disk_size_tgt     = state.data.main.size();
++    state.disk_size_dft     = state.data.drft.size();
++    state.disk_header_bytes = hdr_bytes;
++    state.disk_ckpt_size    = ckpt_bytes;
++    state.disk_hash_tgt     = blob_hash;
++    state.disk_hash_dft     = 0;
++    state.disk_hash_ckpt    = ckpt_hash;
++    state.disk_is_seq_file  = false;
++    state.data.main.clear();
++    state.data.main.shrink_to_fit();
++    state.data.drft.clear();
++    state.data.drft.shrink_to_fit();
++    state.prompt.checkpoints.clear();
++    SRV_TRC(" - spilled prompt cache state to disk: %s (%.3f MiB)\n",
++            path.c_str(), state.disk_size() / (1024.0 * 1024.0));
++    return true;
++}
++
+ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
++    if (ram_disabled) {
++        return nullptr;
++    }
++
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+@@ -1768,7 +2556,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     // skip over-limit entries to avoid disturbing the cache
+     if (limit_size > 0 && state_size_new > limit_size) {
+-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
++        SRV_WRN(" - prompt state size %.3f MiB exceeds RAM cache size limit %.3f MiB, skipping RAM alloc\n",
+                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+         return nullptr;
+     }
+@@ -1780,6 +2568,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         if (len == (int) it->prompt.tokens.size()) {
+             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+ 
++            remove_disk_file(*it);
+             it = states.erase(it);
+         } else {
+             ++it;
+@@ -1787,12 +2576,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     }
+ 
+     if (limit_size > 0) {
+-        // make room before allocating the new vectors to avoid breaching the limit
+-        while (!states.empty() && size() + state_size_new > limit_size) {
+-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+-                    states.front().size() / (1024.0 * 1024.0));
+-
+-            states.pop_front();
++        // make room in RAM before allocating: prefer spilling oldest RAM states to disk
++        size_t cur_ram = ram_size();
++        while (cur_ram + state_size_new > limit_size) {
++            auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) {
++                return !s.on_disk();
++            });
++            if (it == states.end()) {
++                break;
++            }
++            const size_t state_ram = it->ram_size();
++            if (!spill_state_to_disk(*it)) {
++                SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
++                        state_ram / (1024.0 * 1024.0));
++                states.erase(it);
++            }
++            cur_ram = cur_ram >= state_ram ? cur_ram - state_ram : 0;
+         }
+     }
+ 
+@@ -1806,9 +2605,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+-        limit_size = std::max<size_t>(1, 0.4*size());
+-
+-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
++        if (ram_size() > 0) {
++            limit_size = std::max<size_t>(1, size_t(0.4 * ram_size()));
++            SRV_WRN(" - RAM cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
++        } else {
++            ram_disabled = true;
++        }
+ 
+         update();
+ 
+@@ -1824,11 +2626,162 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+             /*.main =*/ std::move(state_data_tgt),
+             /*.drft =*/ std::move(state_data_dft),
+         },
++        /*.disk_path         =*/ {},
++        /*.disk_path_dft     =*/ {},
++        /*.disk_ckpt_path    =*/ {},
++        /*.disk_size_tgt     =*/ 0,
++        /*.disk_size_dft     =*/ 0,
++        /*.disk_header_bytes =*/ 0,
++        /*.disk_ckpt_size    =*/ 0,
++        /*.disk_hash_tgt     =*/ 0,
++        /*.disk_hash_dft     =*/ 0,
++        /*.disk_hash_ckpt    =*/ 0,
++        /*.disk_is_seq_file  =*/ false,
+     });
+ 
+     return &states.back();
+ }
+ 
++bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
++    const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
++    const size_t cur_size     = cur_size_tgt + cur_size_dft;
++
++    SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
++            (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
++
++    if (!ram_disabled) {
++        if (auto * cur = alloc(prompt, cur_size_tgt, cur_size_dft)) {
++            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
++            if (ctx_dft) {
++                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
++            }
++            return true;
++        }
++    }
++
++    const size_t ckpts_est = estimate_checkpoints_bytes(prompt.checkpoints);
++    const size_t total_est = cur_size + 4096 + ckpts_est;
++    if (disk_disabled || (limit_disk_size > 0 && total_est > limit_disk_size)) {
++        return false;
++    }
++
++    for (auto it = states.begin(); it != states.end(); ++it) {
++        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
++        if (cur_lcp_len == (int) prompt.tokens.size()) {
++            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
++            return false;
++        }
++    }
++
++    for (auto it = states.begin(); it != states.end();) {
++        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
++        if (len == (int) it->prompt.tokens.size()) {
++            remove_disk_file(*it);
++            it = states.erase(it);
++        } else {
++            ++it;
++        }
++    }
++
++    evict_disk_for(total_est);
++    if (!ensure_disk_free_space(total_est)) {
++        return false;
++    }
++
++    // Stream directly tensor-by-tensor onto SSD without allocating a giant contiguous RAM buffer.
++    const auto t_save_start = std::chrono::steady_clock::now();
++    const uint64_t fid = next_disk_id++;
++    const std::string path_tgt = (std::filesystem::path(disk_dir) / ("ps5lm_ckpt_" + std::to_string(fid) + ".seq")).string();
++    const std::string path_dft = ctx_dft
++        ? (std::filesystem::path(disk_dir) / ("ps5lm_ckpt_" + std::to_string(fid) + ".dft.seq")).string()
++        : std::string{};
++    const llama_token dummy_tok = 0;
++
++    auto stream_write_cb = [](const void * data, size_t size, void * ud) -> bool {
++        return static_cast<disk_stream_writer *>(ud)->write(data, size);
++    };
++
++    size_t wrote_tgt = 0;
++    uint64_t hash_tgt = 0;
++    {
++        disk_stream_writer writer(8u << 20);
++        if (!writer.open(path_tgt)) {
++            SRV_WRN("failed to open disk prompt cache state %s\n", path_tgt.c_str());
++            return false;
++        }
++        wrote_tgt = llama_state_seq_save_stream(ctx_tgt, id_slot, &dummy_tok, 0, stream_write_cb, &writer);
++        if (wrote_tgt == 0 || wrote_tgt != writer.bytes_written() || !writer.finish()) {
++            writer.abort();
++            std::remove(path_tgt.c_str());
++            SRV_WRN("failed to stream disk prompt cache state to %s\n", path_tgt.c_str());
++            return false;
++        }
++        hash_tgt = writer.checksum();
++    }
++
++    size_t wrote_dft = 0;
++    uint64_t hash_dft = 0;
++    if (ctx_dft) {
++        disk_stream_writer writer_dft(8u << 20);
++        if (!writer_dft.open(path_dft)) {
++            std::remove(path_tgt.c_str());
++            SRV_WRN("failed to open draft disk prompt cache state %s\n", path_dft.c_str());
++            return false;
++        }
++        wrote_dft = llama_state_seq_save_stream(ctx_dft, id_slot, &dummy_tok, 0, stream_write_cb, &writer_dft);
++        if (wrote_dft == 0 || wrote_dft != writer_dft.bytes_written() || !writer_dft.finish()) {
++            writer_dft.abort();
++            std::remove(path_tgt.c_str());
++            std::remove(path_dft.c_str());
++            SRV_WRN("failed to stream draft disk prompt cache state to %s\n", path_dft.c_str());
++            return false;
++        }
++        hash_dft = writer_dft.checksum();
++    }
++
++    std::string path_chk;
++    size_t wrote_chk = 0;
++    uint64_t hash_chk = 0;
++    if (!prompt.checkpoints.empty()) {
++        path_chk = (std::filesystem::path(disk_dir) / ("ps5lm_ckpt_" + std::to_string(fid) + ".chk")).string();
++        if (!write_checkpoints_file(path_chk, prompt.checkpoints, &wrote_chk, &hash_chk)) {
++            std::remove(path_tgt.c_str());
++            if (!path_dft.empty()) {
++                std::remove(path_dft.c_str());
++            }
++            SRV_WRN("failed to write prompt checkpoints to %s\n", path_chk.c_str());
++            return false;
++        }
++    }
++
++    states.push_back({
++        /*.prompt =*/ {
++            /*.tokens      =*/ prompt.tokens.clone(),
++            /*.checkpoints =*/ {},
++        },
++        /*.data              =*/ {},
++        /*.disk_path         =*/ path_tgt,
++        /*.disk_path_dft     =*/ path_dft,
++        /*.disk_ckpt_path    =*/ path_chk,
++        /*.disk_size_tgt     =*/ wrote_tgt,
++        /*.disk_size_dft     =*/ wrote_dft,
++        /*.disk_header_bytes =*/ 0,
++        /*.disk_ckpt_size    =*/ wrote_chk,
++        /*.disk_hash_tgt     =*/ hash_tgt,
++        /*.disk_hash_dft     =*/ hash_dft,
++        /*.disk_hash_ckpt    =*/ hash_chk,
++        /*.disk_is_seq_file  =*/ true,
++    });
++    const double save_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_save_start).count();
++    const size_t total_saved = wrote_tgt + wrote_dft + wrote_chk;
++    const double save_mbps = save_s > 0.0 ? (total_saved / 1e6) / save_s : 0.0;
++    SRV_INF("prompt-cache: saved %.1f MiB (+ %.1f MiB chk) to disk in %.2f s (%.0f MB/s, hash=%016" PRIx64 ")\n",
++            (wrote_tgt + wrote_dft) / (1024.0 * 1024.0), wrote_chk / (1024.0 * 1024.0),
++            save_s, save_mbps, hash_tgt);
++    return true;
++}
++
+ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+@@ -1846,7 +2799,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+ 
+-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
++        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f (%s)\n",
++                it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur, it->on_disk() ? "disk" : "ram");
+ 
+         // don't trash large prompts
+         if (f_keep_cur < 0.25f) {
+@@ -1862,33 +2816,127 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+     }
+ 
+     if (it_best != states.end()) {
+-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+-
+-        {
+-            auto & data = it_best->data.main;
+-
+-            const size_t size = data.size();
+-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+-            if (n != size) {
+-                SRV_ERR("failed to restore state with size %zu\n", size);
+-
++        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f (%s)\n",
++                f_keep_best, f_sim_best, it_best->on_disk() ? "disk" : "ram");
++
++        std::list<common_prompt_checkpoint> loaded_ckpts;
++        if (it_best->on_disk()) {
++            const auto t_load_start = std::chrono::steady_clock::now();
++            bool ok = false;
++            auto stream_read_cb = [](void * data, size_t size, void * ud) -> bool {
++                return static_cast<disk_stream_reader *>(ud)->read(data, size);
++            };
++            if (it_best->disk_is_seq_file) {
++                llama_token dummy_tok = 0;
++                size_t n_tok_read = 0;
++                {
++                    disk_stream_reader reader(4u << 20);
++                    if (!reader.open(it_best->disk_path)) {
++                        SRV_WRN("prompt-cache: failed to open disk state %s\n", it_best->disk_path.c_str());
++                    } else {
++                        const size_t n_tgt = llama_state_seq_load_stream(
++                                ctx_tgt, id_slot, &dummy_tok, 1, &n_tok_read, stream_read_cb, &reader);
++                        if (n_tgt > 0 && n_tgt == it_best->disk_size_tgt &&
++                            reader.bytes_read() == it_best->disk_size_tgt &&
++                            reader.checksum() == it_best->disk_hash_tgt &&
++                            reader.at_eof()) {
++                            ok = true;
++                        } else {
++                            SRV_WRN("prompt-cache: disk state integrity check failed for %s (read=%zu/%zu, hash=%016" PRIx64 "/%016" PRIx64 "), discarding corrupted entry\n",
++                                    it_best->disk_path.c_str(), reader.bytes_read(), it_best->disk_size_tgt,
++                                    reader.checksum(), it_best->disk_hash_tgt);
++                        }
++                    }
++                }
++                if (ok && !it_best->disk_path_dft.empty()) {
++                    GGML_ASSERT(ctx_dft);
++                    disk_stream_reader reader_dft(4u << 20);
++                    ok = false;
++                    if (!reader_dft.open(it_best->disk_path_dft)) {
++                        SRV_WRN("prompt-cache: failed to open draft disk state %s\n", it_best->disk_path_dft.c_str());
++                    } else {
++                        const size_t n_dft = llama_state_seq_load_stream(
++                                ctx_dft, id_slot, &dummy_tok, 1, &n_tok_read, stream_read_cb, &reader_dft);
++                        if (n_dft > 0 && n_dft == it_best->disk_size_dft &&
++                            reader_dft.bytes_read() == it_best->disk_size_dft &&
++                            reader_dft.checksum() == it_best->disk_hash_dft &&
++                            reader_dft.at_eof()) {
++                            ok = true;
++                        } else {
++                            SRV_WRN("prompt-cache: draft disk state integrity check failed for %s (read=%zu/%zu, hash=%016" PRIx64 "/%016" PRIx64 "), discarding corrupted entry\n",
++                                    it_best->disk_path_dft.c_str(), reader_dft.bytes_read(), it_best->disk_size_dft,
++                                    reader_dft.checksum(), it_best->disk_hash_dft);
++                        }
++                    }
++                }
++            } else {
++                std::vector<uint8_t> tmp_tgt;
++                std::vector<uint8_t> tmp_dft;
++                const std::string path = it_best->disk_path;
++                const size_t size_tgt = it_best->disk_size_tgt;
++                const size_t size_dft = it_best->disk_size_dft;
++
++                ok = read_disk_blob(path, size_tgt, size_dft, it_best->disk_hash_tgt, tmp_tgt, tmp_dft);
++                if (!ok) {
++                    SRV_WRN("prompt-cache: disk blob integrity check failed for %s, discarding corrupted entry\n",
++                            path.c_str());
++                } else {
++                    const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, tmp_tgt.data(), size_tgt, id_slot, 0);
++                    tmp_tgt.clear();
++                    tmp_tgt.shrink_to_fit();
++                    if (n_tgt != size_tgt) {
++                        SRV_ERR("failed to restore disk state with size %zu\n", size_tgt);
++                        ok = false;
++                    }
++                    if (ok && !tmp_dft.empty()) {
++                        GGML_ASSERT(ctx_dft);
++                        const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, tmp_dft.data(), size_dft, id_slot, 0);
++                        tmp_dft.clear();
++                        tmp_dft.shrink_to_fit();
++                        if (n_dft != size_dft) {
++                            SRV_WRN("failed to restore draft disk state with size %zu\n", size_dft);
++                            ok = false;
++                        }
++                    }
++                }
++            }
++            if (ok && !it_best->disk_ckpt_path.empty()) {
++                if (!read_checkpoints_file(it_best->disk_ckpt_path, it_best->disk_hash_ckpt, loaded_ckpts)) {
++                    SRV_WRN("prompt-cache: disk checkpoint integrity check failed for %s, discarding partial checkpoints\n",
++                            it_best->disk_ckpt_path.c_str());
++                    loaded_ckpts.clear();
++                }
++            }
++            const size_t total_disk_bytes    = it_best->disk_size();
++            const size_t restored_ckpt_bytes = it_best->disk_ckpt_size;
++            const uint64_t restored_hash     = it_best->disk_hash_tgt;
++            remove_disk_file(*it_best);
++            if (!ok) {
++                if (auto * mem_tgt = llama_get_memory(ctx_tgt)) {
++                    llama_memory_seq_rm(mem_tgt, id_slot, -1, -1);
++                }
++                if (ctx_dft) {
++                    if (auto * mem_dft = llama_get_memory(ctx_dft)) {
++                        llama_memory_seq_rm(mem_dft, id_slot, -1, -1);
++                    }
++                }
++                states.erase(it_best);
+                 return false;
+             }
+-
+-            data.clear();
+-            data.shrink_to_fit();
+-        }
+-
+-        {
+-            auto & data = it_best->data.drft;
+-
+-            if (!data.empty()) {
+-                GGML_ASSERT(ctx_dft);
++            const double load_s    = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load_start).count();
++            const double state_mib = (total_disk_bytes - restored_ckpt_bytes) / (1024.0 * 1024.0);
++            const double ckpt_mib  = restored_ckpt_bytes / (1024.0 * 1024.0);
++            const double mbps      = load_s > 0.0 ? (total_disk_bytes / 1e6) / load_s : 0.0;
++            SRV_INF("prompt-cache: loaded %.1f MiB (+ %.1f MiB chk) from disk in %.2f s (%.0f MB/s, hash=%016" PRIx64 " ok)\n",
++                    state_mib, ckpt_mib, load_s, mbps, restored_hash);
++        } else {
++            {
++                auto & data = it_best->data.main;
+ 
+                 const size_t size = data.size();
+-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
++                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+                 if (n != size) {
+-                    SRV_WRN("failed to restore state with size %zu\n", size);
++                    SRV_ERR("failed to restore state with size %zu\n", size);
+ 
+                     return false;
+                 }
+@@ -1896,9 +2944,31 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+                 data.clear();
+                 data.shrink_to_fit();
+             }
++
++            {
++                auto & data = it_best->data.drft;
++
++                if (!data.empty()) {
++                    GGML_ASSERT(ctx_dft);
++
++                    const size_t size = data.size();
++                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
++                    if (n != size) {
++                        SRV_WRN("failed to restore state with size %zu\n", size);
++
++                        return false;
++                    }
++
++                    data.clear();
++                    data.shrink_to_fit();
++                }
++            }
+         }
+ 
+         prompt = std::move(it_best->prompt);
++        if (!loaded_ckpts.empty()) {
++            prompt.checkpoints = std::move(loaded_ckpts);
++        }
+ 
+         states.erase(it_best);
+     }
+@@ -1907,34 +2977,67 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ }
+ 
+ void server_prompt_cache::update() {
+-    if (limit_size > 0) {
+-        while (!states.empty() && size() > limit_size) {
+-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
++    if (!ram_disabled && limit_size > 0) {
++        size_t cur_ram = ram_size();
++        while (cur_ram > limit_size) {
++            auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) {
++                return !s.on_disk();
++            });
++            if (it == states.end()) {
++                break;
++            }
++            const size_t state_ram = it->ram_size();
++            if (!spill_state_to_disk(*it)) {
++                SRV_WRN(" - RAM cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
++                        it->size() / (1024.0 * 1024.0));
++                states.erase(it);
++            }
++            cur_ram = cur_ram >= state_ram ? cur_ram - state_ram : 0;
++        }
++    }
+ 
+-            states.pop_front();
++    if (!disk_disabled && limit_disk_size > 0) {
++        size_t cur_disk = disk_size();
++        while (cur_disk > limit_disk_size) {
++            auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) {
++                return s.on_disk();
++            });
++            if (it == states.end()) {
++                break;
++            }
++            const size_t evicted = it->disk_size();
++            SRV_WRN(" - disk cache size limit reached, removing oldest disk entry (size = %.3f MiB)\n",
++                    evicted / (1024.0 * 1024.0));
++            remove_disk_file(*it);
++            states.erase(it);
++            cur_disk = cur_disk >= evicted ? cur_disk - evicted : 0;
+         }
+     }
+ 
+     // average size per token
+     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+ 
+-    // dynamically increase the token limit if it can fit in the memory limit
+-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
++    // dynamically increase the token limit if it can fit in the combined RAM+disk budget
++    const size_t total_limit = (ram_disabled ? 0 : limit_size) + (disk_disabled ? 0 : limit_disk_size);
++    const size_t limit_tokens_cur = total_limit > 0 ? std::max<size_t>(limit_tokens, total_limit / size_per_token) : limit_tokens;
+ 
+     if (limit_tokens > 0) {
+         while (!states.empty() && n_tokens() > limit_tokens_cur) {
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
++            remove_disk_file(states.front());
+             states.pop_front();
+         }
+     }
+ 
+-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
++    SRV_TRC(" - cache state: %zu prompts, RAM %.3f MiB + disk %.3f MiB (limits: RAM %.3f MiB, disk %.3f MiB, %zu tokens, %zu est)\n",
++            states.size(), ram_size() / (1024.0 * 1024.0), disk_size() / (1024.0 * 1024.0),
++            limit_size / (1024.0 * 1024.0), limit_disk_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+ 
+     for (const auto & state : states) {
+-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
++        SRV_TRC("   - prompt %p (%s): %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
++                (const void *)&state, state.on_disk() ? "disk" : "ram",
++                state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+     }
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -692,8 +692,27 @@ struct server_prompt_data {
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
++    std::string disk_path;
++    std::string disk_path_dft;
++    std::string disk_ckpt_path;
++    size_t disk_size_tgt     = 0;
++    size_t disk_size_dft     = 0;
++    size_t disk_header_bytes = 0;
++    size_t disk_ckpt_size    = 0;
++    uint64_t disk_hash_tgt   = 0;
++    uint64_t disk_hash_dft   = 0;
++    uint64_t disk_hash_ckpt  = 0;
++    bool disk_is_seq_file    = false;
++
++    bool on_disk() const {
++        return !disk_path.empty();
++    }
+ 
+-    size_t size() const {
++    size_t disk_size() const {
++        return disk_size_tgt + disk_size_dft + disk_header_bytes + disk_ckpt_size;
++    }
++
++    size_t ram_size() const {
+         size_t res = data.size();
+ 
+         for (const auto & ckpt : prompt.checkpoints) {
+@@ -702,31 +721,69 @@ struct server_prompt_cache_state {
+ 
+         return res;
+     }
++
++    size_t size() const {
++        return ram_size() + disk_size();
++    }
+ };
+ 
+ struct server_prompt_cache {
+-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+-        this->limit_tokens = limit_tokens;
+-    }
++    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens,
++                        std::string disk_dir = "", int32_t limit_disk_mib = 4096);
++    ~server_prompt_cache();
++
++    server_prompt_cache(const server_prompt_cache &) = delete;
++    server_prompt_cache & operator=(const server_prompt_cache &) = delete;
+ 
+     std::list<server_prompt_cache_state> states;
+ 
+-    // in bytes, 0 = no limit
++    // in bytes, 0 = no limit (when !ram_disabled)
+     size_t limit_size = 0;
++    bool   ram_disabled = false;
+ 
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // optional SSD disk cache for spilling RAM entries or storing directly when VRAM/RAM is near full
++    std::string disk_dir;
++    size_t limit_disk_size = 0;
++    bool   disk_disabled = true;
++    uint64_t next_disk_id = 1;
++
+     size_t size() const;
++    size_t ram_size() const;
++    size_t disk_size() const;
+ 
+     size_t n_tokens() const;
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
++    bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
++
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();
++
++  private:
++    bool spill_state_to_disk(server_prompt_cache_state & state);
++    static bool write_disk_blob(const std::string & path,
++                                const uint8_t * tgt, size_t tgt_size,
++                                const uint8_t * dft, size_t dft_size,
++                                size_t * out_header_bytes,
++                                uint64_t * out_hash);
++    static bool read_disk_blob(const std::string & path, size_t tgt_size, size_t dft_size,
++                               uint64_t expected_hash,
++                               std::vector<uint8_t> & tgt_out, std::vector<uint8_t> & dft_out);
++    static bool write_checkpoints_file(const std::string & path,
++                                       const std::list<common_prompt_checkpoint> & ckpts,
++                                       size_t * out_bytes,
++                                       uint64_t * out_hash);
++    static bool read_checkpoints_file(const std::string & path,
++                                      uint64_t expected_hash,
++                                      std::list<common_prompt_checkpoint> & out);
++    void remove_disk_file(server_prompt_cache_state & state);
++    void evict_disk_for(size_t incoming_bytes);
++    bool ensure_disk_free_space(size_t incoming_bytes);
+ };
+ 
+ // used exclusively by router mode
