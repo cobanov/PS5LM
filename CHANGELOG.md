@@ -116,6 +116,12 @@ v0.1.x are the upstream payload releases by cobanov.
   153K tokens with the console's free memory unmoved. `GGML_RPC_CHUNK_MB` sets
   the piece size (0 for off).
 
+- **A host keeps its idle connection to a worker alive** (`patches/fleet/0008`):
+  TCP keepalive on the RPC link, first probe after `GGML_RPC_KEEPALIVE_S`
+  seconds idle (60; 0 for off). A host behind a NAT (WSL2) lost the connection
+  after about half an hour without a request, and llama-server aborted on the
+  next one although the worker was fine.
+
 ### Changed
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
