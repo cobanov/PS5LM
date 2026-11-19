@@ -19,6 +19,9 @@
       }
     ]
   },
+  "kernel": {
+    "flexibleMemorySize": 268435456
+  },
   "localizedParameters": {
     "defaultLanguage": "en-US",
     "en-US": {

@@ -123,6 +123,10 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
+  (the system's default is 448 MiB), so the direct pool, where models go, is
+  12.1875 GiB instead of 12. It applies when the app starts from the home screen,
+  not when it restarts for a model.
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
   every worker over the network.
