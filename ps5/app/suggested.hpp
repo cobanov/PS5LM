@@ -42,6 +42,14 @@ inline constexpr Suggestion kSuggestions[] = {
       { "Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf", 7626008928ull,
         "4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e", "Ternary-Bonsai-2-27B-Q2_0.gguf" },
       {} },
+    // Inkling 2 Mini, Thinking Machines' looped MoE (26B, 3.4B active). Unsloth's
+    // repository root holds their fork's layout; upstream llama.cpp reads the
+    // files in Mainline_Support. UD-Q2_K_XL leaves a 64k q8_0 cache. Checked with
+    // ggml-vulkan on a PC; not yet run on the console.
+    { "Inkling 2 Mini", false, "Looped MoE, strong at code, with a 64k context", 0, "unsloth/Inkling-2-Mini-GGUF",
+      { "Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file", 9138716608ull,
+        "b42841608ea380ddde5a3f1125081357128a3c71b80d006246de4e31292fc6c1", "Inkling-2-Mini-UD-Q2_K_XL.gguf" },
+      {} },
     { "Qwen 3.5 9B", false, "Fast all-rounder that leaves room for long chats", 55, "unsloth/Qwen3.5-9B-GGUF",
       { "Qwen3.5-9B-Q4_K_M.gguf", 5680522464ull, "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8", nullptr },
       {} },
