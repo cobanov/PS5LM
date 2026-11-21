@@ -701,6 +701,33 @@ timings add `... N of those tokens chosen again on the full logits, M
 differed`. M must be 0. It fetches the vocabulary for every token, so it is as
 slow as sampling on the host.
 
+### Inkling 2 Mini
+
+Not yet run on a console. What is known, from llama.cpp b12600's source and
+from an untrained `inkling2` fixture (`test-llama-archs -a inkling2 -o DIR`) on
+a host build with one CPU RPC worker:
+
+- The file to use is `Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file` of
+  `unsloth/Inkling-2-Mini-GGUF` (architecture `inkling2_loop`). The file at
+  the repository's root (`inkling2`, with other tensors) is for Unsloth's fork
+  and does not load. `patches/0019` is needed for this file.
+- The fixture loads on the worker, and gives the tokens and logprobs of the
+  run without RPC, with a `q4_0` cache, flash attention and
+  `--backend-sampling`.
+- **Its state cannot be parked on the worker** (`save` answers 501
+  `park_unsupported`): its memory is two attention caches, one for the
+  sliding-window layers, and a recurrent state, and `patches/0015` knows the
+  plain, the hybrid and the recurrent memory only. A server for it runs
+  without `--slot-park-path`.
+- Its attention mask and the relative positions (an `[n_kv, n_tokens]` I32
+  tensor for each of the two caches) are uploaded with every batch: attention
+  with relative positions makes a dense mask itself, which `patches/0012` does
+  not replace. That is 6 bytes for each cell and token of the full-attention
+  cache: about 750 KiB per 128-token batch for every 1,000 tokens of context,
+  75 MiB a batch at 100K. The window cache stays small.
+- `fleet serve` has not been taught the architecture's caches; start
+  llama-server directly.
+
 ## Control server
 
 ```sh
