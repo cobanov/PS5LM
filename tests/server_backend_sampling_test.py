@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import urllib.request
 
 from fleet_rpc_smoke import free_ports, spawn, wait_ready
@@ -100,10 +101,20 @@ class Server:
     def log_text(self):
         return self.log.read_text(errors="replace")
 
-    def stats(self):
-        """The per-request counts the patched server logs, summed."""
+    def lines(self, pattern, expect=0):
+        """The log's matches of a pattern. A request's line is written after its reply is sent, so the last one
+        can be a moment behind the reply: with `expect`, wait for that many, up to 10 s."""
+        deadline = time.monotonic() + 10
+        while True:
+            found = pattern.findall(self.log_text())
+            if len(found) >= expect or time.monotonic() >= deadline:
+                return found
+            time.sleep(0.1)
+
+    def stats(self, expect=0):
+        """The per-request counts the patched server logs, summed (`expect`: as for lines)."""
         total = [0] * 6
-        rows = STATS.findall(self.log_text())
+        rows = self.lines(STATS, expect)
         for row in rows:
             total = [a + int(b) for a, b in zip(total, row)]
         return len(rows), dict(zip(("top_k", "full", "forced", "grammar", "equal", "other"), total))
@@ -187,7 +198,7 @@ def fixture_cases(off, on, check, report):
     covered += 2
 
     # logs so far: every request above was covered
-    n_rows, stats = on.stats()
+    n_rows, stats = on.stats(covered)
     assert DISABLING not in on.log_text(), "the patched server gave backend sampling up"
     assert n_rows == covered, (n_rows, covered)
     # (the two requests sent alone went to the patched server only)
@@ -225,7 +236,7 @@ def fixture_cases(off, on, check, report):
         t.start()
     for t in threads:
         t.join()
-    verified = VERIFIED.findall(check.log_text())
+    verified = check.lines(VERIFIED, 6)
     n_verified, n_differed = sum(int(v) for v, _ in verified), sum(int(d) for _, d in verified)
     assert len(verified) == 6 and n_verified > 100 and n_differed == 0, (len(verified), n_verified, n_differed)
     report["verified_tokens"], report["verified_tokens_that_differed"] = n_verified, n_differed
@@ -300,7 +311,7 @@ def real_cases(build, output, model, report):
             # the reasoning is 16 tokens; the reply carries it trimmed, which can cost a whitespace token
             assert 14 <= n <= 16, (n, b[0])
     assert n_calls > 0, "no reply called the tool"
-    n_rows, stats = on.stats()
+    n_rows, stats = on.stats(12)
     assert n_rows == 12 and DISABLING not in on.log_text(), n_rows
     assert off.log_text().count(DISABLING) == 12
     assert stats["forced"] > 0 and stats["other"] == 0 and stats["top_k"] > 20 * stats["full"], stats
@@ -308,7 +319,7 @@ def real_cases(build, output, model, report):
                   full_logits_by_cause={k: stats[k] for k in ("forced", "grammar", "equal", "other")})
 
     # verify: every token was chosen twice, from the candidates and on the full scores of the same pass
-    verified = VERIFIED.findall(check.log_text())
+    verified = check.lines(VERIFIED, 12)
     n_verified, n_differed = sum(int(v) for v, _ in verified), sum(int(d) for _, d in verified)
     assert len(verified) == 12 and n_verified > 500 and n_differed == 0, (len(verified), n_verified, n_differed)
     report["verified_tokens"], report["verified_tokens_that_differed"] = n_verified, n_differed
