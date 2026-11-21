@@ -1,0 +1,826 @@
+Subject: [PATCH] sampling: backend sampling stays on with a reasoning budget
+ and with a grammar
+
+With --backend-sampling the sampler chain runs on the device that holds the
+output layer, and only what it leaves crosses to the host. Over the RPC
+backend that is the difference between a few bytes and the scores of the
+whole vocabulary per token (970 KiB for a 248K-token vocabulary).
+
+A reasoning budget and a grammar are host samplers, and common_sampler_init
+gave backend sampling up as soon as a request had either ("backend sampling
+is not compatible with reasoning budget, disabling"). A chat request with a
+thinking budget or with tools has one or both, so a server that serves
+agents never sampled on the device. On a PS5 serving Qwen3.8-27B one stream
+wrote 16.3 tokens a second that way against 18.8 without the budget.
+
+Neither needs the scores for most tokens:
+
+- The reasoning budget (common/reasoning-budget.cpp) counts tokens as they
+  are accepted and changes scores only while it forces its end sequence:
+  then every score but one becomes -inf. That is a few tokens of a reply,
+  and only when the budget is reached.
+- A grammar is checked after the chain has chosen: the chosen token alone is
+  tested, and the scores are needed again only when it is rejected, to
+  choose among the tokens the grammar allows. A lazy grammar (tool calls)
+  tests nothing until its trigger was written.
+
+So for such a request the device now keeps one job, the top-k. It runs a
+chain of its own that is top-k with k + 1 (common_sampler_get_backend) and
+returns those candidates; the request's chain stays on the host, whole, and
+runs on the candidates. When the k + 1 scores all differ, the top-k of the
+vocabulary is the top-k of the candidates, in the same order, and from
+there on the host chain does what it does on the full scores, with the same
+random numbers. The token is the one host sampling gives.
+
+The full scores are fetched for the steps that need them, and those steps
+run common_sampler_sample as it was:
+
+- a token the reasoning budget forces,
+- a token the grammar rejects (the resampling), and grammar-first sampling,
+- two equal scores among the candidates, where the order, and at the edge
+  the set, would be the sort's choice.
+
+Fetching them after the fact is new in llama_context:
+llama_set_logits_on_demand() marks a sequence, and
+llama_get_logits_on_demand_ith() copies one row of the logits tensor from
+the backend when the host asks. The tensor of the last ubatch stays where
+it is until the next graph is computed; rows of earlier ubatches of the same
+decode are copied before the next ubatch runs, so several slots in several
+ubatches lose nothing.
+
+It is used when the chain's first sampler that does anything is a top-k of
+at most 1024 (no logit bias, penalties or DRY before it), without mirostat,
+token probabilities or speculative decoding. Otherwise, and with
+LLAMA_BACKEND_SAMPLING_CHECKS=0, the request is sampled on the host as
+before, with the line it logged before. Requests with neither a budget nor
+a grammar keep the whole chain on the device, as before.
+
+The slot's timings gain a line that says how many tokens came from the
+device's top-k and how many needed the full scores, by cause.
+
+LLAMA_BACKEND_SAMPLING_CHECKS=verify is for testing: every token chosen from
+the candidates is chosen again on the full scores of the same pass with a
+copy of the chain, and the slot's timings say how many were compared and how
+many differed. It fetches the full scores for every token.
+
+Only the host changes: the worker runs the same top-k node and answers the
+same tensor reads as before.
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -302,6 +302,10 @@
+ 
+     bool backend_sampling = false;
+ 
++    // PS5LM fork: with backend_sampling, keep the top-k on the backend when a grammar or a reasoning budget
++    // is in use and let the host do the rest (LLAMA_BACKEND_SAMPLING_CHECKS=0 turns it off for the process)
++    bool backend_checks = true;
++
+     // print the parameters into a string
+     std::string print() const;
+ };
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -170,6 +170,66 @@
+     }
+ 
+     mutable int64_t t_total_us = 0;
++
++    // PS5LM fork: backend sampling with host checks (see sampling.h)
++    struct llama_sampler * dev = nullptr; // what the backend runs: top-k (dev_k)
++    int32_t dev_k = 0;                    // top_k + 1
++
++    common_sampler_backend_stats dev_stats;
++
++    std::vector<float> dev_sorted;
++
++    bool dev_verify = false;              // LLAMA_BACKEND_SAMPLING_CHECKS=verify
++    std::vector<llama_token_data> dev_keep;
++
++    // the backend's candidates for this row; false when there are none or they cannot be used
++    bool set_candidates(struct llama_context * ctx, int idx, bool & tie) {
++        tie = false;
++
++        const float *       logits = llama_get_sampled_logits_ith    (ctx, idx);
++        const llama_token * ids    = llama_get_sampled_candidates_ith(ctx, idx);
++
++        if (logits == nullptr || ids == nullptr ||
++                (int32_t) llama_get_sampled_logits_count_ith    (ctx, idx) != dev_k ||
++                (int32_t) llama_get_sampled_candidates_count_ith(ctx, idx) != dev_k) {
++            return false;
++        }
++
++        // the top-k of the full vocabulary is these candidates' top-k, in the same order, only if no two of
++        // them are equal: with equal logits the order (and at the edge the set) is the sort's choice
++        dev_sorted.assign(logits, logits + dev_k);
++        std::sort(dev_sorted.begin(), dev_sorted.end());
++        for (int32_t i = 0; i < dev_k; ++i) {
++            if (!std::isfinite(dev_sorted[i]) || (i > 0 && dev_sorted[i] == dev_sorted[i - 1])) {
++                tie = true;
++                return false;
++            }
++        }
++
++        cur.resize(dev_k);
++        for (int32_t i = 0; i < dev_k; ++i) {
++            cur[i] = llama_token_data{ids[i], logits[i], 0.0f};
++        }
++
++        cur_p = { cur.data(), cur.size(), -1, false };
++
++        return true;
++    }
++
++    // the full logits of this row, fetched from the backend if they are not on the host
++    void set_logits_full(struct llama_context * ctx, int idx) {
++        const float * logits = llama_get_logits_on_demand_ith(ctx, idx);
++        GGML_ASSERT(logits != nullptr && "backend sampling with host checks: the full logits of this row are not available");
++
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++
++        cur.resize(n_vocab);
++        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++        }
++
++        cur_p = { cur.data(), cur.size(), -1, false };
++    }
+ };
+ 
+ std::string common_params_sampling::print() const {
+@@ -341,11 +401,24 @@
+         }
+     }
+ 
++    // PS5LM fork: backend sampling with host checks needs the top-k to be the first sampler that does anything
++    bool dev_top_k_first = false;
++    bool dev_only_noops  = samplers.empty();
++
+     if (params.mirostat == 0) {
+ 
+         bool use_adaptive_p = false; // see below
+ 
+         for (const auto & cnstr : params.samplers) {
++            const size_t n_samplers_prev = samplers.size();
++            if (n_samplers_prev > 0 && dev_only_noops && !dev_top_k_first) {
++                // samplers that are switched off are created as no-ops named "?..."
++                const char * name = llama_sampler_name(samplers.back());
++                dev_only_noops = name != nullptr && name[0] == '?';
++            }
++            if (cnstr == COMMON_SAMPLER_TYPE_TOP_K && params.top_k > 0 && dev_only_noops) {
++                dev_top_k_first = true;
++            }
+             switch (cnstr) {
+                 case COMMON_SAMPLER_TYPE_DRY:
+                     {
+@@ -419,13 +492,44 @@
+         llama_sampler_chain_add(chain, smpl);
+     }
+ 
+-    if (grmr && params.backend_sampling) {
++    // PS5LM fork: backend sampling with host checks (see sampling.h)
++    llama_sampler * dev   = nullptr;
++    int32_t         dev_k = 0;
++
++    if ((grmr || rbudget) && params.backend_sampling) {
++        const char * env = getenv("LLAMA_BACKEND_SAMPLING_CHECKS");
++
++        const char * why = nullptr;
++        if (!params.backend_checks || (env != nullptr && strcmp(env, "0") == 0)) {
++            // switched off: as it was, without another word
++        } else if (params.mirostat != 0) {
++            why = "mirostat has no top-k";
++        } else if (!dev_top_k_first) {
++            why = "top-k is not the first active sampler";
++        } else if (params.top_k > 1024 || params.top_k + 1 >= llama_vocab_n_tokens(vocab)) {
++            why = "top-k is too large";
++        } else if (params.n_probs > 0) {
++            why = "token probabilities were asked for";
++        } else {
++            dev_k = params.top_k + 1;
++            dev   = llama_sampler_chain_init(lparams);
++            llama_sampler_chain_add(dev, llama_sampler_init_top_k(dev_k));
++
++            LOG_DBG("%s: backend sampling with host checks: the backend returns the top %d\n", __func__, dev_k);
++        }
++
++        if (why != nullptr) {
++            LOG_WRN("%s: backend sampling with host checks is not possible: %s\n", __func__, why);
++        }
++    }
++
++    if (grmr && params.backend_sampling && !dev) {
+         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
+ 
+         params.backend_sampling = false;
+     }
+ 
+-    if (rbudget && params.backend_sampling) {
++    if (rbudget && params.backend_sampling && !dev) {
+         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+ 
+         params.backend_sampling = false;
+@@ -443,6 +547,14 @@
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+     };
+ 
++    result->dev   = dev;
++    result->dev_k = dev_k;
++
++    {
++        const char * env = getenv("LLAMA_BACKEND_SAMPLING_CHECKS");
++        result->dev_verify = dev != nullptr && env != nullptr && strcmp(env, "verify") == 0;
++    }
++
+     return result;
+ }
+ 
+@@ -454,6 +566,7 @@
+     llama_sampler_free(gsmpl->grmr);
+     llama_sampler_free(gsmpl->rbudget);
+     llama_sampler_free(gsmpl->chain);
++    llama_sampler_free(gsmpl->dev);
+ 
+     delete gsmpl;
+ }
+@@ -516,7 +629,7 @@
+ }
+ 
+ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+-    return new common_sampler {
++    auto * result = new common_sampler {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+@@ -526,6 +639,16 @@
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
+     };
++
++    // PS5LM fork: a clone reads the same context, so it samples the same way
++    if (gsmpl->dev) {
++        result->dev        = llama_sampler_clone(gsmpl->dev);
++        result->dev_k      = gsmpl->dev_k;
++        result->dev_stats  = gsmpl->dev_stats;
++        result->dev_verify = gsmpl->dev_verify;
++    }
++
++    return result;
+ }
+ 
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+@@ -603,6 +726,174 @@
+     return gsmpl->chain;
+ }
+ 
++// PS5LM fork: backend sampling with host checks (see sampling.h)
++
++struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl) {
++    if (!gsmpl) {
++        return nullptr;
++    }
++
++    return gsmpl->dev ? gsmpl->dev : gsmpl->chain;
++}
++
++bool common_sampler_backend_checks(const struct common_sampler * gsmpl) {
++    return gsmpl != nullptr && gsmpl->dev != nullptr;
++}
++
++common_sampler_backend_stats common_sampler_backend_stats_get(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->dev_stats : common_sampler_backend_stats();
++}
++
++static bool grammar_should_apply(struct common_sampler * gsmpl);
++
++// common_sampler_sample() for a sampler with host checks. Every branch gives the token common_sampler_sample()
++// gives on the full logits, and leaves the samplers (the random number generators too) in the same state.
++static llama_token common_sampler_sample_checked(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
++    llama_token id = LLAMA_TOKEN_NULL;
++
++    auto & grmr    = gsmpl->grmr;
++    auto & rbudget = gsmpl->rbudget;
++    auto & chain   = gsmpl->chain;
++    auto & cur_p   = gsmpl->cur_p;
++    auto & stats   = gsmpl->dev_stats;
++
++    // the budget forces a token: every other logit of the full vocabulary becomes -inf
++    const bool forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
++
++    // the grammar constrains this token (a lazy grammar that waits for its trigger accepts everything)
++    const bool grmr_on = grammar_should_apply(gsmpl) && !llama_sampler_grammar_is_idle(grmr);
++
++    bool tie = false;
++
++    if (forcing) {
++        stats.n_host_forced++;
++    } else if (grammar_first && grmr_on) {
++        stats.n_host_grammar++;
++    } else if (!gsmpl->set_candidates(ctx, idx, tie)) {
++        if (tie) {
++            stats.n_host_tie++;
++        } else {
++            stats.n_host_other++;
++        }
++    } else {
++        // verify: a copy of the chain as it is now, the random number generators too
++        llama_sampler * chain_ref = gsmpl->dev_verify ? llama_sampler_clone(chain) : nullptr;
++
++        // neither the budget nor (before the chain) the grammar changes a logit here, and the chain's first
++        // active sampler is its top-k, which keeps of these top_k + 1 candidates what it keeps of the vocabulary
++        llama_sampler_apply(chain, &cur_p);
++
++        id = cur_p.data[cur_p.selected].id;
++
++        if (chain_ref) {
++            // the first choice of common_sampler_sample() on the full logits
++            const llama_token_data_array cur_p_keep = cur_p;
++            gsmpl->dev_keep = gsmpl->cur;
++
++            gsmpl->set_logits_full(ctx, idx);
++
++            llama_sampler_apply(rbudget, &cur_p);
++            llama_sampler_apply(chain_ref, &cur_p);
++
++            const llama_token id_ref = cur_p.selected >= 0 ? cur_p.data[cur_p.selected].id : LLAMA_TOKEN_NULL;
++
++            llama_sampler_free(chain_ref);
++
++            gsmpl->cur = gsmpl->dev_keep;
++            cur_p      = { gsmpl->cur.data(), cur_p_keep.size, cur_p_keep.selected, cur_p_keep.sorted };
++
++            stats.n_verified++;
++            if (id_ref != id) {
++                stats.n_differed++;
++                LOG_ERR("%s: backend sampling with host checks: token %d from the backend's candidates, %d from the full logits\n",
++                        __func__, id, id_ref);
++            }
++        }
++
++        if (!grmr_on) {
++            stats.n_backend++;
++            return id;
++        }
++
++        // check if it the sampled token fits the grammar (grammar-based rejection sampling)
++        {
++            llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
++            llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
++
++            llama_sampler_apply(grmr, &single_token_data_array);
++
++            const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
++            if (is_valid) {
++                stats.n_backend++;
++                return id;
++            }
++        }
++
++        // resampling, as in common_sampler_sample(), with the full logits
++        stats.n_host++;
++        stats.n_host_grammar++;
++
++        gsmpl->set_logits_full(ctx, idx);
++
++        llama_sampler_apply(rbudget, &cur_p);
++
++        if (grammar_should_apply(gsmpl)) {
++            llama_sampler_apply(grmr, &cur_p);
++        }
++
++        llama_sampler_apply(chain, &cur_p);
++
++        GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++
++        return cur_p.data[cur_p.selected].id;
++    }
++
++    // common_sampler_sample() as it is, with the full logits
++    stats.n_host++;
++
++    gsmpl->set_logits_full(ctx, idx);
++
++    llama_sampler_apply(rbudget, &cur_p);
++
++    if (grammar_first && grammar_should_apply(gsmpl)) {
++        llama_sampler_apply(grmr, &cur_p);
++    }
++
++    llama_sampler_apply(chain, &cur_p);
++
++    id = cur_p.data[cur_p.selected].id;
++
++    if (grammar_first || !grammar_should_apply(gsmpl)) {
++        return id;
++    }
++
++    {
++        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
++        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
++
++        llama_sampler_apply(grmr, &single_token_data_array);
++
++        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
++        if (is_valid) {
++            return id;
++        }
++    }
++
++    gsmpl->set_logits_full(ctx, idx);
++
++    llama_sampler_apply(rbudget,  &cur_p);
++
++    if (grammar_should_apply(gsmpl)) {
++        llama_sampler_apply(grmr,  &cur_p);
++    }
++
++    llama_sampler_apply(chain, &cur_p);
++
++    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++
++    return cur_p.data[cur_p.selected].id;
++}
++
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+ 
+@@ -616,6 +907,11 @@
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
++    // PS5LM fork: backend sampling with host checks
++    if (gsmpl->dev) {
++        return common_sampler_sample_checked(gsmpl, ctx, idx, grammar_first);
++    }
++
+     gsmpl->set_logits(ctx, idx);
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -55,6 +55,43 @@
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ 
++// PS5LM fork: backend sampling with host checks
++//
++// A grammar and a reasoning budget run on the host, so with them the whole chain used to move to the host and
++// every token cost a download of the full vocabulary. With host checks the backend keeps one job, the top-k:
++// it returns the top_k + 1 best candidates, and the host runs its unchanged chain on those. That gives the same
++// token as the chain on the full vocabulary whenever the top_k + 1 logits differ from each other. The full
++// logits are fetched (llama_get_logits_on_demand_ith) only for a step that needs them: a token the reasoning
++// budget forces, a token the grammar rejects, and equal logits among the candidates. Those steps run the host
++// algorithm as it was.
++//
++// LLAMA_BACKEND_SAMPLING_CHECKS in the environment: "0" turns it off; "verify" also chooses every token on the
++// full logits with a copy of the chain, counts the tokens that differ and logs each (for testing: it fetches the
++// full logits for every token).
++//
++// the sampler to attach with llama_set_sampler(): the top-k chain with host checks, else the whole chain
++struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl);
++
++// true when the sampler was set up for host checks; the caller then also asks for
++// llama_set_logits_on_demand() on the sequence
++bool common_sampler_backend_checks(const struct common_sampler * gsmpl);
++
++struct common_sampler_backend_stats {
++    int32_t n_backend      = 0; // tokens chosen from the backend's candidates
++    int32_t n_host         = 0; // tokens that needed the full logits
++    int32_t n_host_forced  = 0; //   forced by the reasoning budget
++    int32_t n_host_grammar = 0; //   rejected by the grammar, or grammar-first sampling
++    int32_t n_host_tie     = 0; //   equal logits among the candidates
++    int32_t n_host_other   = 0; //   no candidates from the backend
++
++    // LLAMA_BACKEND_SAMPLING_CHECKS=verify: tokens from the backend's candidates that were also chosen on the
++    // full logits (fetched for that alone, so it costs what host sampling costs), and how many differed
++    int32_t n_verified     = 0;
++    int32_t n_differed     = 0;
++};
++
++common_sampler_backend_stats common_sampler_backend_stats_get(const struct common_sampler * gsmpl);
++
+ // extended sampling implementation:
+ //
+ // - set logits
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1482,6 +1482,22 @@
+     // note: prefer initializing the context with llama_context_params.samplers when possible
+     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+ 
++    // PS5LM fork: logits on demand
++    // While a sampler is attached to the sequence its raw logits stay on the backend. With this set, the
++    // logits of the sequence's output rows of the last llama_decode() can still be had afterwards with
++    // llama_get_logits_on_demand_ith(), which copies a row to the host when it is first asked for.
++    // Cleared whenever llama_set_sampler() is called for the sequence.
++    LLAMA_API void llama_set_logits_on_demand(struct llama_context * ctx, llama_seq_id seq_id, bool enable);
++
++    // PS5LM fork: the raw logits of the ith token of the last llama_decode(), copied from the backend now if
++    // they were not already. NULL when they cannot be had (not an output row, or the row was not kept).
++    // Valid until the next llama_decode().
++    LLAMA_API float * llama_get_logits_on_demand_ith(struct llama_context * ctx, int32_t i);
++
++    // PS5LM fork: true when smpl is a grammar sampler that constrains nothing at the moment (a lazy grammar
++    // that still waits for its trigger, or no grammar)
++    LLAMA_API bool llama_sampler_grammar_is_idle(const struct llama_sampler * smpl);
++
+     // mirror of llama_sampler_i:
+     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
+     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1084,6 +1084,53 @@
+     }
+ }
+ 
++// PS5LM fork: logits on demand
++void llama_context::set_logits_on_demand(llama_seq_id seq_id, bool enable) {
++    if (enable) {
++        sampling.on_demand.insert(seq_id);
++    } else {
++        sampling.on_demand.erase(seq_id);
++    }
++}
++
++float * llama_context::get_logits_on_demand_ith(int32_t i) {
++    output_reorder();
++
++    try {
++        if (logits.data == nullptr) {
++            throw std::runtime_error("no logits");
++        }
++
++        const int64_t j       = output_resolve_row(i);
++        const int64_t n_vocab = model.vocab.n_tokens();
++
++        float * row = logits.data + j*n_vocab;
++
++        if ((size_t) j >= sampling.on_demand_rows.size()) {
++            // nothing was recorded for this decode: no sampler was attached, so the row is in the buffer
++            return sampling.samplers.empty() ? row : nullptr;
++        }
++
++        const int32_t src = sampling.on_demand_rows[j];
++        if (src == sampling_info::ROW_HOST) {
++            return row;
++        }
++        if (src == sampling_info::ROW_NONE || sampling.on_demand_tensor == nullptr) {
++            return nullptr;
++        }
++
++        ggml_backend_tensor_get(sampling.on_demand_tensor, row, (size_t) src*n_vocab*sizeof(float), n_vocab*sizeof(float));
++
++        sampling.on_demand_rows[j] = sampling_info::ROW_HOST;
++        sampling.n_on_demand_fetch++;
++
++        return row;
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
++        return nullptr;
++    }
++}
++
+ float * llama_context::get_embeddings() {
+     output_reorder();
+ 
+@@ -1408,6 +1455,9 @@
+ }
+ 
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
++    // PS5LM fork: logits on demand are asked for again by whoever attaches the next sampler
++    sampling.on_demand.erase(seq_id);
++
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+     }
+@@ -1931,6 +1981,10 @@
+     output_swaps.clear();
+     embd_batch_idxs.clear();
+ 
++    // PS5LM fork: logits on demand - the last decode's rows are gone from here on
++    sampling.on_demand_rows.clear();
++    sampling.on_demand_tensor = nullptr;
++
+     sched_reserve();
+ 
+     bool did_optimize = false;
+@@ -1997,9 +2051,30 @@
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // PS5LM fork: logits on demand
++    const bool on_demand = has_samplers && logits.data != nullptr;
++    if (on_demand) {
++        sampling.on_demand_rows.assign(n_outputs_all, sampling_info::ROW_NONE);
++    }
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
++        // PS5LM fork: logits on demand - another graph is about to be computed, so the rows of the
++        // previous ubatch that were left on the backend are copied now
++        if (sampling.on_demand_tensor != nullptr) {
++            const size_t row_size = (size_t) n_vocab*sizeof(float);
++            for (size_t j = 0; j < sampling.on_demand_rows.size(); ++j) {
++                const int32_t src = sampling.on_demand_rows[j];
++                if (src >= 0) {
++                    ggml_backend_tensor_get(sampling.on_demand_tensor, logits.data + j*n_vocab, (size_t) src*row_size, row_size);
++                    sampling.on_demand_rows[j] = sampling_info::ROW_HOST;
++                    sampling.n_on_demand_fetch++;
++                }
++            }
++            sampling.on_demand_tensor = nullptr;
++        }
++
+         // count the outputs in this ubatch
+         {
+             int32_t n_outputs_new = 0;
+@@ -2077,6 +2152,37 @@
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+             }
++
++            // PS5LM fork: logits on demand - these rows are on the host already
++            if (on_demand) {
++                for (int64_t r = 0; r < n_outputs; ++r) {
++                    sampling.on_demand_rows[n_outputs_prev + r] = sampling_info::ROW_HOST;
++                }
++            }
++        } else if (on_demand && t_logits && n_outputs > 0) {
++            // PS5LM fork: logits on demand - every output row of this ubatch has a sampler; remember where the
++            // rows of the sequences that asked are, they are copied only if the host asks for them
++            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
++
++            bool any = false;
++            int32_t r = 0;
++            for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
++                if (!ubatch.output[i]) {
++                    continue;
++                }
++                for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
++                    if (sampling.on_demand.count(ubatch.seq_id[i][s]) > 0) {
++                        sampling.on_demand_rows[n_outputs_prev + r] = r;
++                        any = true;
++                        break;
++                    }
++                }
++                r++;
++            }
++
++            if (any) {
++                sampling.on_demand_tensor = t_logits;
++            }
+         }
+ 
+         // extract embeddings
+@@ -2453,6 +2559,11 @@
+             }
+         }
+ 
++        // PS5LM fork: logits on demand
++        if (i0 < sampling.on_demand_rows.size() && i1 < sampling.on_demand_rows.size()) {
++            std::swap(sampling.on_demand_rows[i0], sampling.on_demand_rows[i1]);
++        }
++
+         if (embd.size > 0) {
+             for (uint64_t k = 0; k < n_embd_out; k++) {
+                 std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
+@@ -4473,6 +4584,17 @@
+     return ctx->set_sampler(seq_id, smpl);
+ }
+ 
++// PS5LM fork: logits on demand
++void llama_set_logits_on_demand(llama_context * ctx, llama_seq_id seq_id, bool enable) {
++    ctx->set_logits_on_demand(seq_id, enable);
++}
++
++float * llama_get_logits_on_demand_ith(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++
++    return ctx->get_logits_on_demand_ith(i);
++}
++
+ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -14,6 +14,7 @@
+ 
+ #include <array>
+ #include <map>
++#include <set>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -269,6 +270,10 @@
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++    // PS5LM fork: logits on demand, see llama.h
++    void    set_logits_on_demand(llama_seq_id seq_id, bool enable);
++    float * get_logits_on_demand_ith(int32_t i);
++
+ private:
+     llm_graph_result * get_gf_res_prev();
+ 
+@@ -348,6 +353,23 @@
+ 
+         // optimization
+         std::vector<llama_token> token_ids_full_vocab;
++
++        // PS5LM fork: logits on demand
++        // sequences whose raw logits the host may still ask for after a decode
++        std::set<llama_seq_id> on_demand;
++
++        // per output row of the last decode: where its raw logits are
++        //   ROW_NONE  not kept
++        //   ROW_HOST  in the logits buffer
++        //   >= 0      still on the backend, the row of on_demand_tensor
++        static constexpr int32_t ROW_NONE = -2;
++        static constexpr int32_t ROW_HOST = -1;
++        std::vector<int32_t> on_demand_rows;
++
++        // logits tensor of the last ubatch of the last decode, valid until the next graph is computed
++        ggml_tensor * on_demand_tensor = nullptr;
++
++        uint64_t n_on_demand_fetch = 0;
+     };
+ 
+     sampling_info sampling;
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -2690,6 +2690,15 @@
+     }
+ }
+ 
++// PS5LM fork: see llama.h; false for any sampler that is not this grammar sampler (llguidance for one)
++bool llama_sampler_grammar_is_idle(const struct llama_sampler * smpl) {
++    if (smpl == nullptr || smpl->iface == nullptr || smpl->iface->apply != llama_sampler_grammar_apply) {
++        return false;
++    }
++    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
++    return ctx->grammar == nullptr || ctx->grammar->awaiting_trigger;
++}
++
+ // Fwd declare to break reset --> init_impl --> llama_sampler_grammar_i --> reset cycle.
+ static struct llama_sampler * llama_sampler_init_grammar_impl(
+         const struct llama_vocab * vocab,
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1052,6 +1052,22 @@
+                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
+                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
+ 
++        // PS5LM fork: backend sampling with host checks
++        if (common_sampler_backend_checks(smpl.get())) {
++            const auto bs = common_sampler_backend_stats_get(smpl.get());
++
++            SLT_INF(*this,
++                    "backend sampling with host checks: %d tokens from the backend's top-k, %d from the full logits "
++                    "(%d forced by the reasoning budget, %d for the grammar, %d equal logits, %d other)\n",
++                    bs.n_backend, bs.n_host, bs.n_host_forced, bs.n_host_grammar, bs.n_host_tie, bs.n_host_other);
++
++            if (bs.n_verified > 0) {
++                SLT_INF(*this,
++                        "backend sampling with host checks: %d of those tokens chosen again on the full logits, %d differed\n",
++                        bs.n_verified, bs.n_differed);
++            }
++        }
++
+         const int32_t n_draft_total       = stats.n_draft_tokens;
+         const int32_t n_draft_accepted    = stats.n_draft_accepted;
+         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
+@@ -2345,6 +2361,11 @@
+ 
+         // initialize samplers
+         if (task.need_sampling()) {
++            // PS5LM fork: backend sampling with host checks samples one row at a time
++            if (spec) {
++                task.params.sampling.backend_checks = false;
++            }
++
+             try {
+                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+             } catch (std::exception & e) {
+@@ -2365,7 +2386,12 @@
+ 
+             // TODO: tmp until backend sampling is fully implemented
+             if (use_backend_sampling) {
+-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
++                // PS5LM fork: with a grammar or a reasoning budget this is the top-k alone, and the host may
++                // ask for the full logits of a row (see common/sampling.h)
++                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get_backend(slot.smpl.get()));
++                if (common_sampler_backend_checks(slot.smpl.get())) {
++                    llama_set_logits_on_demand(ctx_tgt, slot.id, true);
++                }
+             } else {
+                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+             }

@@ -12,14 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "third_party/llama.cpp/gguf-py"))
 
 
-def add_tokenizer(writer):
-    """Bytes, a-z and the word boundary: one token per character."""
+def add_tokenizer(writer, markers=()):
+    """Bytes, a-z and the word boundary: one token per character. `markers` are added
+    as user-defined tokens, one token each (a template's reasoning tags)."""
     writer.add_tokenizer_model("llama")
     tokens = ["<unk>", "<s>", "</s>"] + [f"<0x{i:02X}>" for i in range(256)]
-    tokens += [chr(i) for i in range(97, 123)] + ["\u2581"]
+    tokens += [chr(i) for i in range(97, 123)] + ["\u2581"] + list(markers)
     writer.add_token_list(tokens)
     writer.add_token_scores([0.0] * len(tokens))
-    writer.add_token_types([2, 3, 3] + [6] * 256 + [1] * 27)
+    writer.add_token_types([2, 3, 3] + [6] * 256 + [1] * 27 + [4] * len(markers))
     writer.add_bos_token_id(1)
     writer.add_eos_token_id(2)
     writer.add_unk_token_id(0)
@@ -79,7 +80,7 @@ def make_fixture(path: Path, head_dim: int = 8, ffn: int = 0, context: int = 256
     return path
 
 
-def make_recurrent_fixture(path: Path) -> Path:
+def make_recurrent_fixture(path: Path, markers=()) -> Path:
     """The same tokenizer on an untrained 2-block Mamba: a recurrent state, which
     cannot be rolled back, so llama-server makes context checkpoints for it."""
     import numpy as np
@@ -98,7 +99,7 @@ def make_recurrent_fixture(path: Path) -> Path:
     writer.add_ssm_state_size(16)
     writer.add_ssm_time_step_rank(2)
     writer.add_layer_norm_rms_eps(1e-5)
-    tokens = add_tokenizer(writer)
+    tokens = add_tokenizer(writer, markers)
     rng = np.random.default_rng(20261112)
 
     def weight(name, shape):
