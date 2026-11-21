@@ -12,7 +12,10 @@ v0.1.x are the upstream payload releases by cobanov.
   Unsloth's `UD-Q2_K_XL` from `Mainline_Support` (upstream llama.cpp cannot read the files in
   the repository root, which use Unsloth's fork layout). The planner counts its cache slots:
   layers 6 to 17 run three times a token, each pass with its own KV and conv state, so 48
-  slots, 8 of them full attention and 40 sliding window. At 11.38 GiB that is a 64k `q8_0` cache.
+  slots, 8 of them full attention and 40 sliding window. Its relative position bias adds about
+  208 bytes of compute buffer per context and ubatch token (832 MiB at 64k, `-ub 64`, measured
+  with ggml-vulkan). At 11.38 GiB that is a 64k `q8_0` cache, 11.24 GiB planned. Checked on a PC
+  with ggml-vulkan and the patched tree: it answers correctly. Not yet run on the console.
 - **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again

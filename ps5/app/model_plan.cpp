@@ -258,6 +258,14 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     }
     m.n_expert        = (uint32_t) num("expert_count");
 
+    // A learned relative position bias (Inkling 2) is built per head for every
+    // cached token and ubatch token. ggml-vulkan's compute buffer grew by about
+    // 208 bytes for each (Inkling 2 Mini, -ub 64, q8_0 cache, all on the GPU):
+    // 226 MiB at 16k, 832 MiB at 64k, 1673 MiB at 128k.
+    if (num("attention.relative_extent")) {
+        m.bias_bytes = 208.0;
+    }
+
     // Looped models (Inkling 2): the layers [loop.start, loop.end) run loop.count
     // times a token, and llama.cpp gives every pass its own cache slot. Inkling 2
     // Mini has 24 layers and 48 slots: 8 hold the whole context, 40 the window.
@@ -434,7 +442,8 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             const uint32_t swa_tokens = std::min(ctx, (m.swa_window + p.ubatch + 255) / 256 * 256);
             const double   kv         = (kv_bytes_per_token(m, t) * ctx +
                                  m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
-            const double total = p.weights_gib + kv + p.state_gib + p.reserve_gib;
+            const double bias  = m.bias_bytes * ctx * p.ubatch / kGiB;
+            const double total = p.weights_gib + kv + bias + p.state_gib + p.reserve_gib;
             if (total <= budget_gib) {
                 p.fits = true;
                 p.ctx = ctx;
