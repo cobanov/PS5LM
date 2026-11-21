@@ -57,6 +57,7 @@ DATA = '/data/PS5LM'
 WORKER_FILE = f'{DATA}/fleet-worker.txt'
 ARGS_FILE = f'{DATA}/app-args.txt'
 ENV_FILE = f'{DATA}/env.txt'       # switches PS5LM sets at start, one NAME=value a line
+LOG_FILE = f'{DATA}/app.log'       # PS5LM's log, started anew each time it starts
 CACHE_DIR = f'{DATA}/rpc-cache'    # the worker's weight cache (PS5LM_RPC_CACHE_GB)
 ACK = 'I_UNDERSTAND_RPC_IS_UNAUTHENTICATED'
 PS5_MODELS = f'{DATA}/models'
@@ -258,6 +259,43 @@ def read_text(address, path, limit=1 << 20):
     """A small text file from the console, or '' when it is not there."""
     with console_ftp(address) as ftp:
         return get_text(ftp, path, limit)
+
+
+def get_head(ftp, path, size=4096):
+    """The first `size` bytes of a file over an open connection, without fetching
+    the rest; '' when it is not there."""
+    try:
+        ftp.voidcmd('TYPE I')
+        data, conn = b'', ftp.transfercmd(f'RETR {path}')
+    except ftplib.error_perm:
+        return ''
+    try:
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        conn.close()
+    with contextlib.suppress(ftplib.Error):   # 226, or 426 for a transfer cut short
+        ftp.voidresp()
+    return data.decode('utf-8', 'replace')
+
+
+def started(address):
+    """PS5LM's start mark: the first line of app.log, which it writes anew, with the
+    time, every time it starts. It changes when PS5LM has started again, whatever
+    its ports answer meanwhile. '' when there is no log, or no whole line yet."""
+    with console_ftp(address, timeout=5) as ftp:
+        head = get_head(ftp, LOG_FILE, 256)
+    return head.split('\n', 1)[0].strip() if '\n' in head else ''
+
+
+def worker_expected(address):
+    """True when the console is set to start as a fleet worker (fleet-worker.txt is
+    there), whatever its ports say now."""
+    with console_ftp(address, timeout=5) as ftp:
+        return remote_size(ftp, WORKER_FILE) is not None
 
 
 def worker_env(screen=True, cache_gib=0):

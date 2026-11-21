@@ -96,6 +96,8 @@ CACHE_CHECK_SECONDS = 60   # how often a console's weight cache is listed (FTP)
 LIMITS = dict(devices=1024, pools=64, replicas=256)
 REPLICA_PORTS = range(18100, 19100)
 LOAD_TIMEOUT = dict(rpc=1800, direct=900, app=900, server=0)
+WORKER_GONE_SECONDS = 30   # how long a console asked to restart gets to start anew before the wait gives up on seeing it
+WORKER_SETTLE_SECONDS = 8  # how long a worker that has just lost its host gets to read as an idle worker again
 MASK = 'set'               # how the page and `ctl export` show a key that is set
 _ID = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 _DEVICE = re.compile(r'[A-Za-z]{2,16}[0-9]{0,2}')
@@ -650,6 +652,7 @@ class Fleet:
         older PS5LM does not take the restart request: it leaves worker mode, and
         is made a worker again."""
         name, address, port = device['id'], device['address'], device['port']
+        mark = self._start_mark(address)
         if not devices.restart(address, env):
             if devices.leave_worker(address) != 'restarted':
                 # An older build can only quit, and leave_worker removed its
@@ -662,10 +665,58 @@ class Fleet:
                 raise ControlError(f'{name}: PS5LM did not take the request to become a worker again')
         with self.lock:
             self.env_pending.discard(name)
-        time.sleep(2)   # the old worker can answer for a moment after it took the request
-        if not self._wait_port(address, port, 150, replica):
+        return self._await_worker(device, mark, replica)
+
+    def _start_mark(self, address):
+        """PS5LM's start mark on a console now (devices.started), '' when it cannot be read."""
+        try:
+            return devices.started(address)
+        except ERRORS:
+            return ''
+
+    def _await_worker(self, device, mark, replica=None):
+        """Wait for a console that was asked to restart to be a worker again: first
+        for PS5LM to have started anew (its start mark differs from `mark`, read
+        before the request), then for its worker port to accept.
+
+        The port alone does not say which worker answers. The old one goes on
+        accepting for seconds after it took the request, and one that has just lost
+        a host refuses connections while it frees what the host held (3.5 s after a
+        55K-token session), then accepts again, all before PS5LM restarts. A host
+        started on either sign lost its worker a moment later."""
+        name, address, port = device['id'], device['address'], device['port']
+        asked = time.monotonic()
+        anew = bool(mark) and self._wait_started(address, mark, WORKER_GONE_SECONDS, replica)
+        seen = time.monotonic()
+        if not self._wait_port(address, port, 150, replica, pause=0.25 if anew else 2):
             raise ControlError(f'{name} did not come back as a worker in 150 s')
-        return f'worker restarted on {address}:{port}'
+        if not anew:
+            return (f'worker restarted on {address}:{port} (PS5LM was not seen to start anew in '
+                    f'{WORKER_GONE_SECONDS} s, so the old worker may still be the one answering)')
+        return (f'worker restarted on {address}:{port} (PS5LM started anew {seen - asked:.1f} s after it '
+                f'took the request, listening {time.monotonic() - seen:.1f} s later)')
+
+    def _wait_started(self, address, mark, timeout, replica=None):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            now = self._start_mark(address)
+            if now and now != mark:
+                return True
+            if replica is not None and replica.cancel.is_set():
+                return False
+            time.sleep(0.3)
+        return False
+
+    def _settled(self, address, port, status):
+        """Look again, for a few seconds, at a console that is set to be a worker but
+        does not read as an idle one: a worker that has just lost its host refuses or
+        ignores connections while it frees what the host held, which reads as idle
+        or as busy."""
+        deadline = time.monotonic() + WORKER_SETTLE_SECONDS
+        while time.monotonic() < deadline and (status['mode'] != 'worker' or status.get('busy')):
+            time.sleep(0.5)
+            status = devices.ps5_mode(address, port)
+        return status
 
     def remove_device(self, device_id):
         self.device(device_id)
@@ -798,6 +849,15 @@ class Fleet:
                 return f"deleted {cleared['files']} cached tensors, {cleared['mib'] / 1024:.1f} GiB"
             if mode == 'offline':
                 raise ControlError('the console does not answer: off, in rest mode, or not jailbroken since it started')
+            # A console set to be a worker that does not read as an idle one may only
+            # be between hosts: look again before acting on what its ports said.
+            expected = False
+            if mode != 'worker' or status.get('busy'):
+                with contextlib.suppress(*ERRORS):
+                    expected = devices.worker_expected(address)
+                if expected:
+                    status = self._settled(address, port, status)
+                    mode = status['mode']
             if action == 'launch':
                 if mode != 'idle':
                     return f'PS5LM is already open ({mode})'
@@ -810,10 +870,14 @@ class Fleet:
                     if status.get('busy'):
                         raise ControlError('its worker is serving a split; stop that first')
                     return self._restart_worker(device, env)
-                if not devices.restart(address):
+                mark = self._start_mark(address) if expected else ''
+                if not devices.restart(address, env if expected else None):
                     if not self._open_console(device):
                         raise ControlError('PS5LM is not open; open it on the console')
-                    return 'PS5LM was closed; asked the console to open it'
+                    if not expected:
+                        return 'PS5LM was closed; asked the console to open it'
+                if expected:      # it comes back as a worker, whatever its ports said: wait for that one
+                    return self._await_worker(device, mark)
                 return 'asked PS5LM to restart' + (' with its model' if mode in ('serving', 'loading') else '')
             if action == 'worker':
                 if mode == 'worker':
@@ -1035,14 +1099,14 @@ class Fleet:
             replica.deadline = time.time() + LOAD_TIMEOUT[replica.via]
             self._set(replica, 'starting', detail)
 
-    def _wait_port(self, address, port, timeout, replica=None):
+    def _wait_port(self, address, port, timeout, replica=None, pause=2):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if devices.port_open(address, port, 1):
                 return True
             if replica is not None and replica.cancel.is_set():
                 return False
-            time.sleep(2)
+            time.sleep(pause)
         return False
 
     def _start_replica(self, replica, pool):
