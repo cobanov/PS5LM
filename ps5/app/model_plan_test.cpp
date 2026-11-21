@@ -74,6 +74,29 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan cp = ps5lm::plan_model(c, budget);
     assert(cp.fits && cp.ctx > 4096 && has_args(cp, "-ub", "64"));
 
+    // Inkling 2 Mini (inkling2_loop): layers 6 to 17 run three times, each pass
+    // with its own cache slot, so 48 slots: the full-attention layers 5 and 23
+    // once, 11 and 17 three times (8), and 40 window layers.
+    Gguf ink;
+    std::vector<bool> ink_swa(24, true);
+    for (int il : { 5, 11, 17, 23 }) {
+        ink_swa[il] = false;
+    }
+    ink.kv("general.architecture", "inkling2_loop").kv("general.name", "Inkling-2-Mini")
+        .kv("inkling2_loop.block_count", 24u).kv("inkling2_loop.attention.head_count", 24u)
+        .kv("inkling2_loop.attention.head_count_kv", 8u).kv("inkling2_loop.embedding_length", 2304u)
+        .kv("inkling2_loop.attention.key_length", 128u).kv("inkling2_loop.attention.value_length", 128u)
+        .kv("inkling2_loop.context_length", 1048576u).kv("inkling2_loop.expert_count", 128u)
+        .kv("inkling2_loop.attention.sliding_window", 1024u)
+        .kv("inkling2_loop.attention.sliding_window_pattern", ink_swa)
+        .kv("inkling2_loop.loop.count", 3u).kv("inkling2_loop.loop.start", 6u).kv("inkling2_loop.loop.end", 18u);
+    const ps5lm::ModelInfo ik = ps5lm::read_model_header("Inkling-2-Mini-UD-Q2_K_XL.gguf", ink.bytes(), 9141428384ull);
+    assert(ik.ok && ik.n_layer == 48 && ik.n_kv_layers() == 48 && ik.n_swa_layers == 40);
+    const ps5lm::Preset * ikp = ps5lm::find_preset(ik);
+    assert(ikp && std::string(ikp->label) == "Inkling 2");
+    const ps5lm::Plan ikplan = ps5lm::plan_model(ik, budget);
+    assert(ikplan.fits && ikplan.ctx >= 65536 && ikplan.total_gib <= budget);
+
     // A larger prompt batch costs compute buffer, counted by the feed-forward width.
     Gguf wide_ff = chat;
     wide_ff.kv("qwen35.feed_forward_length", 12288u);

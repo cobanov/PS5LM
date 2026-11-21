@@ -171,6 +171,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
 
     std::map<std::string, uint64_t> ints;  // every scalar, and the largest element of numeric arrays
     std::map<std::string, uint64_t> sums;  // numeric arrays: the sum of their elements
+    std::map<std::string, std::vector<uint64_t>> arrs;  // numeric arrays, element by element
     std::map<std::string, std::string> strs;
     for (uint64_t i = 0; i < n_kv && !r.bad; i++) {
         const std::string key = r.str();
@@ -186,10 +187,12 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                 }
             } else if (n <= 4096) {  // per-layer values, such as head_count_kv
                 uint64_t mx = 0, sum = 0;
+                std::vector<uint64_t> & vals = arrs[key];
                 for (uint64_t j = 0; j < n; j++) {
                     const uint64_t v = read_int(r, et);
                     mx = std::max(mx, v);
                     sum += v;
+                    vals.push_back(v);
                 }
                 ints[key] = mx;
                 sums[key] = sum;
@@ -255,6 +258,24 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     }
     m.n_expert        = (uint32_t) num("expert_count");
 
+    // Looped models (Inkling 2): the layers [loop.start, loop.end) run loop.count
+    // times a token, and llama.cpp gives every pass its own cache slot. Inkling 2
+    // Mini has 24 layers and 48 slots: 8 hold the whole context, 40 the window.
+    const uint64_t loop_count = num("loop.count"), loop_start = num("loop.start"), loop_end = num("loop.end");
+    if (loop_count > 1 && loop_start < loop_end && loop_end <= m.n_layer) {
+        const auto swa = arrs.find(a + "attention.sliding_window_pattern");
+        uint32_t n_slot = 0, n_swa = 0;
+        for (uint32_t il = 0; il < m.n_layer; il++) {
+            const uint32_t passes = il >= loop_start && il < loop_end ? (uint32_t) loop_count : 1;
+            n_slot += passes;
+            if (m.swa_window && swa != arrs.end() && il < swa->second.size() && swa->second[il]) {
+                n_swa += passes;
+            }
+        }
+        m.n_layer      = n_slot;
+        m.n_swa_layers = m.swa_window ? n_swa : 0;
+    }
+
     // Recurrent layers (Gated DeltaNet, Mamba): a fixed f32 state each,
     // the recurrent matrix plus the convolution window.
     const uint64_t inner = num("ssm.inner_size"), state = num("ssm.state_size");
@@ -314,6 +335,9 @@ const std::vector<Preset> & presets() {
         // PrismML's model card (thinking mode); min_p 0.05 is not in the file.
         { "bonsai", "Bonsai 2", "Qwen 3.8 27B in ternary weights; Q2_0 is 7.1 GiB and keeps 64k with room to spare",
           { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05" }, 65536 },
+        // Thinking Machines' model card; the GGUF carries the same in general.sampling.*.
+        { "inkling", "Inkling 2", "26B MoE, 3.4B active, looped; UD-Q2_K_XL leaves room for a long context",
+          { "--temp", "1.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0" } },
         { "qwen3.8", "Qwen 3.8", "27B hybrid Gated DeltaNet; UD-Q2_K_XL holds 64k context on the GPU",
           { "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0" } },
         { "qwen3.6", "Qwen 3.6", "MoE 35B-A3B or dense 27B; the MoE decodes fastest",
