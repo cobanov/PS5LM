@@ -1,8 +1,8 @@
 diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
-index cf147c7e7..a5f26d018 100644
+index 0244d4a..1e0e416 100644
 --- a/tools/server/server-http.cpp
 +++ b/tools/server/server-http.cpp
-@@ -10,6 +10,7 @@
+@@ -13,6 +13,7 @@
  #include <future>
  #include <memory>
  #include <string>
@@ -10,7 +10,7 @@ index cf147c7e7..a5f26d018 100644
  #include <thread>
  #include <mutex>
  
-@@ -24,6 +25,7 @@ public:
+@@ -27,6 +28,7 @@ public:
      std::vector<std::thread> threads; // one thread per listener
      std::unique_ptr<httplib::ThreadPool> pool; // single pool shared among all listeners
      int n_threads_http = 0;
@@ -18,7 +18,7 @@ index cf147c7e7..a5f26d018 100644
  };
  
  class server_http_task_queue : public httplib::TaskQueue {
-@@ -529,9 +531,23 @@ bool server_http_context::start() {
+@@ -648,9 +650,23 @@ bool server_http_context::start() {
      pimpl->pool = std::make_unique<httplib::ThreadPool>(pimpl->n_threads_http, pimpl->n_threads_http + 1024);
      for (size_t i = 0; i < pimpl->servers.size(); ++i) {
          const auto & srv = pimpl->servers[i];
@@ -45,7 +45,7 @@ index cf147c7e7..a5f26d018 100644
              }
          });
          srv->wait_until_ready();
-@@ -547,6 +563,7 @@ bool server_http_context::start() {
+@@ -666,6 +682,7 @@ bool server_http_context::start() {
  }
  
  void server_http_context::stop() const {

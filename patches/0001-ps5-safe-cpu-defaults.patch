@@ -1,8 +1,8 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index 401de1d..7e89648 100644
+index b009d46..c28da1e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -29,6 +29,11 @@
+@@ -34,6 +34,11 @@
  #include <unordered_set>
  #include <vector>
  
@@ -14,7 +14,7 @@ index 401de1d..7e89648 100644
  #if defined(__APPLE__) && defined(__MACH__)
  #include <sys/types.h>
  #include <sys/sysctl.h>
-@@ -199,6 +204,16 @@ static int cpu_count_math_cpus(int n_cpu) {
+@@ -204,6 +209,16 @@ static int cpu_count_math_cpus(int n_cpu) {
   * Returns number of CPUs on system that are useful for math.
   */
  int32_t common_cpu_get_num_math() {
@@ -32,10 +32,10 @@ index 401de1d..7e89648 100644
      int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
      if (n_cpu < 1) {
 diff --git a/common/common.h b/common/common.h
-index dcc5ec1..ee1c265 100644
+index a8e89ed..36d6933 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -73,7 +73,11 @@ struct common_cpu_params {
+@@ -76,7 +76,11 @@ struct common_cpu_params {
      bool     mask_valid                  = false;   // Default: any CPU
      enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
      bool     strict_cpu                  = false;   // Use strict CPU placement

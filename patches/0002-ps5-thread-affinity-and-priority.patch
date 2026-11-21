@@ -1,8 +1,24 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index c28da1e..2da19a1 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -297,6 +297,11 @@ bool set_process_priority(enum ggml_sched_priority prio) {
+     if (prio == GGML_SCHED_PRIO_NORMAL) {
+         return true;
+     }
++#if defined(__PROSPERO__)
++    // PS5: what setpriority does to a payload is unknown. ggml lowers its own
++    // threads' Sony priority for --prio -1 and refuses to raise them.
++    return prio == GGML_SCHED_PRIO_LOW;
++#endif
+ 
+     int p = 0;
+     switch (prio) {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8620c6c..dd1bbed 100644
+index 33193a5..5bf4864 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2695,6 +2695,51 @@ static bool ggml_thread_apply_priority(int32_t prio) {
+@@ -2734,6 +2734,51 @@ static bool ggml_thread_apply_priority(int32_t prio) {
      return true;
  }
  
@@ -54,7 +70,7 @@ index 8620c6c..dd1bbed 100644
  #else // unsupported platforms
  
  static bool ggml_thread_apply_affinity(const bool * mask) {
-@@ -3296,9 +3341,11 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int
+@@ -3335,9 +3380,11 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int
      if (threadpool->pause) {
         // Update main thread prio and affinity to match the threadpool settings
         ggml_thread_apply_priority(threadpool->prio);
@@ -66,7 +82,7 @@ index 8620c6c..dd1bbed 100644
  
         // resume does cond broadcast
         ggml_threadpool_resume_locked(threadpool);
-@@ -3375,9 +3422,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3414,9 +3461,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
      if (!threadpool->pause) {
          // Update main thread prio and affinity at the start, otherwise we'll do it in resume
          ggml_thread_apply_priority(threadpool->prio);
@@ -81,19 +97,3 @@ index 8620c6c..dd1bbed 100644
      }
  #endif // GGML_USE_OPENMP
  
-diff --git a/common/common.cpp b/common/common.cpp
-index 7e89648..f0693fe 100644
---- a/common/common.cpp
-+++ b/common/common.cpp
-@@ -275,6 +275,11 @@ bool set_process_priority(enum ggml_sched_priority prio) {
-     if (prio == GGML_SCHED_PRIO_NORMAL) {
-         return true;
-     }
-+#if defined(__PROSPERO__)
-+    // PS5: what setpriority does to a payload is unknown. ggml lowers its own
-+    // threads' Sony priority for --prio -1 and refuses to raise them.
-+    return prio == GGML_SCHED_PRIO_LOW;
-+#endif
- 
-     int p = 0;
-     switch (prio) {

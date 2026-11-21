@@ -1,49 +1,8 @@
-Subject: [PATCH] server: slots are parked on the RPC worker
-
-With --slot-park-path DIR, POST /slots/{id}?action=save and action=restore
-with {"filename": KEY} keep the slot's state on the RPC worker's own storage
-under KEY (ggml-rpc/park.h) instead of in a file here, and action=park-list,
-park-delete and park-status look after the keys. DIR holds only the
-bookkeeping: per key a manifest, the tokens (4 bytes each) and the positions
-of the parked attention cells (24 bytes each). "device": false in the body
-keeps the old file behaviour when --slot-save-path is set too.
-
-- A save writes the attention cells at positions the key does not hold yet
-  and the recurrent state as it is: bytes in proportion to the tokens added,
-  plus one recurrent state.
-- A recurrent state cannot be rewound, so a request that returns and differs
-  before the parked end needs an earlier state: the recurrent state of the
-  save before, which is kept on the worker. With "checkpoint": true, and on a
-  key's first save, the slot's own checkpoint is parked as well.
-- The slot's tokens are compared with the parked ones. If they differ before
-  the parked end, the files that end before the difference are kept and the
-  rest written again ("mode": "rewrite"): a changed history is never resumed
-  as it was.
-- The manifest names the files with their sizes and checksums and is replaced
-  only after the worker has the new files whole, so a save that dies leaves
-  the previous state loadable. A restore checks sizes and checksums and leaves
-  the slot empty, never half restored, when anything is wrong.
-- Errors carry "park_error": park_pruned (410), park_torn and
-  park_incompatible (409), park_no_space (507), park_unsupported (501),
-  park_empty and park_bad_request (400), park_io (500). A key that was never
-  parked is a 404.
-- A save or a restore waits for its slot like a request sent to it, in the
-  order they came (the task carries the slot's id), and lets what waited behind
-  it go on when it is done. The server does one thing on a slot at a time, so
-  no park action runs beside a request or beside another one.
-- The tokens and cell positions of a key are appended to by a save that adds
-  and written to a new pair of files by one that rewrites; the old pair, like
-  the worker's old files, goes only after the manifest is replaced. A server
-  that dies in any save leaves the key as its last finished save left it.
-  LLAMA_PARK_DIE_AT=manifest ends the server just before the manifest is
-  replaced, for the test of that.
-- One RPC worker only, no draft model, no media in the slot.
-
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 267b848..f30045f 100644
+index a638237..264ee3a 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3665,6 +3665,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3673,6 +3673,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              }
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
@@ -65,22 +24,22 @@ index 267b848..f30045f 100644
          {"--media-path"}, "PATH",
          "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
 diff --git a/common/common.h b/common/common.h
-index 20a6466..2bc5f4e 100644
+index 36d6933..45056f4 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -709,6 +709,7 @@ struct common_params {
+@@ -734,6 +734,7 @@ struct common_params {
      bool log_json = false;
  
      std::string slot_save_path;
 +    std::string slot_park_path; // PS5LM device parking: bookkeeping of the slots parked on the RPC worker
      std::string media_path; // path to directory for loading media files
+     bool media_allow_private_urls = false; // allow http(s) media URLs on local or private addresses
  
-     float slot_prompt_similarity = 0.1f;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 6dba147..3892ed8 100644
+index 371b29e..a184faa 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1009,6 +1009,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+@@ -1042,6 +1042,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
      return true;
  }
  
@@ -90,7 +49,7 @@ index 6dba147..3892ed8 100644
  //
  // server_context_impl (private implementation)
  //
-@@ -1016,6 +1019,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+@@ -1049,6 +1052,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
  struct server_context_impl {
      friend struct server_context;
  
@@ -100,7 +59,7 @@ index 6dba147..3892ed8 100644
  public:
      // only use these pointers outside of this class:
      //  - when not in sleeping state
-@@ -3208,6 +3214,18 @@ private:
+@@ -3251,6 +3257,18 @@ private:
                  } break;
              case SERVER_TASK_TYPE_SLOT_SAVE:
                  {
@@ -119,7 +78,7 @@ index 6dba147..3892ed8 100644
                      const int id_slot = task.slot_action.id_slot;
                      server_slot * slot = get_slot_by_id(id_slot);
                      if (slot == nullptr) {
-@@ -3221,6 +3239,17 @@ private:
+@@ -3264,6 +3282,17 @@ private:
                          break;
                      }
  
@@ -137,7 +96,7 @@ index 6dba147..3892ed8 100644
                      const int64_t t_start = ggml_time_us();
  
                      std::string filename = task.slot_action.filename;
-@@ -5985,7 +6014,7 @@ void server_routes::init_routes() {
+@@ -6134,7 +6163,7 @@ void server_routes::init_routes() {
  
      this->post_slots = [this](const server_http_req & req) {
          auto res = create_response();
@@ -146,7 +105,7 @@ index 6dba147..3892ed8 100644
              res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
              return res;
          }
-@@ -6002,6 +6031,54 @@ void server_routes::init_routes() {
+@@ -6151,6 +6180,54 @@ void server_routes::init_routes() {
  
          std::string action = req.get_param("action");
  
@@ -203,7 +162,7 @@ index 6dba147..3892ed8 100644
          }
 diff --git a/tools/server/server-park.h b/tools/server/server-park.h
 new file mode 100644
-index 0000000..d0e2ad6
+index 0000000..d734770
 --- /dev/null
 +++ b/tools/server/server-park.h
 @@ -0,0 +1,1074 @@
@@ -798,7 +757,7 @@ index 0000000..d0e2ad6
 +            throw server_park_error{"park_empty", 400, "the slot holds no state to park"};
 +        }
 +        for (const auto & c : slot.prompt.checkpoints) {
-+            if (!c.data_dft.empty() || !c.data_spec.empty()) {
++            if (!c->data_dft.empty() || !c->data_spec.empty()) {
 +                throw server_park_error{"park_unsupported", 501, "device parking does not keep speculative-decoding checkpoints"};
 +            }
 +        }
@@ -875,8 +834,8 @@ index 0000000..d0e2ad6
 +        const common_prompt_checkpoint * ckpt = nullptr;
 +        if (rs_bytes > 0 && (want_checkpoint || !prev_ok)) {
 +            for (const auto & c : slot.prompt.checkpoints) {
-+                if (!c.data_tgt.empty() && c.n_tokens <= (int64_t) tokens.size() && c.pos_max < n_kv && (ckpt == nullptr || c.n_tokens > ckpt->n_tokens)) {
-+                    ckpt = &c;
++                if (!c->data_tgt.empty() && c->n_tokens <= (int64_t) tokens.size() && c->pos_max < n_kv && (ckpt == nullptr || c->n_tokens > ckpt->n_tokens)) {
++                    ckpt = c.get();
 +                }
 +            }
 +        }
@@ -1183,7 +1142,7 @@ index 0000000..d0e2ad6
 +            }
 +            slot.prompt.tokens = std::move(restored);
 +            if (!m.ck.file.empty()) {
-+                slot.prompt.checkpoints.push_back(std::move(ckpt));
++                slot.prompt.checkpoints.push_back(std::make_shared<const common_prompt_checkpoint>(std::move(ckpt)));
 +            }
 +        } catch (...) {
 +            ggml_rpc_park_rsp rsp;
@@ -1282,10 +1241,10 @@ index 0000000..d0e2ad6
 +    std::mutex  mutex;
 +};
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 97d31fd..28f4411 100644
+index f6517df..a9329d3 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -188,6 +188,7 @@ struct server_task {
+@@ -205,6 +205,7 @@ struct server_task {
          int id_slot;
          std::string filename;
          std::string filepath;

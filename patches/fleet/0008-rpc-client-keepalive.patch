@@ -1,17 +1,8 @@
-Subject: [PATCH] rpc: the client keeps an idle connection alive
-
-The connection from a host to a worker carries nothing while no request runs.
-A host behind a NAT (WSL2 behind Windows) loses it after about half an hour of
-that: the next request's first message fails, and llama-server aborts with
-"Remote RPC server crashed", although the worker is fine. The client socket
-now has TCP keepalive: a probe after GGML_RPC_KEEPALIVE_S seconds idle
-(default 60, 0 = off), then every 20 s, given up after 6 misses. Linux only.
-
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index 8fad632..be2355b 100644
+index 652e424..663affd 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
-@@ -792,6 +792,24 @@ socket_ptr socket_t::connect(const char * host, int port) {
+@@ -807,6 +807,24 @@ socket_ptr socket_t::connect(const char * host, int port) {
      if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
          return nullptr;
      }

@@ -1,24 +1,9 @@
-Subject: [PATCH] rpc: large tensor reads and writes go in pieces
-
-An RPC server receives every SET_TENSOR into one heap buffer of the message's
-size and builds every GET_TENSOR answer in one. A host that saves or restores a
-slot reads and writes whole KV layers that way (85 MiB each for Qwen3.8-27B at
-153K tokens), and every prompt batch sends an attention mask that grows with
-the depth (38 MiB at 128-token batches, 128 MiB at 512). A PS5 worker with 60
-to 100 MiB to spare died of either ("Failed to allocate input buffer").
-
-The client now splits set_tensor, set_tensor_async, get_tensor,
-get_tensor_async and the two 2-D variants into pieces of at most
-GGML_RPC_CHUNK_MB MiB (default 8, 0 = off). Weights that take the hash-cache
-path are not split. Only client functions change: the server sees ordinary,
-smaller requests, so either side can be updated alone.
-
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 29b2414..e8dc5fc 100644
+index 1712727..b6eaef2 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -876,7 +876,27 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
-     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+@@ -895,7 +895,28 @@ static bool rpc_use_hash_cache(const rpc_dispatcher & dispatcher, const ggml_ten
+     return dispatcher.get_send_tensor_hash() && size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
  }
  
 +// PS5LM context study 2026-11-14: split large tensor reads and writes into pieces. The RPC server receives every
@@ -36,7 +21,8 @@ index 29b2414..e8dc5fc 100644
 +}
 +
  static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-+    if (const size_t chunk = rpc_chunk_bytes(); chunk && size > chunk && !rpc_use_hash_cache(tensor, size)) {
++    if (const size_t chunk = rpc_chunk_bytes(); chunk && size > chunk &&
++            !rpc_use_hash_cache(*((ggml_backend_rpc_buffer_context *) buffer->context)->dispatcher, tensor, size)) {
 +        for (size_t o = 0; o < size; o += chunk) {
 +            ggml_backend_rpc_buffer_set_tensor(buffer, tensor, (const char *) data + o, offset + o, std::min(chunk, size - o));
 +        }
@@ -45,7 +31,7 @@ index 29b2414..e8dc5fc 100644
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      rpc_tensor rpc_tensor = serialize_tensor(tensor);
      uint8_t cache_flag = 0;
-@@ -905,6 +925,14 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+@@ -924,6 +945,14 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
  
  static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
          size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
@@ -60,7 +46,7 @@ index 29b2414..e8dc5fc 100644
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      rpc_tensor rpc_tensor = serialize_tensor(tensor);
      LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
-@@ -927,6 +955,14 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -946,6 +975,14 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
  
  static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
          size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
@@ -75,7 +61,7 @@ index 29b2414..e8dc5fc 100644
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
               rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
-@@ -948,6 +984,12 @@ static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -967,6 +1004,12 @@ static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
  }
  
  static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -88,11 +74,12 @@ index 29b2414..e8dc5fc 100644
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
               rpc_log_format_size(size).c_str());
-@@ -1177,6 +1219,12 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+@@ -1205,6 +1248,13 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
  }
  
  static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-+    if (const size_t chunk = rpc_chunk_bytes(); chunk && size > chunk && !rpc_use_hash_cache(tensor, size)) {
++    if (const size_t chunk = rpc_chunk_bytes(); chunk && size > chunk &&
++            !rpc_use_hash_cache(*((ggml_backend_rpc_context *) backend->context)->dispatcher, tensor, size)) {
 +        for (size_t o = 0; o < size; o += chunk) {
 +            ggml_backend_rpc_set_tensor_async(backend, tensor, (const char *) data + o, offset + o, std::min(chunk, size - o));
 +        }
@@ -101,7 +88,7 @@ index 29b2414..e8dc5fc 100644
      ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
      rpc_tensor rpc_tensor = serialize_tensor(tensor);
      uint8_t cache_flag = 0;
-@@ -1205,6 +1253,12 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
+@@ -1233,6 +1283,12 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
  }
  
  static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {

@@ -1,7 +1,8 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e8808ab..371b29e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -4422,6 +4422,20 @@
+@@ -4500,6 +4500,20 @@ private:
                      const auto & spans = slot.task->params.message_spans;
                      const auto last_user_pos = spans.last_user_message_pos();
  
@@ -22,17 +23,17 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
                      // add prompt tokens for processing in the current batch
-@@ -4476,7 +4490,8 @@
+@@ -4557,7 +4571,8 @@ private:
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
  
--                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-+                            if ((pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) &&
+-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
++                            if ((pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) &&
 +                                checkpoint_kept(pos)) {
                                  break;
                              }
                          }
-@@ -4492,7 +4507,7 @@
+@@ -4573,7 +4588,7 @@ private:
                              bool should_break = false;
                              for (int offset : checkpoint_offsets) {
                                  const int n_last = std::min(n_batch, offset);
@@ -41,7 +42,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
                                      should_break = true;
                                      break;
                                  }
-@@ -4546,6 +4561,9 @@
+@@ -4632,6 +4647,9 @@ private:
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  

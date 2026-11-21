@@ -1,26 +1,8 @@
-Subject: [PATCH] llama: a sequence's state in parts, the tensor data left on the device
-
-llama_state_seq_park_get/set write and read one part of a sequence's state,
-the attention cells or the recurrent state, with the tensor data handed to a
-callback range by range instead of copied through the caller: the caller keeps
-only the small part (cell positions, layout) and leaves the data where it is
-(ggml_backend_rpc_park).
-
-- The attention part takes a position: only the cells at and after it are
-  written, so a caller that saved a conversation before writes what was added
-  since. Set with append adds such cells to those the sequence already holds.
-- The recurrent part is whole: it has a fixed size and cannot be extended. The
-  callback is told how much of the small part comes before each tensor, so a
-  caller that writes both in that order after llama_state_seq_park_header has
-  written a context checkpoint without holding it.
-- For the hybrid, attention-only and recurrent-only memories; the others
-  answer that they have no parts.
-
 diff --git a/include/llama.h b/include/llama.h
-index 3af6e22..924d155 100644
+index 7122143..e8db644 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -952,6 +952,52 @@ extern "C" {
+@@ -947,6 +947,52 @@ extern "C" {
                      llama_seq_id   dest_seq_id,
             llama_state_seq_flags   flags);
  
@@ -74,7 +56,7 @@ index 3af6e22..924d155 100644
      // Decoding
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ca84fc4..1bf8837 100644
+index 7490cf3..8c261ee 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,9 @@
@@ -87,7 +69,7 @@ index ca84fc4..1bf8837 100644
  #include "llama-mmap.h"
  #include "llama-model.h"
  #include "llama-moe-cache.h"
-@@ -3415,6 +3418,165 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+@@ -3811,6 +3814,165 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
  
  static constexpr uint32_t io_magic = 0xaf143cd8;
  
@@ -253,7 +235,7 @@ index ca84fc4..1bf8837 100644
  size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
      llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
      try {
-@@ -4590,6 +4752,30 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -5010,6 +5172,30 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  
@@ -285,10 +267,10 @@ index ca84fc4..1bf8837 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 6938fb1..ebe554c 100644
+index 3e3921c..9f792f3 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -165,6 +165,13 @@ struct llama_context {
+@@ -180,6 +180,13 @@ struct llama_context {
      size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
      size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
  
@@ -303,10 +285,10 @@ index 6938fb1..ebe554c 100644
              const char * filepath,
             llama_token * tokens_out,
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 6f0e3f7..1f98ed3 100644
+index fbe422a..4291448 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -2102,6 +2102,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+@@ -2258,6 +2258,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
              add_cell = add_cell && !cells.is_empty(i);
              add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
  
@@ -316,7 +298,7 @@ index 6f0e3f7..1f98ed3 100644
              // check the cell is not SWA-masked
              if (add_cell && seq_id != -1) {
                  const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-@@ -2368,7 +2371,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2524,7 +2527,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
              return false;
          }
  
@@ -329,10 +311,10 @@ index 6f0e3f7..1f98ed3 100644
          llama_batch_allocr balloc(hparams.n_pos_per_embd());
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 9bfb8f2..8088a62 100644
+index 1b40f6f..851aacd 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -151,6 +151,14 @@ public:
+@@ -153,6 +153,14 @@ public:
      void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
      void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
  
@@ -347,7 +329,7 @@ index 9bfb8f2..8088a62 100644
      //
      // llama_kv_cache specific API
      //
-@@ -346,6 +354,9 @@ private:
+@@ -365,6 +373,9 @@ private:
          std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
      };
  
