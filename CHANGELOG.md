@@ -8,6 +8,11 @@ v0.1.x are the upstream payload releases by cobanov.
 ## [Unreleased]
 
 ### Added
+- **Inkling 2 Mini** (Thinking Machines' looped MoE, 26B with 3.4B active) in Suggested, as
+  Unsloth's `UD-Q2_K_XL` from `Mainline_Support` (upstream llama.cpp cannot read the files in
+  the repository root, which use Unsloth's fork layout). The planner counts its cache slots:
+  layers 6 to 17 run three times a token, each pass with its own KV and conv state, so 48
+  slots, 8 of them full attention and 40 sliding window. At 11.38 GiB that is a 64k `q8_0` cache.
 - **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
@@ -148,6 +153,17 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- llama.cpp moves to `e50c254a2` (2026-11-21), about 790 commits on from b11827, for Inkling 2
+  (`inkling2_loop`, #32217, #32694 and the loop fix #32704, which is not in a release tag yet).
+  - `patches/0011` is gone: upstream keeps the rotation matrices in device buffers itself
+    (`llama_kv_cache::init_rotation`). Its test went with it.
+  - `patches/0012` is dropped for now. Upstream rebuilt the KQ mask (`llm_attn_mask`, with row
+    slices for Inkling's relative bias and DSpark), and the device-built mask does not port onto
+    that as it was. The host mask is upstream's default; a long prompt uploads more per ubatch.
+  - The other patches re-based. `fleet/0006` and `fleet/0009` now put their HELLO bits in
+    upstream's new `flags` byte (GRAPH_FREE `0x80`, PARK `0x40`; upstream uses bit 0 for
+    SET_TENSOR_HASH). The RPC protocol is 10.0.1; the fleet tests read the major from the pin.
+  - `patches/0016` follows upstream's checkpoints, which are now shared pointers.
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
   every worker over the network.

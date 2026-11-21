@@ -160,7 +160,7 @@ memory. IP validation is not authentication.
 ## Revisions and build
 
 Developed on PS5LM `c4595784ce75c1d58777b11ef812d3e087e74296`, with llama.cpp
-`970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc` and UI
+`970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc` (now `e50c254a22c590c9d2a60db86690d48d42497e2b`) and UI
 `bf44d80384d5b8f8f4f213cf98d748887211328d`. Build host and workers from the same
 checkout and patch set. The host manifest checks the local binary checksum and
 llama revision. A remote handshake checks **protocol compatibility**, not a remote
