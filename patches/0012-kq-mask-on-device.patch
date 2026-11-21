@@ -1,7 +1,30 @@
+PS5LM: the causal KQ mask is built on the device that holds the KV cache.
+
+A graph's attention mask is [n_kv, n_tokens] and llama.cpp fills it on the host
+and uploads it with every batch: 21 MB for a 512-token batch at 21K of context,
+over the network for an RPC worker. For a plain causal mask over one sequence
+per stream only the positions are needed, so the graph gets two small inputs,
+the cells' positions [n_kv] and the tokens' positions [n_tokens], and makes the
+mask from them on the device (repeat, add, clamp, log: exactly 0 or -inf).
+A batch that needs anything else (several sequences in a stream, a sliding
+window, 2-D positions, ALiBi, non-causal attention) keeps the host mask, as
+does a cache in host memory. LLAMA_KQ_MASK_HOST=1 turns it off.
+
+On b12600 the mask is llama.cpp's llm_attn_mask, which also carries the cell
+rows of flash attention over K/V rows. The device mask is one more form of it
+(pos_kv, pos_tok; raw is then a node of the graph, not an input), made in
+build_attn_inp_attn_mask whenever rows are not in use, and filled in
+llama_kv_cache::set_input_attn_mask. So every memory whose masks come from that
+builder has it: the plain cache, the hybrid one, and now the full-attention
+half of a sliding-window pair (its window half keeps the host mask). Builders
+that make a dense mask themselves (attention with relative positions, as
+Inkling 2 uses, and the K-only caches) are as before: host mask.
+
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 269b920fb..9d4520c62 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -65,6 +65,109 @@ static bool can_reuse_kq_mask(
+@@ -68,6 +68,73 @@ static bool can_reuse_kq_mask(
      return res;
  }
  
@@ -72,132 +95,97 @@ diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 +    return res;
 +}
 +
-+// either kind of mask, whichever the graph was built with
-+static bool can_reuse_attn_kv_mask(
-+        const llm_graph_input_attn_kv * inp,
-+        const llama_kv_cache_context * mctx,
-+        const llama_ubatch & ubatch,
-+        const llama_cparams & cparams) {
-+    if (inp->self_kq_pos_kv) {
-+        return can_reuse_kq_mask_dev(inp->self_kq_pos_kv, inp->self_kq_pos_tok, mctx, ubatch, cparams);
-+    }
-+
-+    // a graph with the host mask is rebuilt once the device mask becomes possible
-+    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
-+    if (mctx->can_build_kq_mask_dev(ubatch, cparams.causal_attn, n_stream)) {
-+        return false;
-+    }
-+
-+    return can_reuse_kq_mask(inp->self_kq_mask, mctx, ubatch, cparams);
-+}
-+
-+static void set_input_attn_kv_mask(
-+        const llm_graph_input_attn_kv * inp,
-+        const llama_kv_cache_context * mctx,
-+        const llama_ubatch * ubatch,
-+        const llama_cparams & cparams) {
-+    if (inp->self_kq_pos_kv) {
-+        if (inp->self_kq_pos_kv->buffer && inp->self_kq_pos_tok->buffer) {
-+            mctx->set_input_kq_pos(inp->self_kq_pos_kv, inp->self_kq_pos_tok, ubatch);
-+        }
-+        return;
-+    }
-+
-+    if (inp->self_kq_mask && inp->self_kq_mask->buffer) {
-+        mctx->set_input_kq_mask(inp->self_kq_mask, ubatch, cparams.causal_attn);
-+    }
-+}
-+
- // impl
- 
- void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-@@ -547,9 +650,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
- 
-     // the mask is left unallocated when the graph only stores K/V without attending
-     // (e.g. DFlash's KV-injection pass)
--    if (self_kq_mask && self_kq_mask->buffer) {
--        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
--    }
-+    set_input_attn_kv_mask(this, mctx, ubatch, cparams);
- 
-     if (self_k_rot && self_k_rot->buffer) {
-         mctx->set_input_k_rot(self_k_rot);
-@@ -570,7 +671,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
-   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
- 
--    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-+    res &= can_reuse_attn_kv_mask(this, mctx, params.ubatch, params.cparams);
- 
-     return res;
- }
-@@ -1164,7 +1265,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
- 
--    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-+    set_input_attn_kv_mask(inp_attn.get(), mctx->get_attn(), ubatch, cparams);
- 
-     if (inp_attn->self_k_rot) {
-         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-@@ -1197,7 +1298,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
-     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
- 
--    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-+    res &= can_reuse_attn_kv_mask(inp_attn.get(), mctx->get_attn(), params.ubatch, params.cparams);
- 
-     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
- 
-@@ -3191,8 +3292,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
-         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
- 
--        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
--        inp->self_kq_mask_cnv = inp->self_kq_mask;
-+        inp->self_kq_mask_cnv = build_attn_inp_kq_mask_dev(ctx0, mctx_cur, ubatch, cparams,
-+                &inp->self_kq_pos_kv, &inp->self_kq_pos_tok);
-+        if (!inp->self_kq_mask_cnv) {
-+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-+            inp->self_kq_mask_cnv = inp->self_kq_mask;
-+        }
+ static bool can_reuse_attn_mask(
+         const llm_attn_mask & attn_mask,
+         const llama_kv_cache_context * mctx,
+@@ -86,6 +153,19 @@ static bool can_reuse_attn_mask(
      }
  
-     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+     if (!use_rows) {
++        // PS5LM: either kind of mask, whichever the graph was built with
++        if (attn_mask.pos_kv) {
++            return can_reuse_kq_mask_dev(attn_mask.pos_kv, attn_mask.pos_tok, mctx, ubatch, cparams);
++        }
++
++        // a graph with the host mask is rebuilt once the device mask becomes possible
++        if (attn_mask.dev_capable) {
++            const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
++            if (mctx->can_build_kq_mask_dev(ubatch, cparams.causal_attn, n_stream)) {
++                return false;
++            }
++        }
++
+         return can_reuse_kq_mask(attn_mask.raw, mctx, ubatch, cparams);
+     }
+ 
+@@ -114,7 +194,12 @@ static llm_attn_mask build_attn_inp_attn_mask(
+ 
+     if (n_kv_rows == 0) {
+         attn_mask.rows = nullptr;
+-        attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
++        // PS5LM: the mask is made on the cache's device when it can be (build_attn_inp_kq_mask_dev)
++        attn_mask.dev_capable = true;
++        attn_mask.raw = build_attn_inp_kq_mask_dev(ctx, mctx, ubatch, cparams, &attn_mask.pos_kv, &attn_mask.pos_tok);
++        if (!attn_mask.raw) {
++            attn_mask.raw = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
++        }
+     } else {
+         const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
+ 
 diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b5956ead9..0f0d2c711 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -364,6 +364,10 @@ public:
-     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+@@ -355,6 +355,13 @@ struct llm_attn_mask {
  
-+    // PS5LM: when the mask is built on the device, self_kq_mask is null and these are the inputs
-+    ggml_tensor * self_kq_pos_kv  = nullptr; // F32 [n_kv, 1, 1, n_stream]
-+    ggml_tensor * self_kq_pos_tok = nullptr; // F32 [1, n_batch/n_stream, 1, n_stream]
+     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
+     bool block_uniform = false;
 +
-     // note: assumes v_rot^2 == I
-     ggml_tensor * self_k_rot = nullptr;
-     ggml_tensor * self_v_rot = nullptr;
++    // PS5LM: when the mask is built on the device, raw is a node of the graph and these are its
++    // inputs. dev_capable: made by a builder that takes the device mask whenever the cache allows
++    // it, so a graph that got the host mask is built again once the device mask becomes possible.
++    ggml_tensor * pos_kv  = nullptr; // F32 [n_kv, 1, 1, n_stream]
++    ggml_tensor * pos_tok = nullptr; // F32 [1, n_batch/n_stream, 1, n_stream]
++    bool dev_capable = false;
+ };
+ 
+ class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index fbe422a27..f001cd2d4 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -385,6 +385,7 @@ llama_kv_cache::llama_kv_cache(
+@@ -368,6 +368,7 @@ llama_kv_cache::llama_kv_cache(
      }
  
-     init_attn_rot_dev();
+     init_rotation(name_tag);
 +    init_kq_mask_dev();
  
      const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
      debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
-@@ -1885,6 +1886,88 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
-     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+@@ -1905,6 +1906,14 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T *
+ }
+ 
+ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
++    // PS5LM: the mask is made on the device, only its two position inputs are filled
++    if (attn_mask.pos_kv) {
++        if (attn_mask.pos_kv->buffer && attn_mask.pos_tok->buffer) {
++            set_input_kq_pos(attn_mask.pos_kv, attn_mask.pos_tok, ubatch);
++        }
++        return;
++    }
++
+     // fill the cell rows of each slice
+     if (attn_mask.rows && attn_mask.rows->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(attn_mask.rows->buffer));
+@@ -1977,6 +1986,88 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const
+     }
  }
  
 +void llama_kv_cache::init_kq_mask_dev() {
 +    kq_mask_dev = false;
 +
 +    const char * env = getenv("LLAMA_KQ_MASK_HOST");
-+    if ((env && atoi(env) != 0) || hparams.no_alloc || layers.empty()) {
++    if ((env && atoi(env) != 0) || ctxs_bufs.no_alloc || layers.empty()) {
 +        return;
 +    }
 +
@@ -278,7 +266,7 @@ diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -3040,6 +3123,14 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+@@ -3124,6 +3215,14 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
      kv->set_input_pos_bucket(dst, ubatch);
  }
  
@@ -290,27 +278,28 @@ diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
 +    kv->set_input_kq_pos(dst_kv, dst_tok, ubatch);
 +}
 +
- void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
-     kv->set_input_k_rot(dst);
+ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+     kv->set_input_relative_pos(dst, ubatch, extent);
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1b40f6fc4..43fc56d52 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -236,6 +236,11 @@ public:
-     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+@@ -251,6 +251,11 @@ public:
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
  
 +    // PS5LM: build the KQ mask on the cache's device from per-cell and per-token positions
 +    // instead of uploading the full [n_kv, n_tokens] mask. Only for plain causal masks.
 +    bool can_build_kq_mask_dev(const llama_ubatch & ubatch, bool causal_attn, int64_t n_stream) const;
 +    void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_tok, const llama_ubatch * ubatch) const;
 +
-     void set_input_k_rot(ggml_tensor * dst) const;
-     void set_input_v_rot(ggml_tensor * dst) const;
+     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
+     bool has_cell_ext() const;
  
-@@ -300,6 +305,11 @@ private:
+@@ -311,6 +316,11 @@ private:
  
-     void init_attn_rot_dev();
+     void init_rotation(const char * name_tag);
  
 +    // PS5LM: every layer of the cache is in a non-host buffer (env LLAMA_KQ_MASK_HOST=1 disables)
 +    bool kq_mask_dev = false;
@@ -320,13 +309,13 @@ diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
      // env: LLAMA_KV_CACHE_DEBUG
      int debug = 0;
  
-@@ -443,6 +453,9 @@ public:
-     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+@@ -456,6 +466,9 @@ public:
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
  
 +    bool can_build_kq_mask_dev(const llama_ubatch & ubatch, bool causal_attn, int64_t n_stream) const;
 +    void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_tok, const llama_ubatch * ubatch) const;
 +
-     void set_input_k_rot(ggml_tensor * dst) const;
-     void set_input_v_rot(ggml_tensor * dst) const;
+     // see llama_kv_cache::get_prev_tokens()
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
  
