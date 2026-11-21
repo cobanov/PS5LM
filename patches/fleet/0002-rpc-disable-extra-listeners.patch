@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 45fa8a4..a832f6f 100644
+index e4a84cb..0d9cf31 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -2189,6 +2189,12 @@ void rpc_server::sync_all_backends() {
+@@ -2334,6 +2334,12 @@ static bool comm_caps_handshake(const socket_ptr & peer, bool recv_first) {
  // so it gets the same transport upgrades (e.g. RDMA).
  bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
      response.ok = 0;
@@ -12,6 +12,6 @@ index 45fa8a4..a832f6f 100644
 +    if (std::getenv("GGML_RPC_NO_COMM") != nullptr) {
 +        return true;
 +    }
-     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
+     if (request.device >= backends.size() || request.world < 2 || request.rank >= request.world) {
          return true;
      }

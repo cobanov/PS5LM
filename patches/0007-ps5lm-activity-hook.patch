@@ -1,8 +1,8 @@
 diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
-index 7ac78f9..c791d20 100644
+index 1e0e416..6460e51 100644
 --- a/tools/server/server-http.cpp
 +++ b/tools/server/server-http.cpp
-@@ -52,6 +52,16 @@ server_http_context::~server_http_context() {
+@@ -56,6 +56,16 @@ server_http_context::~server_http_context() {
      }
  }
  
@@ -19,7 +19,7 @@ index 7ac78f9..c791d20 100644
  static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
      // skip logging requests that are regularly sent, to avoid log spam
      if (req.path == "/health"
-@@ -649,7 +659,8 @@ static std::string build_query_string(const httplib::Request & req) {
+@@ -769,7 +779,8 @@ static std::string build_query_string(const httplib::Request & req) {
  // using unique_ptr for request to allow safe capturing in lambdas
  using server_http_req_ptr = std::unique_ptr<server_http_req>;
  
@@ -29,7 +29,7 @@ index 7ac78f9..c791d20 100644
      if (response->is_stream()) {
          res.status = response->status;
          // Tell Nginx to not buffer any streamed response
-@@ -660,9 +671,12 @@ static void process_handler_response(server_http_req_ptr && request, server_http
+@@ -780,9 +791,12 @@ static void process_handler_response(server_http_req_ptr && request, server_http
          std::shared_ptr<server_http_req> q_ptr = std::move(request);
          std::shared_ptr<server_http_res> r_ptr = std::move(response);
  
@@ -43,9 +43,9 @@ index 7ac78f9..c791d20 100644
              if (!chunk.empty()) {
                  if (!sink.write(chunk.data(), chunk.size())) {
                      return false;
-@@ -675,7 +689,10 @@ static void process_handler_response(server_http_req_ptr && request, server_http
+@@ -795,7 +809,10 @@ static void process_handler_response(server_http_req_ptr && request, server_http
              }
-             return has_next;
+             return true;
          };
 -        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
 +        const auto on_complete = [request = q_ptr, response = r_ptr, activity](bool) mutable {
@@ -55,7 +55,7 @@ index 7ac78f9..c791d20 100644
              response->on_complete();
              response.reset();
              request.reset();
-@@ -685,6 +702,10 @@ static void process_handler_response(server_http_req_ptr && request, server_http
+@@ -805,6 +822,10 @@ static void process_handler_response(server_http_req_ptr && request, server_http
          res.status = response->status;
          set_headers(res, response->headers);
          res.set_content(response->data, response->content_type);
@@ -66,7 +66,7 @@ index 7ac78f9..c791d20 100644
          response->on_complete();
      }
  }
-@@ -752,8 +773,12 @@ void server_http_context::post(const std::string & path, const server_http_conte
+@@ -872,8 +893,12 @@ void server_http_context::post(const std::string & path, const server_http_conte
              std::move(files),
              req.is_connection_closed
          });

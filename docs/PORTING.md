@@ -1,6 +1,6 @@
 # Porting notes
 
-What it took to build llama.cpp for the PS5, and why. Upstream is pinned at `b11827` (2026-10-22).
+What it took to build llama.cpp for the PS5, and why. Upstream is pinned at `e50c254a2` (2026-11-21, after b12608), the first commit with the Inkling 2 loop fix.
 
 ## The target
 

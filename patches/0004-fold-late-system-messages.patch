@@ -1,10 +1,8 @@
-PS5LM: fold every system or developer message that is not first into the leading one (Codex and Claude Code send them), so templates like Qwen's accept the Chat Completions, Responses and Anthropic APIs.
-
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 4f1acba1a..76058afd7 100644
+index eb5781e..c1cdbc6 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
-@@ -1405,6 +1405,54 @@ json oaicompat_chat_params_parse(
+@@ -1554,6 +1554,54 @@ json oaicompat_chat_params_parse(
      if (!messages.is_array()) {
          throw std::invalid_argument("Expected 'messages' to be an array");
      }

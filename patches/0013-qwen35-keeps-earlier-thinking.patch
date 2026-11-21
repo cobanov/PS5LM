@@ -1,6 +1,8 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index de5f1c4..7920258 100644
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
-@@ -780,6 +780,27 @@
+@@ -974,6 +974,27 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model *
                             "{%- if false %}");
      }
  
@@ -28,27 +30,28 @@
      std::string token_bos = bos_token_override;
      std::string token_eos = eos_token_override;
      bool        add_bos   = false;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 302ef31..cc063bb 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
-@@ -7729,7 +7729,47 @@
-         assert_contains(prompt, think_a2);
+@@ -8366,6 +8366,46 @@ static void test_deepseek_v4_thinking_retention() {
      }
  }
-+
+ 
 +// PS5LM: with preserve_reasoning, Qwen3.5 renders an earlier turn as it rendered while that turn
 +// was the last one, so a new user message only appends to the prompt and the cache still matches.
 +static void test_qwen35_preserve_reasoning() {
 +    LOG_DBG("%s\n", __func__);
 +
 +    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
-+    assert_equals(true, common_chat_templates_get_caps(tmpls.get()).at("supports_preserve_reasoning"));
++    assert_equals(true, common_chat_templates_get_caps(tmpls.get()).at("supports_preserve_reasoning").get<bool>());
 +
 +    common_chat_msg user_q1; user_q1.role = "user"; user_q1.content = "Question 1";
 +    common_chat_msg user_q2; user_q2.role = "user"; user_q2.content = "Question 2";
 +    // a client that sends the thinking back, and one that drops it (Open WebUI without a provider)
 +    common_chat_msg asst_thought = simple_assist_msg("Answer 1", "thinking A1");
 +    common_chat_msg asst_bare    = simple_assist_msg("Answer 1");
- 
++
 +    auto render = [&](const std::vector<common_chat_msg> & messages, const std::string & preserve) {
 +        common_chat_templates_inputs inputs;
 +        inputs.messages = messages;
@@ -78,10 +81,10 @@
  // Verify that consecutive tool results are rendered in the tool call order of the
  // preceding assistant message (matched by tool call id), as required by the reference
  // DeepSeek-V4 implementation.
-@@ -8131,6 +8171,7 @@
-         test_translate_gemma();
-         test_deepseek_v4_thinking_retention();
+@@ -8906,6 +8946,7 @@ int main(int argc, char ** argv) {
          test_deepseek_v4_tool_result_ordering();
+         test_deepseek_v4_1_message_fields();
+         test_inkling2_media_blocks();
 +        test_qwen35_preserve_reasoning();
          test_template_generation_prompt();
          test_reasoning_effort_caps();

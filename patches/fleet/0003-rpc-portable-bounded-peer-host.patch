@@ -1,19 +1,14 @@
-Subject: [PATCH] rpc: avoid strnlen hidden by PS5 XOPEN feature macros
-
-The native CMake build uses _XOPEN_SOURCE=600, which hides strnlen in the
-PS5 SDK headers. Use a bounded C++ scan with the same semantics instead.
-This does not enable peer communications; NO_COMM still rejects them.
-
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 0d9cf31..eeead7b 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -2226,7 +2226,8 @@
+@@ -2376,7 +2376,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
+             state.peers[peer_rank - 1] = std::move(peer);
          }
-         state.peer->update_caps(remote_caps);
      } else {
 -        const std::string host(request.host, strnlen(request.host, sizeof(request.host)));
 +        const char * host_end = std::find(request.host, request.host + sizeof(request.host), '\0');
 +        const std::string host(request.host, host_end);
+         socket_ptr peer;
          // rank 0 may not be listening yet, retry for a few seconds
-         for (int i = 0; i < 100 && state.peer == nullptr; i++) {
-             state.peer = socket_t::connect(host.c_str(), request.port);
+         for (int i = 0; i < 100 && peer == nullptr; i++) {

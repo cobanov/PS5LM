@@ -712,8 +712,8 @@ def case_mixed(rig, report):
         rig.stop()
 
     # what a worker says in its handshake: bit 0 is the graph-free of patches/fleet/0006, bit 1 parking
-    assert hello_features(rig, park=True) & 3 == 3
-    assert hello_features(rig, park=False) & 3 == 1
+    assert hello_features(rig, park=True) & 0xc0 == 0xc0
+    assert hello_features(rig, park=False) & 0xc0 == 0x80
     seen["handshake"] = "parking is offered only with a park folder"
     rig.start()
     report["mixed"] = seen

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression for the pinned v8 RPC server's server-side NO_COMM gate.
+"""Regression for the pinned RPC server's server-side NO_COMM gate.
 
 Starts one loopback CPU worker. Sends only valid HELLO/COMM_INIT/DEVICE_COUNT
 frames, never model data. The requested extra port is already reserved, so even
@@ -10,10 +10,16 @@ import argparse
 from contextlib import ExitStack
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
 import time
+
+# Only the major version breaks compatibility; read it from the pinned llama.cpp.
+RPC_MAJOR = int(re.search(r'#define RPC_PROTO_MAJOR_VERSION\s+(\d+)',
+                          (Path(__file__).resolve().parents[1] / 'third_party/llama.cpp/ggml/include/ggml-rpc.h')
+                          .read_text()).group(1))
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -68,7 +74,7 @@ def run(binary):
             sock.settimeout(1)
             hello = request(sock, 14, bytes(24), 28)
             # Only the major version breaks compatibility; upstream bumps the patch per new ggml op.
-            assert hello[0] == 8, hello[:3]
+            assert hello[0] == RPC_MAJOR, hello[:3]
             for rank in (0, 1):
                 body = struct.pack('<IIII64s', 0, rank, 2, comm_port, b'127.0.0.1')
                 assert request(sock, 20, body, 1) == b'\0', f'rank {rank} was not refused'

@@ -34,6 +34,7 @@ struct ModelInfo {
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
+    double      bias_bytes      = 0;   // attention bias buffers, per context token and ubatch token
     std::string mmproj;                // a vision projector beside the model, or empty
     uint64_t    mmproj_bytes    = 0;
     std::string projector_type;        // clip.projector_type: the projector's own, or the paired one's

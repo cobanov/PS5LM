@@ -21,10 +21,16 @@ An unpatched worker fails step 1.
 import argparse
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
 import time
+
+# Only the major version breaks compatibility; read it from the pinned llama.cpp.
+RPC_MAJOR = int(re.search(r'#define RPC_PROTO_MAJOR_VERSION\s+(\d+)',
+                          (Path(__file__).resolve().parents[1] / 'third_party/llama.cpp/ggml/include/ggml-rpc.h')
+                          .read_text()).group(1))
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,7 +89,7 @@ def connect(port):
     sock = socket.create_connection(('127.0.0.1', port), timeout=5)
     sock.settimeout(30)
     hello = request(sock, HELLO, bytes(24), 28)
-    assert hello[0] == 8, hello[:3]
+    assert hello[0] == RPC_MAJOR, hello[:3]
     remote, _ = struct.unpack('<QQ', request(sock, ALLOC_BUFFER, struct.pack('<IQ', 0, 4096), 16))
     base, = struct.unpack('<Q', request(sock, BUFFER_GET_BASE, struct.pack('<Q', remote), 8))
     return sock, hello, remote, base
@@ -129,7 +135,7 @@ def run(binary):
                     time.sleep(0.05)
 
             sock, hello, remote, base = connect(port)
-            assert hello[3] & 1, 'the worker does not advertise GRAPH_FREE (patches/fleet/0006 missing?)'
+            assert hello[3] & 0x80, 'the worker does not advertise GRAPH_FREE (patches/fleet/0006 missing?)'
             freed = send_graphs(sock, worker.pid, remote, base, 1000, free=True)
             assert freed < 48, f'the worker grew {freed:.0f} MiB although it was told to free the graphs'
             last = 1000+GRAPHS-1
