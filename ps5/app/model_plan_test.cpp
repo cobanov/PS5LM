@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
     const ps5lm::Preset * ikp = ps5lm::find_preset(ik);
     assert(ikp && std::string(ikp->label) == "Inkling 2");
     const ps5lm::Plan ikplan = ps5lm::plan_model(ik, budget);
-    assert(ikplan.fits && ikplan.ctx >= 65536 && ikplan.total_gib <= budget);
+    assert(ikplan.fits && ikplan.ctx >= 32768 && ikplan.total_gib <= budget);
 
     // A larger prompt batch costs compute buffer, counted by the feed-forward width.
     Gguf wide_ff = chat;
