@@ -148,6 +148,39 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **llama.cpp moves to b12600** (29b52d398, 2026-11-20), 775 commits on from b11827, for
+  Inkling 2 Mini: its `inkling2_loop` architecture came with that commit
+  (ggml-org/llama.cpp 32694). Tested on a host build against CPU workers only; **not yet
+  built into a release or run on a console**.
+  - A host and a worker must both be on this pin. llama.cpp's RPC protocol went from 8 to
+    10 and a handshake between the two refuses, so a console keeps its old app until the
+    host is changed with it.
+  - `patches/0011` (the KV cache's rotation matrices kept on its device) is gone: llama.cpp
+    does it itself (31073). `tests/server_kv_rotation_test.py` stays and holds llama.cpp to
+    it.
+  - `patches/0012` (the causal mask built on the KV cache's device) is written anew on
+    llama.cpp's `llm_attn_mask`. It now also covers the full-attention half of a
+    sliding-window model's cache (Gemma 3); a model whose attention has relative
+    positions (Inkling 2) makes a dense mask itself and keeps the host mask.
+  - The worker's handshake bits moved: llama.cpp took the byte they were in for flags of
+    its own, counted up from bit 0, so graph-free (`patches/fleet/0006`) is bit 6 and
+    parking (`patches/fleet/0009`) bit 7.
+  - `patches/fleet/0010`, new: an RPC device no longer claims flash attention over K/V
+    rows, which llama.cpp now uses for a unified KV cache when a device says it can. The
+    RPC device said yes for every op without asking its worker, and ggml-vulkan has no
+    such kernel, so a console would have been sent an op it cannot run.
+    `GGML_RPC_KV_ROWS=1` on the host offers it again.
+  - `patches/0019`, new, carries ggml-org/llama.cpp 32704 (open, not merged): without it
+    the looped layers of `inkling2_loop` run their second and third pass without the
+    experts' scales. To be dropped when a pin has it.
+  - The other patches are re-based; `0016`, `fleet/0005`, `fleet/0007` and `fleet/0009`
+    with small changes for llama.cpp's reference-counted checkpoints and its new RPC
+    send path. `--defrag-thold` is gone from llama-server.
+  - Known limits for Inkling 2 Mini, from reading the code and from an untrained
+    `inkling2_loop` fixture over a CPU worker ([FLEET.md](docs/FLEET.md#inkling-2-mini)):
+    its memory (two attention caches and a recurrent state) cannot be parked on the
+    worker yet, and its attention mask and relative positions are still uploaded with
+    every batch.
 - **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
   (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
   scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
