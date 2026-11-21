@@ -148,6 +148,77 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **llama.cpp moves to b12600** (29b52d398, 2026-11-20), 775 commits on from b11827, for
+  Inkling 2 Mini: its `inkling2_loop` architecture came with that commit
+  (ggml-org/llama.cpp 32694). Tested on a host build against CPU workers only; **not yet
+  built into a release or run on a console**.
+  - A host and a worker must both be on this pin. llama.cpp's RPC protocol went from 8 to
+    10 and a handshake between the two refuses, so a console keeps its old app until the
+    host is changed with it.
+  - `patches/0011` (the KV cache's rotation matrices kept on its device) is gone: llama.cpp
+    does it itself (31073). `tests/server_kv_rotation_test.py` stays and holds llama.cpp to
+    it.
+  - `patches/0012` (the causal mask built on the KV cache's device) is written anew on
+    llama.cpp's `llm_attn_mask`. It now also covers the full-attention half of a
+    sliding-window model's cache (Gemma 3); a model whose attention has relative
+    positions (Inkling 2) makes a dense mask itself and keeps the host mask.
+  - The worker's handshake bits moved: llama.cpp took the byte they were in for flags of
+    its own, counted up from bit 0, so graph-free (`patches/fleet/0006`) is bit 6 and
+    parking (`patches/fleet/0009`) bit 7.
+  - `patches/fleet/0010`, new: an RPC device no longer claims flash attention over K/V
+    rows, which llama.cpp now uses for a unified KV cache when a device says it can. The
+    RPC device said yes for every op without asking its worker, and ggml-vulkan has no
+    such kernel, so a console would have been sent an op it cannot run.
+    `GGML_RPC_KV_ROWS=1` on the host offers it again.
+  - `patches/0019`, new, carries ggml-org/llama.cpp 32704 (open, not merged): without it
+    the looped layers of `inkling2_loop` run their second and third pass without the
+    experts' scales. To be dropped when a pin has it.
+  - The other patches are re-based; `0016`, `fleet/0005`, `fleet/0007` and `fleet/0009`
+    with small changes for llama.cpp's reference-counted checkpoints and its new RPC
+    send path. `--defrag-thold` is gone from llama-server.
+  - Known limits for Inkling 2 Mini, from reading the code and from an untrained
+    `inkling2_loop` fixture over a CPU worker ([FLEET.md](docs/FLEET.md#inkling-2-mini)):
+    its memory (two attention caches and a recurrent state) cannot be parked on the
+    worker yet, and its attention mask and relative positions are still uploaded with
+    every batch.
+- **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
+  (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
+  scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
+  reasoning budget or a tool-call grammar switched that off for the request ("backend
+  sampling is not compatible with reasoning budget, disabling"), and every agent
+  request has both: a PS5 wrote 16.3 tokens a second that way against 18.8 without
+  the budget. For such a request the worker now returns the top-k plus one candidate
+  and the host runs its chain, the budget and the grammar on those. The whole
+  vocabulary is fetched only for a token the budget forces, a token the grammar
+  rejects, and two equal scores among the candidates. The tokens are the ones host
+  sampling gives for the same seed. On a CPU worker with Qwen3.5-0.8B a token cost
+  184 bytes from the worker instead of 993,288, and 19,179 of 19,354 tokens of
+  budget-and-tools replies never needed more. It needs a top-k of at most 1024 as the
+  first active sampler (no logit bias or penalties before it), no mirostat, token
+  probabilities or speculative decoding; otherwise, and with
+  `LLAMA_BACKEND_SAMPLING_CHECKS=0`, a request is sampled on the host as before.
+  `LLAMA_BACKEND_SAMPLING_CHECKS=verify` chooses every token both ways and counts
+  the ones that differ, for testing a build on a worker.
+  `tests/server_backend_sampling_test.py` checks it
+  ([FLEET.md](docs/FLEET.md#sampling-on-the-worker)).
+- **A reply sent back is not read again** (`patches/0017`): a chat client sends the
+  previous reply back as a message, and the template and the tokeniser do not always
+  give the tokens the model wrote. The same text can be split into other tokens
+  (` book` `marks` written, ` bookmarks` on the way back), and the whitespace around
+  the end of the reasoning is the template's: what a reasoning budget left before the
+  end-of-reasoning marker, or the model wrote after it, is not what comes back. A hybrid
+  model cannot step back a few tokens, so the slot returned to its checkpoint and read
+  the whole reply again, or the whole last firing after a parked restore, and the
+  parked key was rewritten from there. Qwen3.8-27B serving agents did this on 10 of
+  227 follow-up turns, 84 to 10,508 tokens each. The server now compares the slot's
+  remaining tokens with the prompt as text, and as far as they say the same the prompt
+  continues from the slot's tokens. Whitespace is compared like any text, except right
+  before and right after the marker that closes the thinking block the template opened
+  in an assistant turn. A history that was really changed is read again as
+  before. `prompt_tokens` then counts the kept tokens, a token or two away from a
+  fresh tokenisation. `LLAMA_REPLY_AS_GENERATED=0` (or `false`, `off`, `no`) turns it off.
+  `tests/server_reply_as_generated_test.py` checks it on a host build
+  ([FLEET.md](docs/FLEET.md#a-reply-sent-back)).
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
   every worker over the network.

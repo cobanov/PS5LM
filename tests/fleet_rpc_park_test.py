@@ -8,6 +8,10 @@ Checked here:
 
   swap      save, another conversation takes the slot, restore: the next turn
             re-reads only its new tokens and answers exactly as without the swap
+  kept      a request that spells the parked history with other tokens saying
+            the same (patches/0017): after a restore it reads only its new tokens,
+            the next save appends, the key holds the slot's tokens; a history
+            really changed in the same place is rewritten
   firings   five firings that each add tokens: each save writes only the new
             cells plus one recurrent state, and a restore from the five files is
             exact; a request that stops short of the parked end goes back to the
@@ -651,7 +655,7 @@ def case_crash(rig, report):
 
 
 def hello_features(rig, park):
-    """The fourth byte of a worker's HELLO answer; a worker of its own, as one serves a single client at a time."""
+    """The flags byte (the fourth) of a worker's HELLO answer; a worker of its own, as one serves a single client at a time."""
     port, = free_ports(1)
     env = dict(rig.env)
     if park:
@@ -711,9 +715,10 @@ def case_mixed(rig, report):
         seen["old host, new worker"] = "serves; has no park actions"
         rig.stop()
 
-    # what a worker says in its handshake: bit 0 is the graph-free of patches/fleet/0006, bit 1 parking
-    assert hello_features(rig, park=True) & 3 == 3
-    assert hello_features(rig, park=False) & 3 == 1
+    # what a worker says in the flags byte of its handshake: bit 6 is the graph-free of patches/fleet/0006,
+    # bit 7 parking (llama.cpp's own flags count up from bit 0)
+    assert hello_features(rig, park=True) & 0xC0 == 0xC0
+    assert hello_features(rig, park=False) & 0xC0 == 0x40
     seen["handshake"] = "parking is offered only with a park folder"
     rig.start()
     report["mixed"] = seen
@@ -757,7 +762,85 @@ def case_memory(rig, report):
         assert rise <= 14, f"the worker's peak memory rose {rise:.1f} MiB while parking and loading {state / 2**20:.1f} MiB"
 
 
-CASES = dict(swap=case_swap, firings=case_firings, many=case_many, torn=case_torn, stale=case_stale,
+def same_text_other_tokens(rig, tokens, low, high):
+    """`tokens` with one of them, in [low, high), written with other tokens that say the same."""
+    if not rig.real:
+        # the fixture has every letter twice: as its byte (3 + the byte) and as a token of its own (259 on)
+        for i in range(high - 1, low - 1, -1):
+            if 3 + ord("a") <= tokens[i] <= 3 + ord("z"):
+                return tokens[:i] + [259 + tokens[i] - 3 - ord("a")] + tokens[i + 1:]
+        raise AssertionError("no letter in that stretch")
+
+    def text(ids):
+        status, body = rig.call("/detokenize", {"tokens": ids})
+        assert status == 200, body
+        return body["content"]
+
+    def ids(piece):
+        status, body = rig.call("/tokenize", {"content": piece, "add_special": False})
+        assert status == 200, body
+        return body["tokens"]
+
+    for i in range(high - 1, low, -1):
+        piece = text([tokens[i]])
+        for cut in range(1, len(piece)):
+            two = ids(piece[:cut]) + ids(piece[cut:])
+            if len(two) == 2 and text(tokens[i - 1:i] + two + tokens[i + 1:i + 2]) == text(tokens[i - 1:i + 2]):
+                return tokens[:i] + two + tokens[i + 1:]
+    raise AssertionError("no token in that stretch splits in two")
+
+
+def case_kept(rig, report):
+    """patches/0017 with parked state: a request that spells the parked history with other tokens (as a chat
+    template does with a reply it writes out again) is a continuation of it. After a restore it reads only its
+    new tokens, the next save appends, and the key holds the slot's tokens, so the turn after that matches too."""
+    a, b = rig.history(21, rig.args.tokens), rig.history(22, rig.args.tokens)
+    more, more2 = rig.history(23, 24), rig.history(24, 24)
+    rig.slot("erase")
+    ref1, _ = rig.turn(a)
+    ref2, ref_read = rig.turn(a + ref1 + more)
+    ref3, ref_read3 = rig.turn(a + ref1 + more + ref2 + more2)
+    rig.slot("erase")
+
+    r1, _ = rig.turn(a)
+    assert r1 == ref1
+    first = rig.slot("save", "kept-a")
+    rig.turn(b)                                   # another conversation takes the slot
+    rig.slot("restore", "kept-a")
+    other = same_text_other_tokens(rig, a, len(a) - 60, len(a))
+    assert other != a and len(other) in (len(a), len(a) + 1)
+    r2, read = rig.turn(other + r1 + more)
+    assert read == ref_read, f"read {read} tokens after the restore for a history spelled with other tokens, {ref_read} for the same tokens"
+    assert r2 == ref2, "the turn after a kept history answers differently than on the slot's own tokens"
+    saved = rig.slot("save", "kept-a")
+    assert saved["mode"] == "append", saved
+    assert saved["n_saved"] == len(a) + REPLY + len(more) + KEPT, saved      # the slot's tokens, not the request's
+    assert saved["n_appended"] == saved["n_saved"] - first["n_saved"], (first, saved)
+
+    rig.turn(b)
+    restored = rig.slot("restore", "kept-a")
+    assert restored["n_restored"] == saved["n_saved"], (saved, restored)
+    r3, read = rig.turn(other + r1 + more + r2 + more2)
+    assert read == ref_read3 and r3 == ref3, f"second turn after a kept history: read {read} (wanted {ref_read3})"
+    again = rig.slot("save", "kept-a")
+    assert again["mode"] == "append", again
+
+    # a history that was really changed in the same place is still rewritten from the change
+    rig.turn(b)
+    rig.slot("restore", "kept-a")
+    i = next(k for k in range(len(a) - 1, len(a) - 61, -1) if other[k] != a[k])
+    changed = a[:i] + [a[i - 1] if a[i - 1] != a[i] else a[i - 2]] + a[i + 1:]
+    _, read = rig.turn(changed + r1 + more)
+    assert read > len(a) - i, f"a changed history was read from token {len(changed) + REPLY + len(more) - read}, the change is at {i}"
+    rewritten = rig.slot("save", "kept-a")
+    assert rewritten["mode"] == "rewrite", rewritten
+    for key in ("kept-a",):
+        rig.slot("park-delete", key)
+    report["kept"] = dict(read_after_restore=ref_read, appended=saved["n_appended"], other_tokens=len(other) - len(a),
+                          changed_history="rewrite, read %d" % read)
+
+
+CASES = dict(swap=case_swap, kept=case_kept, firings=case_firings, many=case_many, torn=case_torn, stale=case_stale,
              prune=case_prune, mixed=case_mixed, busy=case_busy, crash=case_crash, memory=case_memory)
 
 
