@@ -704,12 +704,39 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(job['state'], 'done', job)
         self.assertIn('not seen to start anew', job['result'])
 
+    def test_a_restart_without_a_start_mark_waits_before_it_looks_at_the_port(self):
+        # No log to read (setUp's started gives ''): the port is all there is, and the
+        # old worker can answer for a moment after it took the request.
+        self.fleet.add_device(ps5())
+        events = []
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='worker')), \
+                patch.object(devices, 'restart', return_value=True), \
+                patch.object(devices, 'port_probe', lambda address, port, timeout=0.6: events.append('port') or 'open'), \
+                patch.object(control.time, 'sleep', events.append):
+            self.fleet.device_action('ps5-a', 'restart')
+            (job,) = self.finished()
+        self.assertEqual(job['state'], 'done', job)
+        self.assertEqual(events[:2], [2, 'port'])
+
+    def test_only_a_restart_looks_again_at_a_console_between_hosts(self):
+        # Quit, leave and unload act on what the ports say at once, as before.
+        self.fleet.add_device(ps5())
+        with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')) as mode, \
+                patch.object(devices, 'worker_expected', return_value=True) as expected, \
+                patch.object(devices, 'quit_app'):
+            self.fleet.device_action('ps5-a', 'quit')
+            (job,) = self.finished()
+        self.assertEqual(job['result'], 'asked PS5LM to quit')
+        mode.assert_called_once()
+        expected.assert_not_called()
+
     def test_a_worker_between_hosts_is_restarted_as_a_worker(self):
         # A worker that has just lost its host refuses connections while it frees
         # what the host held, which reads as idle. The console is set to be a worker
         # (fleet-worker.txt), so the restart looks again, and when it still reads as
         # idle it is restarted with its settings and waited for like any worker.
         self.fleet.add_device(ps5())
+        self.fleet.env_pending.add('ps5-a')
         marks = iter(['21:00:00 ps5lm-app: version 0.11.0', '21:00:00 ps5lm-app: version 0.11.0',
                       '21:00:09 ps5lm-app: version 0.11.0'])
         with patch.object(devices, 'ps5_mode', return_value=dict(mode='idle')) as mode, \
@@ -724,6 +751,8 @@ class FleetTests(unittest.TestCase):
         self.assertGreater(mode.call_count, 1)
         restart.assert_called_once_with('192.168.50.21', devices.worker_env(False, 0))
         self.assertIn('worker restarted on 192.168.50.21:30052 (PS5LM started anew', job['result'])
+        # The restart wrote its settings, so they are no longer shown as pending.
+        self.assertNotIn('ps5-a', self.fleet.env_pending)
         # It read as a worker again within the time allowed: the usual restart.
         modes = iter([dict(mode='idle'), dict(mode='idle'), dict(mode='worker')])
         with patch.object(devices, 'ps5_mode', lambda address, port: next(modes)), \

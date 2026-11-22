@@ -688,6 +688,8 @@ class Fleet:
         asked = time.monotonic()
         anew = bool(mark) and self._wait_started(address, mark, WORKER_GONE_SECONDS, replica)
         seen = time.monotonic()
+        if not mark:
+            time.sleep(2)   # no start mark to watch, and the old worker can answer for a moment after it took the request
         if not self._wait_port(address, port, 150, replica, pause=0.25 if anew else 2):
             raise ControlError(f'{name} did not come back as a worker in 150 s')
         if not anew:
@@ -850,9 +852,10 @@ class Fleet:
             if mode == 'offline':
                 raise ControlError('the console does not answer: off, in rest mode, or not jailbroken since it started')
             # A console set to be a worker that does not read as an idle one may only
-            # be between hosts: look again before acting on what its ports said.
+            # be between hosts: a restart looks again before acting on what its ports
+            # said. The other actions act at once, as before.
             expected = False
-            if mode != 'worker' or status.get('busy'):
+            if action == 'restart' and (mode != 'worker' or status.get('busy')):
                 with contextlib.suppress(*ERRORS):
                     expected = devices.worker_expected(address)
                 if expected:
@@ -877,6 +880,8 @@ class Fleet:
                     if not expected:
                         return 'PS5LM was closed; asked the console to open it'
                 if expected:      # it comes back as a worker, whatever its ports said: wait for that one
+                    with self.lock:   # restart wrote its settings to env.txt before the request
+                        self.env_pending.discard(device_id)
                     return self._await_worker(device, mark)
                 return 'asked PS5LM to restart' + (' with its model' if mode in ('serving', 'loading') else '')
             if action == 'worker':
