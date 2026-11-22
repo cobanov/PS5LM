@@ -148,6 +148,10 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
+  (the system's default is 448 MiB), so the direct pool, where models go, is
+  12.1875 GiB instead of 12. It applies when the app starts from the home screen,
+  not when it restarts for a model.
 - **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
   (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
   scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
