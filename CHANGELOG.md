@@ -163,7 +163,8 @@ v0.1.x are the upstream payload releases by cobanov.
   before and right after the marker that closes the thinking block the template opened
   in an assistant turn. A history that was really changed is read again as
   before. `prompt_tokens` then counts the kept tokens, a token or two away from a
-  fresh tokenisation. `LLAMA_REPLY_AS_GENERATED=0` (or `false`, `off`, `no`) turns it off.
+  fresh tokenisation. It is off unless `LLAMA_REPLY_AS_GENERATED` is `1` (or `true`, `on`,
+  `yes`); the fleet controller sets it for its hosts, so the app's own server is unchanged.
   `tests/server_reply_as_generated_test.py` checks it on a host build
   ([FLEET.md](docs/FLEET.md#a-reply-sent-back)).
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache

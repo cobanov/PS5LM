@@ -87,7 +87,8 @@ class Rig:
         self.host_dir = output / "host-park"
         self.host_dir.mkdir(parents=True)
         self.worker_port, self.api = free_ports(2)
-        self.env = dict(os.environ, GGML_RPC_NO_RDMA="1", GGML_RPC_NO_COMM="1", CUDA_VISIBLE_DEVICES="-1")
+        # A fleet host's environment (controller.child_environment): patches/0017 on.
+        self.env = dict(os.environ, GGML_RPC_NO_RDMA="1", GGML_RPC_NO_COMM="1", CUDA_VISIBLE_DEVICES="-1", LLAMA_REPLY_AS_GENERATED="1")
         self.stack = None
         self.worker = self.server = None
         self.n_start = 0

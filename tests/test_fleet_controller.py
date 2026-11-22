@@ -201,6 +201,13 @@ class ControllerTests(unittest.TestCase):
             self.assertNotIn('LLAMA_ARG_RPC', env)
             self.assertEqual(env['GGML_RPC_NO_RDMA'], '1')
 
+    def test_a_fleet_host_keeps_replies_as_generated_unless_told_not_to(self):
+        with patch.dict(os.environ):
+            os.environ.pop('LLAMA_REPLY_AS_GENERATED', None)
+            self.assertEqual(controller.child_environment()['LLAMA_REPLY_AS_GENERATED'], '1')
+            os.environ['LLAMA_REPLY_AS_GENERATED'] = '0'
+            self.assertEqual(controller.child_environment()['LLAMA_REPLY_AS_GENERATED'], '0')
+
     def test_preflight_caps_declared_budget(self):
         text = ('Available devices:\n  RPC0: 127.0.0.1:50052 (64 MiB, 24 MiB free)\n'
                 '  RPC1: 127.0.0.1:50053 (64 MiB, 48 MiB free)\n')

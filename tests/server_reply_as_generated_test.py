@@ -35,7 +35,8 @@ Read again, from a checkpoint:
   bound     the prompt with the slot's tokens would not fit the context (fixture only)
   reject    the patch's last check refuses (forced with LLAMA_REPLY_AS_GENERATED_TEST_REJECT): the request is
             served as without the patch
-  off       LLAMA_REPLY_AS_GENERATED=0, false, OFF or no: split and before are read again; any other value is on
+  off       without LLAMA_REPLY_AS_GENERATED, or with it 0, OFF or any value but 1, true, on or yes (in any case):
+            split and before are read again. The other cases run with it 1, as a fleet host's controller sets it
 
 Run after scripts/build-fleet-host.sh. The model is an untrained recurrent fixture with one token per letter,
 so only token counts and the server's timings are checked, not the words. With --model the same cases run on a
@@ -108,7 +109,9 @@ class Server:
             command += ["--model", str(fixture), "--ctx-size", str(CONTEXT), "--batch-size", "16", "--ubatch-size", "16",
                         "--chat-template-file", str(template)]
         self.end_of_turn = "<|im_end|>" if self.real else "</s>"
-        self.command, self.env = command, dict(os.environ, CUDA_VISIBLE_DEVICES="-1", **(env or {}))
+        # A value of None leaves the variable out, whatever the caller's environment holds.
+        merged = dict(os.environ, CUDA_VISIBLE_DEVICES="-1", **(env or {}))
+        self.command, self.env = command, {k: v for k, v in merged.items() if v is not None}
 
     def start(self, stack):
         wait_ready(spawn(stack, self.command, self.log, self.env), self.port, http=True)
@@ -396,21 +399,23 @@ def run(build, output, model):
     output.mkdir(parents=True, exist_ok=True)
     report = []
     with ExitStack() as stack:
-        cases(Server(build, output, model, "on").start(stack), True, report)
+        cases(Server(build, output, model, "on", {"LLAMA_REPLY_AS_GENERATED": "1"}).start(stack), True, report)
     report.append("OFF")
-    for value in ("0", "false", "OFF", "no"):
+    for value in (None, "0", "OFF", "maybe"):
         with ExitStack() as stack:
-            cases(Server(build, output, model, "off-" + value, {"LLAMA_REPLY_AS_GENERATED": value}).start(stack), False, report)
-    report.append("ON with LLAMA_REPLY_AS_GENERATED=yes")
+            name = "off-" + (value or "unset")
+            cases(Server(build, output, model, name, {"LLAMA_REPLY_AS_GENERATED": value}).start(stack), False, report)
+    report.append("ON with LLAMA_REPLY_AS_GENERATED=Yes")
     with ExitStack() as stack:
-        server = Server(build, output, model, "on-yes", {"LLAMA_REPLY_AS_GENERATED": "yes"}).start(stack)
+        server = Server(build, output, model, "on-yes", {"LLAMA_REPLY_AS_GENERATED": "Yes"}).start(stack)
         case = Case(server, "yes")
         kept, read, held = case.run(case.split())
-        assert kept == held, f"LLAMA_REPLY_AS_GENERATED=yes: kept {kept} of {held}"
+        assert kept == held, f"LLAMA_REPLY_AS_GENERATED=Yes: kept {kept} of {held}"
         report.append(f"split {kept}/{held}")
     report.append("LAST CHECK REFUSES")
     with ExitStack() as stack:
-        server = Server(build, output, model, "reject", {"LLAMA_REPLY_AS_GENERATED_TEST_REJECT": "1"}).start(stack)
+        server = Server(build, output, model, "reject", {"LLAMA_REPLY_AS_GENERATED": "1",
+                                                         "LLAMA_REPLY_AS_GENERATED_TEST_REJECT": "1"}).start(stack)
         case = Case(server, "reject")
         kept, read, held = case.run(case.split())
         assert kept < held, f"the check refused and {kept} of {held} were kept all the same"

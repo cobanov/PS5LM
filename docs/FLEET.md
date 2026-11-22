@@ -643,9 +643,12 @@ Nothing changes in the API. For a client:
   switched off, the off switch) stops matching at the first kept reply and
   reads on from the checkpoint or the parked save before it.
 
-`LLAMA_REPLY_AS_GENERATED` in the server's environment turns it off when it is
-`0`, `false`, `off` or `no` (in any case); any other value, or none, leaves it
-on. The log line is `previous reply kept as generated: the prompt differs at
+It is off unless `LLAMA_REPLY_AS_GENERATED` in the server's environment is `1`,
+`true`, `on` or `yes` (in any case), because it changes how every PS5LM server
+matches a request against its slot, the app's own included. The fleet
+controller sets it to `1` for the llama-server it starts; set it yourself for
+one you start by hand, or set it to `0` before starting the controller to
+compare. The log line is `previous reply kept as generated: the prompt differs at
 N, ...`; `previous reply not kept: ...` is a warning that the patch's own last
 check refused a prompt it had built, and the request was served without it.
 
