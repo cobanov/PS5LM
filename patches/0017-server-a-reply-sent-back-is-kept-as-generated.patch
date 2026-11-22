@@ -56,7 +56,7 @@ before, on a prompt that now shares that much more with the slot.
   alora, or a slot or prompt with media.
 - prompt_tokens in the usage then counts the kept tokens, a token or two away
   from what tokenising the rendered prompt gives.
-- LLAMA_REPLY_AS_GENERATED=0, false, off or no turns it off.
+- Off unless LLAMA_REPLY_AS_GENERATED is 1, true, on or yes; the fleet controller sets it for its hosts.
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
@@ -333,13 +333,13 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 +    return ua == ub && !test_reject;
 +}
 +
-+// LLAMA_REPLY_AS_GENERATED=0, false, off or no turns it off (to compare); anything else, or nothing, leaves it on
++// on only when LLAMA_REPLY_AS_GENERATED is 1, true, on or yes (the fleet controller sets it for its hosts); off otherwise
 +static bool reply_as_generated_enabled() {
 +    static const bool enabled = [] {
 +        const char * e = getenv("LLAMA_REPLY_AS_GENERATED");
 +        std::string v = e != nullptr ? e : "";
 +        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-+        return !(v == "0" || v == "false" || v == "off" || v == "no");
++        return v == "1" || v == "true" || v == "on" || v == "yes";
 +    }();
 +    return enabled;
 +}
