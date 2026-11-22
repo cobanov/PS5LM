@@ -591,6 +591,64 @@ at a time:
   and it was still slower.
 - `-ub` 256 to 1024 are within 2% of each other.
 
+### A reply sent back
+
+A chat client sends each reply back as a message with its next request. The
+server writes that message out through the chat template and tokenises it
+again, and compares the result with the tokens the slot holds. They are not
+always the same tokens although the client changed nothing:
+
+- The model spells text with whatever tokens it likes (` book` `marks`); the
+  tokeniser has one spelling (` bookmarks`).
+- The whitespace around the end of the reasoning is the template's, not the
+  model's. The template trims the reasoning and writes its own separator
+  before the end-of-reasoning marker, and after it: the server hands the
+  content over without its leading whitespace. A reasoning budget that ends
+  the thinking in the middle of a line leaves other whitespace in the slot,
+  before the marker (after a space or a blank line) or after it (the model
+  goes on with its line).
+
+A hybrid model's recurrent state cannot step back, so the slot used to return
+to its checkpoint and read the whole reply again: 10 of 227 follow-up turns of
+Qwen3.8-27B, 84 to 10,508 tokens each, 16 s at 30K tokens of depth and 48 s at
+150K for a reply of ordinary length. After a restore from a parked save it read
+the whole last firing, and the next save rewrote the key from there.
+
+`patches/0017` keeps the reply as it was generated: where the slot's tokens and
+the prompt stop matching, it compares the two as text, marker tokens by id,
+and when they say the same the prompt continues from the slot's tokens.
+Whitespace is text like any other, except in one place: right before, and
+right after, the marker that closes the thinking block the template opened in
+an assistant turn. A `</think>` anywhere else (one the model wrote into its
+answer, one in a user or a tool message) is compared with its whitespace.
+Nothing changes in the API. For a client:
+
+- After a kept reply the model continues from the tokens it wrote, not from a
+  re-tokenised copy, so the next reply can differ from what an unpatched
+  server gives after reading the reply again.
+- `prompt_tokens` counts the kept tokens: a token or two away from tokenising
+  the rendered prompt (`/apply-template` then `/tokenize`), for the rest of
+  the conversation.
+- A parked key stays in append mode after such a turn, and its token list is
+  the slot's, not the rendered one.
+- A message that was really changed is read again from the change, as before.
+- The slot's tokens are kept as far as they say the same as the prompt, which
+  need not be the end of either. A reply cut off by `max_tokens` (the slot
+  holds it less its last token), a reply that was cancelled, or a later
+  message that was changed, is read again from where it differs, not from
+  the kept reply.
+
+- Keep a conversation's reasoning settings the same from turn to turn. A
+  request the comparison does not run for (`cache_prompt` false, thinking
+  switched off, the off switch) stops matching at the first kept reply and
+  reads on from the checkpoint or the parked save before it.
+
+`LLAMA_REPLY_AS_GENERATED` in the server's environment turns it off when it is
+`0`, `false`, `off` or `no` (in any case); any other value, or none, leaves it
+on. The log line is `previous reply kept as generated: the prompt differs at
+N, ...`; `previous reply not kept: ...` is a warning that the patch's own last
+check refused a prompt it had built, and the request was served without it.
+
 ## Control server
 
 ```sh
@@ -837,6 +895,20 @@ and the worker's memory. With `PS5LM_PARK_TEST_MODEL` set to a GGUF it runs a
 second time with that model: Qwen3.5-0.8B has the attention cells plus
 recurrent state of the models the consoles serve, which the untrained fixture
 (attention only) has not.
+
+`tests/server_reply_as_generated_test.py` gives a slot a reply token by token
+and sends it back as a chat message. Kept: split into other tokens, other
+whitespace before and after the marker that closes the thinking, with a tool
+call, sent back by a streaming request, with two more turns on top, a later
+reply that was cut off; and what the model writes after a kept reply is what
+it writes from the same tokens read afresh. Read again: whitespace at a
+second marker in the content, two spaces for one in the content and in a tool
+argument, the marker's characters as plain text, a later reply that comes
+back changed or was cancelled, three real edits, a prompt that would not fit
+the context, the patch's last check refusing, and the off switch's four
+spellings. It uses an untrained recurrent fixture with one token per letter,
+and the named model as well when `PS5LM_PARK_TEST_MODEL` is set. The park
+test's `kept` case does the same through a parked save and restore.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
 on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only
