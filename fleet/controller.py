@@ -30,6 +30,9 @@ def child_environment():
     env = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_ARG_')}
     env['GGML_RPC_NO_RDMA'] = '1'
     env['GGML_RPC_NO_COMM'] = '1'
+    # patches/0017 is off by default, as it changes how every PS5LM server matches a
+    # request against its slot; a fleet host keeps replies as generated unless told not to.
+    env.setdefault('LLAMA_REPLY_AS_GENERATED', '1')
     return env
 
 

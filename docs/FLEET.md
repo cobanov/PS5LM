@@ -325,6 +325,180 @@ Q4_K_M (5.4 GiB; 4.2 GiB of it in tensors the cache keeps) from a PC's CPU:
 
 Every load gave the same answer at temperature 0.
 
+### Parked state
+
+A host that serves many conversations on one slot (a swarm of agents taking
+turns) has to put the state of the one leaving somewhere. llama-server's own
+answers keep it on the host: the prompt cache in memory, or a slot file. For
+Qwen3.8-27B at 153K tokens that is 2.8 GiB per conversation, fetched over the
+network at about 94 MiB/s and sent back the same way: 50 s out and 65 s back,
+and a 12 GB host holds two.
+
+With device parking the state stays on the console. The worker keeps it in
+files in `/data/PS5LM/park`, the host keeps the token list and a manifest, a few
+MB per conversation, and a save writes only what was added since the last one.
+
+On the console: `PS5LM_PARK_GB=N` in env.txt (whole GiB, 1 to 4096; 128 when
+not set, 0 turns it off; PS5LM after v0.11.0). The worker tells hosts in its
+handshake that it takes park commands, so an older host or an older worker
+serves as before.
+
+On the host: `--slot-park-path DIR` (a folder for the bookkeeping, not in
+`/tmp`) and `--cache-ram 0`: the automatic prompt cache would still fetch the
+state of every conversation that loses the slot. The client parks and resumes
+by name:
+
+| Request | Does |
+|---|---|
+| `POST /slots/0?action=save` `{"filename": "n17"}` | Parks the slot under the key `n17` |
+| `POST /slots/0?action=restore` `{"filename": "n17"}` | Puts that state back in the slot |
+| `POST /slots/0?action=park-list` | The keys, their sizes and state, the room left |
+| `POST /slots/0?action=park-delete` `{"filename": "n17"}` | Drops a key, on the console and on the host |
+| `POST /slots/0?action=park-status` | Free space, bytes parked, the cap |
+
+A key is 1 to 64 letters, digits, `.`, `_` or `-`. With `--slot-save-path` also
+set, `"device": false` in the body makes the same two actions use a host file
+as before.
+
+A save or a restore is never refused because the slot is busy, and never runs
+beside a request: it waits for the slot, and the server does one thing on a
+slot at a time.
+
+- Sent while a request generates, a save parks what that request leaves when
+  it ends, and a restore replaces it then. The request itself is not disturbed.
+- Saves, restores and requests that name the slot (`"id_slot": 0`, as the
+  swarm's do) run in the order they were sent. A request that names no slot is
+  taken up after the park actions that wait, whenever it came.
+- Two saves of one key at once: the first parks, the second answers
+  `"mode": "unchanged"`. A save and a restore of one key at once run one after
+  the other in the order sent; either way the key is whole.
+- A client that gives up on a save or a restore that is still waiting cannot
+  count on it being dropped: the server notices a closed connection about
+  once a second and drops the action then, but one whose turn comes first is
+  run all the same, and once started it runs to its end. After giving up on a
+  restore, look at the slot (`GET /slots`) or send the restore again.
+- `park-list`, `park-delete` and `park-status` do not wait for the slot; they
+  run between the batches of a request in progress.
+
+A save answers with what it wrote (Qwen3.5-0.8B on a CPU worker, the fourth
+firing of a conversation):
+
+```json
+{"id_slot": 0, "filename": "n17", "device": true, "mode": "append",
+ "n_saved": 10063, "n_appended": 2516,
+ "n_written": 28897228, "n_written_kv": 8695296, "n_written_state": 20201932, "n_written_checkpoint": 0,
+ "n_parked_bytes": 75181592, "n_segments": 4,
+ "checkpoint_n_tokens": 7547, "checkpoint_kind": "previous_save",
+ "pruned": [], "timings": {"save_ms": 104.2}}
+```
+
+- `mode` is `new` (the key's first save, or one that could not be added to:
+  `reason` says why), `append`, `rewrite` or `unchanged`.
+- **Append only.** The attention cells of the tokens added since the key's last
+  save go to a new file (18 KiB a token for Qwen3.8-27B with a q4_0 cache). The
+  recurrent state has a fixed size (150 MiB for that model) and is written
+  whole each time: that is the fixed cost of a save.
+- **A changed history is never resumed as it was.** The host compares the
+  slot's tokens with the parked ones. If they differ before the parked end (the
+  client compacted or edited the history), the save keeps the files that end
+  before the difference and writes the rest again: `"mode": "rewrite"`,
+  `"rewritten_from": N`.
+- **Going back.** A recurrent state cannot be rewound, so a request that
+  returns and differs from the parked tokens before their end needs an earlier
+  state. That is the recurrent state of the save before, which stays on the
+  console (`"checkpoint_kind": "previous_save"`): such a request reads again
+  what the last save added. A client whose requests usually stop short of the
+  parked end (it does not send the last reply back as it was written) sends
+  `"checkpoint": true` with the save: the slot's own checkpoint, 4 tokens before
+  the end of its last prompt, is parked too, and the return reads a handful of
+  tokens, at the price of a second 150 MiB block per save. A key's first save
+  always does this.
+- `pruned` names the keys the console dropped to make room for this save.
+
+A restore answers `{"n_restored": tokens, "n_read": bytes, "n_segments": files,
+"checkpoint_n_tokens": ..., "timings": {"restore_ms": ...}}`. When it fails, the
+slot is left empty, never half restored, and the body's `error.park_error` says
+why:
+
+| Status | `park_error` | Means |
+|---|---|---|
+| 404 | (llama-server's own "File Not Found" body) | No such key |
+| 410 | `park_pruned` | The console dropped the key to make room, or its storage was cleared. The history has to be read again |
+| 409 | `park_torn` | The files and the bookkeeping do not agree (a size or a checksum). Delete the key |
+| 409 | `park_incompatible` | Parked by another model, or it does not fit this context |
+| 507 | `park_no_space` | (save) Over the cap or the disk is full, with nothing left to drop |
+| 501 | `park_unsupported` | The worker has no parking (older, or `PS5LM_PARK_GB=0`), there is more than one worker, or the model has a draft model or media in the slot |
+| 400 | `park_empty`, `park_bad_request` | Nothing in the slot; a bad key |
+| 500 | `park_io` | Anything else, with the worker's message |
+
+How it holds together:
+
+- A key is a folder on the console. Every file in it is written once, in order,
+  under a temporary name, and renamed when whole: `NNNNNN.kv` (the cells one
+  save added), `NNNNNN.rs` (the recurrent state at the end of that save; the
+  newest two are kept), `NNNNNN.ck` (a parked checkpoint). The host's manifest
+  names the files that make up the state, with their sizes and checksums, and is
+  replaced only after the console has the new files whole. A save that dies
+  half way (the worker killed in it) leaves the previous state loadable; what it
+  left behind is removed by the next save.
+- The worker moves the data between the GPU and the file through one 8 MiB
+  buffer, whatever the size of the state. The files are written through ftpsrv,
+  as the weight cache's are, and read in 8 MiB reads. Without an ftpsrv a save
+  is refused (`park_io`): it is never written the slow way.
+- The worker keeps the folder to N GiB: before a save it drops whole keys, the
+  one used longest ago first, never one with a file open and never the one
+  restored last. It keeps the order of use itself (`/data/PS5LM/park/.used`,
+  rewritten at every save and restore), because the console's file times move
+  when a key is saved but not when it is read. 128 GiB holds forty
+  conversations at a full 155K window (3.1 GiB each) or a hundred at about 60K.
+  There is no free-space floor on a console: a title's free-space call answers
+  a fixed 16 GiB, so only N bounds the folder.
+- On the host a key is `manifest.json`, `tokens.NNNNNN.bin` (4 bytes a token)
+  and `meta.NNNNNN.bin` (24 bytes a token): 4.3 MB at 153K tokens. They survive
+  a server restart and a reboot; a parked key is resumed by a new server process
+  as by the old one. A save that adds appends to the two files past what the
+  manifest covers; a save that rewrites starts a new pair and drops the old one
+  after the manifest is replaced. So if the server or the PC dies in a save,
+  append or rewrite, the key is as its last finished save left it.
+- One worker only: with several, a slot's state is spread over them, and
+  parking is refused.
+
+Measured on 2026-11-15 on one PS5 on 11.60 serving Qwen3.8-27B (GSQ-RCO
+IQ3_XXS, every layer on the console, one slot of 155,648 tokens, q4_0 cache)
+from a PC over gigabit Ethernet. Neurons of real source code, each firing 200
+new tokens and a 16-token reply; times are the server's own for the whole
+action:
+
+| | 20K tokens | 100K | 153K |
+|---|---|---|---|
+| First save | 651 MiB, 10.4 s | 2,057 MiB, 30.6 s | |
+| Save after growing to this size | | 1,552 MiB for 79,784 new tokens, 22.1 s | 1,059 MiB for 51,704 new tokens, 15.0 s |
+| Save after a firing (216 new tokens) | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s | 153.4 MiB, 2.2 s |
+| Restore | 2.2 s | 3.6 s | 4.6 s |
+| The same return through the host prompt cache | 14 s | 46 s | 65 s |
+
+- A save writes 149.6 MiB (the recurrent state) plus 18.0 KiB per new token,
+  at 72 to 74 MB/s; with `"checkpoint": true` 303 MiB in 5.7 s. A first save
+  includes the checkpoint.
+- Four neurons at 100K took turns on the slot, twelve hand-overs: each reply
+  was the one the same neuron gave without leaving the slot, 201 tokens were
+  read for the 200 new ones, and a hand-over (restore, firing, save) took about
+  18 s. The host's llama-server stayed at 1.1 GiB.
+- A request that differed from the parked tokens 3 tokens before their end
+  read 414 tokens after a default save (217 with the neuron still in the slot,
+  and 217 after a save with `"checkpoint": true`), at 101K and at 153K alike.
+- The console's free memory did not move during saves and restores (never
+  under 71.7 MiB in 306 samples), and the keys were restored by a new server
+  process and a restarted worker with the same replies.
+- At 5 hand-overs an hour that is 18 GiB written to the console's SSD a day,
+  at 48 an hour 173 GiB, for firings this small; a firing that adds 3,000
+  tokens writes 202 MiB (24 and 228 GiB a day).
+
+`scripts/ps5lm-app.sh bench-park [GiB]` measures the write path first: that
+many GiB (4) in 8 MiB pieces through ftpsrv to the data folder and to
+`/mnt/usb0` and `/mnt/ext0` when they are there, with the speed of every GiB,
+then the file read back and checked. It works beside a running worker.
+
 **Restart the worker title between different model runs and after errors.**
 PS5LM documents retained Vulkan memory after in-process unload; this increment
 does not promise safe hot reload. Stop through the normal title-close / existing
@@ -421,6 +595,111 @@ at a time:
 - MTP doesn't help this load. The drafts were accepted about 90% of the time,
   and it was still slower.
 - `-ub` 256 to 1024 are within 2% of each other.
+
+### A reply sent back
+
+A chat client sends each reply back as a message with its next request. The
+server writes that message out through the chat template and tokenises it
+again, and compares the result with the tokens the slot holds. They are not
+always the same tokens although the client changed nothing:
+
+- The model spells text with whatever tokens it likes (` book` `marks`); the
+  tokeniser has one spelling (` bookmarks`).
+- The whitespace around the end of the reasoning is the template's, not the
+  model's. The template trims the reasoning and writes its own separator
+  before the end-of-reasoning marker, and after it: the server hands the
+  content over without its leading whitespace. A reasoning budget that ends
+  the thinking in the middle of a line leaves other whitespace in the slot,
+  before the marker (after a space or a blank line) or after it (the model
+  goes on with its line).
+
+A hybrid model's recurrent state cannot step back, so the slot used to return
+to its checkpoint and read the whole reply again: 10 of 227 follow-up turns of
+Qwen3.8-27B, 84 to 10,508 tokens each, 16 s at 30K tokens of depth and 48 s at
+150K for a reply of ordinary length. After a restore from a parked save it read
+the whole last firing, and the next save rewrote the key from there.
+
+`patches/0017` keeps the reply as it was generated: where the slot's tokens and
+the prompt stop matching, it compares the two as text, marker tokens by id,
+and when they say the same the prompt continues from the slot's tokens.
+Whitespace is text like any other, except in one place: right before, and
+right after, the marker that closes the thinking block the template opened in
+an assistant turn. A `</think>` anywhere else (one the model wrote into its
+answer, one in a user or a tool message) is compared with its whitespace.
+Nothing changes in the API. For a client:
+
+- After a kept reply the model continues from the tokens it wrote, not from a
+  re-tokenised copy, so the next reply can differ from what an unpatched
+  server gives after reading the reply again.
+- `prompt_tokens` counts the kept tokens: a token or two away from tokenising
+  the rendered prompt (`/apply-template` then `/tokenize`), for the rest of
+  the conversation.
+- A parked key stays in append mode after such a turn, and its token list is
+  the slot's, not the rendered one.
+- A message that was really changed is read again from the change, as before.
+- The slot's tokens are kept as far as they say the same as the prompt, which
+  need not be the end of either. A reply cut off by `max_tokens` (the slot
+  holds it less its last token), a reply that was cancelled, or a later
+  message that was changed, is read again from where it differs, not from
+  the kept reply.
+
+- Keep a conversation's reasoning settings the same from turn to turn. A
+  request the comparison does not run for (`cache_prompt` false, thinking
+  switched off, the off switch) stops matching at the first kept reply and
+  reads on from the checkpoint or the parked save before it.
+
+It is off unless `LLAMA_REPLY_AS_GENERATED` in the server's environment is `1`,
+`true`, `on` or `yes` (in any case), because it changes how every PS5LM server
+matches a request against its slot, the app's own included. The fleet
+controller sets it to `1` for the llama-server it starts; set it yourself for
+one you start by hand, or set it to `0` before starting the controller to
+compare. The log line is `previous reply kept as generated: the prompt differs at
+N, ...`; `previous reply not kept: ...` is a warning that the patch's own last
+check refused a prompt it had built, and the request was served without it.
+
+### Sampling on the worker
+
+`--backend-sampling` on the host puts the sampler chain on the worker, so the
+scores of the whole vocabulary are not sent to the host for every token
+(970 KiB for Qwen3.8-27B's 248K tokens). A reasoning budget and a grammar run
+on the host, and a request with either used to be sampled on the host
+altogether: the log said `backend sampling is not compatible with reasoning
+budget, disabling`, and every token of every stream fetched the vocabulary. A
+chat request with `thinking_budget_tokens` or with `tools` is such a request.
+
+`patches/0018` leaves the worker the top-k for those requests. The worker
+returns the best `top_k + 1` candidates (168 bytes for `top_k` 20); the host
+runs the request's own chain on them, then the budget's count and the grammar's
+check. That is the token host sampling gives, with the same seed, whenever the
+candidates' scores all differ. The host fetches the whole vocabulary for:
+
+- a token the reasoning budget forces (the end of thinking, when the budget is
+  reached: one or two tokens of a reply),
+- a token the grammar rejects, which is chosen again among the allowed tokens,
+- two equal scores among the candidates.
+
+Those steps are sampled as before, on the full scores. The slot's timings say
+how often each happened:
+
+```
+backend sampling with host checks: 290 tokens from the backend's top-k, 2 from the full logits (2 forced by the reasoning budget, 0 for the grammar, 0 equal logits, 0 other)
+```
+
+It applies when the first sampler in the chain that does anything is a top-k
+of at most 1024: no `logit_bias`, repetition penalty or DRY before it, no
+mirostat, no `n_probs`, no speculative decoding. A request outside that is
+sampled on the host as before and the log says why (`backend sampling with
+host checks is not possible: ...`, then the old line). Requests with neither a
+budget nor a grammar keep the whole chain on the worker, as before.
+`LLAMA_BACKEND_SAMPLING_CHECKS=0` in the server's environment turns it off.
+Only the host changes; a worker needs no new build.
+
+`LLAMA_BACKEND_SAMPLING_CHECKS=verify` is for testing a host build on a
+worker: every token chosen from the candidates is chosen again on the whole
+vocabulary's scores of the same pass, with a copy of the chain, and the
+timings add `... N of those tokens chosen again on the full logits, M
+differed`. M must be 0. It fetches the vocabulary for every token, so it is as
+slow as sampling on the host.
 
 ## Control server
 
@@ -660,6 +939,37 @@ serve` CLI. It checks token IDs, assigned layers and per-worker computation.
 This proves a real distributed execution path on host CPUs, not useful language
 quality, PS5 GPU operation, large-model scaling or network speed. Tests use
 loopback only and clean up their child processes.
+
+`tests/fleet_rpc_park_test.py` covers parked state the same way (a CPU worker
+with a park folder): a swap, five appending firings, several keys, restarts, a
+worker killed in a save, a changed history, the cap, a worker without parking,
+and the worker's memory. With `PS5LM_PARK_TEST_MODEL` set to a GGUF it runs a
+second time with that model: Qwen3.5-0.8B has the attention cells plus
+recurrent state of the models the consoles serve, which the untrained fixture
+(attention only) has not.
+
+`tests/server_reply_as_generated_test.py` gives a slot a reply token by token
+and sends it back as a chat message. Kept: split into other tokens, other
+whitespace before and after the marker that closes the thinking, with a tool
+call, sent back by a streaming request, with two more turns on top, a later
+reply that was cut off; and what the model writes after a kept reply is what
+it writes from the same tokens read afresh. Read again: whitespace at a
+second marker in the content, two spaces for one in the content and in a tool
+argument, the marker's characters as plain text, a later reply that comes
+back changed or was cancelled, three real edits, a prompt that would not fit
+the context, the patch's last check refusing, and the off switch's four
+spellings. It uses an untrained recurrent fixture with one token per letter,
+and the named model as well when `PS5LM_PARK_TEST_MODEL` is set. The park
+test's `kept` case does the same through a parked save and restore.
+
+`tests/server_backend_sampling_test.py` sends the same requests to two servers
+of the build, one with `LLAMA_BACKEND_SAMPLING_CHECKS=0`, each on its own CPU
+worker, and compares token ids: reasoning budgets that are hit, grammars
+sampled hot enough to reject tokens, a lazy grammar beside a budget, greedy
+and seeded, two slots at once, and requests the patch leaves alone. It checks
+that the budget ends the reasoning at the same token and what each server
+logged, and a third server in `verify` mode must report no token that differs. With `PS5LM_PARK_TEST_MODEL` it also compares chat replies with a
+budget and a tool, streamed and not.
 
 `.github/workflows/fleet-host.yml` runs these checks on pull requests and pushes
 on `main` or `fleet/**`, using ordinary Ubuntu hosted runners, read-only

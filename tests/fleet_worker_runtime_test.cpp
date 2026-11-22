@@ -126,6 +126,24 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // Parked state: on at the default size unless set, 0 is off, refused values say so;
+    // the worker hands the folder and the size to the RPC server, or takes them away.
+    check(rpc_park_config(nullptr, "/p").dir == "/p" && rpc_park_config(nullptr, "/p").gib == kRpcParkDefaultGib, "parking on by default");
+    check(rpc_park_config("0", "/p").dir.empty() && rpc_park_config("0", "/p").error.empty(), "parking 0 is off");
+    check(rpc_park_config("300", "/p").dir == "/p" && rpc_park_config("300", "/p").gib == 300, "parking 300 GiB");
+    for (const char * bad : { "", "-1", "032", "4097", "12G", "1.5", "99999" }) {
+        const RpcPark refused = rpc_park_config(bad, "/p");
+        check(refused.dir.empty() && !refused.error.empty(), "bad parking size refused");
+    }
+    setenv("GGML_RPC_PARK_DIR", "/from-env-txt", 1);
+    run_fleet_worker(valid);
+    check(std::getenv("GGML_RPC_PARK_DIR") == nullptr, "no parking: the server gets no folder, whatever env.txt says");
+    run_fleet_worker(valid, {}, rpc_park_config("64", "/p"));
+    check(std::string(std::getenv("GGML_RPC_PARK_DIR")) == "/p" && std::string(std::getenv("GGML_RPC_PARK_GB")) == "64",
+          "the server gets the park folder and its size");
+    unsetenv("GGML_RPC_PARK_DIR");
+    unsetenv("GGML_RPC_PARK_GB");
+
     char path[] = "/tmp/ps5lm-fleet-config-XXXXXX";
     int fd = mkstemp(path);
     check(fd >= 0, "temporary config file");

@@ -61,6 +61,23 @@ fetch_pinned https://github.com/mihawk-99/PS5_PayloadSDK.git "$sdk_fork" "$sdk_r
 
 # Upstream scripts verify the v0.42 SDK release and zlib archive SHA-256s.
 # These are public homebrew sources/tools, not proprietary firmware dumps.
+# zlib.net sometimes answers the pinned archive with something else, which fails
+# that check. The setup skips its download when the archive is already there with
+# the right hash, so take it from zlib's GitHub release first; on any failure the
+# setup downloads it from zlib.net as before.
+zlib_archive="$vk/.deps/native/zlib/zlib-1.3.2.tar.gz"
+zlib_sha=bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+if [[ ! -f "$zlib_archive" ]]; then
+    mkdir -p "$(dirname "$zlib_archive")"
+    if wget -q --tries=3 -O "$zlib_archive.download" \
+            https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz &&
+        printf '%s  %s\n' "$zlib_sha" "$zlib_archive.download" | sha256sum --check --strict --quiet; then
+        mv "$zlib_archive.download" "$zlib_archive"
+    else
+        rm -f "$zlib_archive.download"
+        echo "native-check: zlib from GitHub failed; the setup downloads it from zlib.net" >&2
+    fi
+fi
 export PS5_PAYLOAD_SDK_FORK="$sdk_fork"
 timeout 300 bash "$vk/tools/setup-native-dependencies.sh"
 export PS5_VULKAN_ROOT="$vk"
