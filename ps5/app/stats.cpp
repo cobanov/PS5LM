@@ -34,8 +34,9 @@ namespace ps5lm {
 
 namespace {
 
-constexpr size_t kHistory = 120;  // seconds of history in the charts
-constexpr double kGiB     = 1073741824.0;
+constexpr size_t kHistory           = 120;         // seconds of history in the charts
+constexpr double kGiB               = 1073741824.0;
+constexpr int    kLlamaPollTimeoutS = 8;           // survives multi-second prefill, vision encode, or state I/O in llama-server
 
 void push(std::vector<float> & v, float x) {
     v.push_back(x);
@@ -134,9 +135,13 @@ std::string http_post(int port, const char * path, const std::string & body, int
     if (fd < 0) {
         return {};
     }
-    timeval tv = { timeout_s, 0 };
+    timeval tv = { std::max(timeout_s, 1), 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#ifdef SO_NOSIGPIPE
+    const int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
     sockaddr_in addr = {};
 #ifdef __FreeBSD__
     addr.sin_len = sizeof(addr);
@@ -151,9 +156,22 @@ std::string http_post(int port, const char * path, const std::string & body, int
             req += "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
         }
         req += "\r\n" + body;
-        send(fd, req.data(), req.size(), 0);
+        int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+        send_flags = MSG_NOSIGNAL;
+#endif
+        size_t sent_total = 0;
+        bool   send_ok    = true;
+        while (sent_total < req.size()) {
+            const ssize_t n = send(fd, req.data() + sent_total, req.size() - sent_total, send_flags);
+            if (n <= 0) {
+                send_ok = false;
+                break;
+            }
+            sent_total += (size_t) n;
+        }
         char buf[4096];
-        for (ssize_t got; (got = recv(fd, buf, sizeof(buf), 0)) > 0;) {
+        for (ssize_t got; send_ok && (got = recv(fd, buf, sizeof(buf), 0)) > 0;) {
             out.append(buf, (size_t) got);
             if (out.size() > (1u << 20)) {
                 break;
@@ -340,14 +358,14 @@ void StatsCollector::run() {
     double last_busy = 0, last_tokens = 0, last_gen_s = 0;
     bool   have_last = false, last_working = false;
     double last_ptok = 0, last_psec = 0, last_decoded = 0;
+    double last_exporter_try = start - 60.0;
     // The hour charts' sums since their last point: temperature, power, GPU, CPU.
     double hour_sum[4] = {};
     int    hour_n[4] = {}, seconds = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        const double wall = now_s(), cpu = cpu_seconds();
 
-        const std::string m = http_get(port_, "/metrics");
+        const std::string m = http_get(port_, "/metrics", kLlamaPollTimeoutS);
         // Only real metrics: while the model loads the server already answers,
         // with 503 "Loading model", and that is not ready.
         const bool        up = m.find("llamacpp:") != std::string::npos;
@@ -357,7 +375,7 @@ void StatsCollector::run() {
         const bool   working = metric(m, "requests_processing") > 0;
         std::string  slots;
         if (up) {
-            slots = http_get(port_, "/slots");
+            slots = http_get(port_, "/slots", kLlamaPollTimeoutS);
         }
 
         double pool = 0, free = 0, heap = 0;
@@ -410,7 +428,9 @@ void StatsCollector::run() {
             p = http_get(9100, "/metrics");
             // Not running: hand the bundled copy to elfldr, at start and then
             // once a minute (elfldr may come later).
-            if (p.empty() && (long) (wall - start) % 60 == 1) {
+            const double try_now = now_s();
+            if (p.empty() && try_now - last_exporter_try >= 60.0) {
+                last_exporter_try = try_now;
                 const bool sent = send_payload(sandbox_path("/app0/payloads/ps5-exporter.elf").c_str(), 9021);
                 ps5lm::log_line("ps5-exporter not running; %s\n",
                                 sent ? "sent the bundled copy to elfldr" : "no elfldr on 9021 to load it");
@@ -434,6 +454,7 @@ void StatsCollector::run() {
             }
         }
         std::vector<Drive> drives = drives_from_metrics(p);
+        const double wall = now_s(), cpu = cpu_seconds();
 
         std::lock_guard<std::mutex> lock(mutex_);
         const double dt = wall - last_wall;
@@ -487,15 +508,18 @@ void StatsCollector::run() {
                 const double dgen = gen_s - last_gen_s;
                 live_.gen_tps = dgen > 0.05 ? (float) ((tokens - last_tokens) / dgen) : 0.0f;
             }
-            live_.ctx_used = (uint32_t) (json_int(slots, "n_prompt_tokens") + json_int(slots, "n_decoded"));
-            // The server's counters move only when a request ends, so during a
-            // long reply the speed comes from the slot's decoded count.
-            const double decoded = (double) json_int(slots, "n_decoded");
-            if (working && have_last && decoded > last_decoded && dt > 0) {
-                live_.gen_tps  = (float) ((decoded - last_decoded) / dt);
-                live_.gpu_busy = 1.0f;  // ponytail: a decoding slot keeps the GPU busy; no finer reading mid-request
+            // /slots n_prompt_tokens is prompt.tokens.size(), which already includes generated tokens.
+            if (!slots.empty()) {
+                live_.ctx_used = (uint32_t) json_int(slots, "n_prompt_tokens");
+                // The server's counters move only when a request ends, so during a
+                // long reply the speed comes from the slot's decoded count.
+                const double decoded = (double) json_int(slots, "n_decoded");
+                if (working && have_last && decoded > last_decoded && dt > 0) {
+                    live_.gen_tps  = (float) ((decoded - last_decoded) / dt);
+                    live_.gpu_busy = 1.0f;  // ponytail: a decoding slot keeps the GPU busy; no finer reading mid-request
+                }
+                last_decoded = working ? decoded : 0;
             }
-            last_decoded = working ? decoded : 0;
             have_last   = true;
             last_busy   = busy_s;
             last_tokens = tokens;
