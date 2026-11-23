@@ -5,6 +5,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "stats.hpp"
+#include "heap_info.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -224,6 +225,7 @@ extern "C" {
 void ps5lm_activity_begin(int id, const char * method, const char * path, const char * remote, const char * body,
                           size_t body_len) {
     (void) method;
+    ps5lm::heap_request_begun();  // counted before any early return
     if (!g_sink) {
         return;
     }
@@ -284,6 +286,9 @@ void ps5lm_activity_data(int id, const char * data, size_t len) {
 }
 
 void ps5lm_activity_end(int id, int status) {
+    // The main loop trims the heap 0.25 s after this, once the request's
+    // response and the slot's buffers are freed (heap_info.hpp).
+    ps5lm::heap_request_ended();
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_partial.erase(id);

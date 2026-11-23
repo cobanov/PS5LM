@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:50:02 -0400
+Subject: [PATCH 2/4] Block contended heap waits and expose shared memory
+ availability
+
+Use pthread locks for dlmalloc and sleeping waits for arena initialization, preventing real-time waiters from starving a preempted owner. Query total free and largest contiguous direct memory without allocating.
+
+Verified: make -C platform test (318 checks plus directory and fragmented-memory tests), PS5 cross-build. Loopback tests require network access.
+
+Backported to b83202be for PS5LM from mihawk-99/PS5_PayloadSDK commit 3752be7e7812713e01fbe998d92952cd7b559f7f. Heap part only: src/dlmalloc/mspace.c and src/heap.c. Its memory.h, memory.c and test are not taken.
+---
+ platform/src/dlmalloc/mspace.c | 2 ++
+ platform/src/heap.c            | 9 +++++++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/platform/src/dlmalloc/mspace.c b/platform/src/dlmalloc/mspace.c
+index 33599d6..5692d26 100644
+--- a/platform/src/dlmalloc/mspace.c
++++ b/platform/src/dlmalloc/mspace.c
+@@ -15,6 +15,8 @@ int ps5p_heap_unmap(void *address, size_t bytes);
+ 
+ #define ONLY_MSPACES 1
+ #define USE_LOCKS 1
++/* Block behind an arena owner instead of starving it at real-time priority. */
++#define USE_SPIN_LOCKS 0
+ /* Each block records its mspace, so a free or realloc from any thread goes to
+  * the arena the block came from (src/heap.c). */
+ #define FOOTERS 1
+diff --git a/platform/src/heap.c b/platform/src/heap.c
+index 56a3c5e..3a95d30 100644
+--- a/platform/src/heap.c
++++ b/platform/src/heap.c
+@@ -31,6 +31,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/types.h>
++#include <time.h>
+ 
+ /* src/dlmalloc/mspace.c */
+ typedef void *mspace;
+@@ -189,8 +190,12 @@ once(int *state, bool (*make)(void *), void *context)
+    if (seen == 0 &&
+        __atomic_compare_exchange_n(state, &seen, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+       __atomic_store_n(state, make(context) ? 2 : 3, __ATOMIC_RELEASE);
+-   while ((seen = __atomic_load_n(state, __ATOMIC_ACQUIRE)) == 1)
+-      ;
++   /* A real-time waiter must let a preempted initializer run. sched_yield
++    * need not schedule a lower-priority owner on the same CPU. */
++   while ((seen = __atomic_load_n(state, __ATOMIC_ACQUIRE)) == 1) {
++      const struct timespec pause = {0, 50000};
++      nanosleep(&pause, NULL);
++   }
+    return seen == 2;
+ }
+ 

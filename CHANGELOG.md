@@ -232,6 +232,16 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **The title heap hands back memory it frees** (#75). The heap is the payload SDK's (dlmalloc in
+  eight arenas over direct memory). At the pinned SDK it maps segments back to back, dlmalloc joins
+  neighbours into one segment, and a joined segment can only go back whole, so one block left near its
+  end keeps everything below it. Over a run of photo requests the CPU heap grew and the pool's largest
+  free block shrank. `patches/sdk` carries four later commits of the SDK by its author (2 MiB segments
+  with a gap so they never join, `ps5_heap_trim()`, calloc clearing reused memory, sleeping arena
+  locks), applied to an export of the pin at build time and linked ahead of the stock heap; the pin
+  itself does not move. The app trims the heap 0.25 s after each request and every 10 s. The memory
+  line ends with exact MiB, the heap's segments and what it has in use; `memory each` logs one after
+  every request, and `trim` / `trim on` / `trim off` trim now or turn the trim off and on.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the

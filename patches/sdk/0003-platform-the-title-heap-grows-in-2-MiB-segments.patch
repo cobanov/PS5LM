@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:47:22 -0400
+Subject: [PATCH 3/4] platform: the title heap grows in 2 MiB segments
+
+Direct memory is committed whole when it is mapped, where libc's heap takes a page
+as it is touched. With 16 MiB segments and up to eight arenas, a payload sharing the
+application's pool held far more than it used: a Wine helper running a game's Vulkan
+driver kept 88 MiB of 16 MiB segments mapped (PS5 Pro, firmware 10.01), and the
+console's peak memory rose by about 85 MiB against the same game on libc's heap.
+
+DEFAULT_GRANULARITY goes from 16 MiB to 2 MiB, so an arena maps 2 MiB at a time, and
+the segment table from 1024 to 8192 entries, enough 2 MiB segments for the whole
+16 GiB range, so a title's large heap is not cut short by the table. Blocks past the
+32 MiB mapping threshold keep their own segment as before.
+
+A new host check: an arena's first segment is its 2 MiB granularity. make test: 321 of
+321 checks; make builds the console library with -Werror. Not yet measured on the console.
+
+Backported to b83202be for PS5LM from mihawk-99/PS5_PayloadSDK commit 9d0487845ad50e3a266872cbbaaedc6ffafe3404. Whole commit.
+---
+ platform/src/dlmalloc/mspace.c | 10 +++++++---
+ platform/src/heap.c            |  4 +++-
+ platform/tests/test_platform.c |  2 ++
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/platform/src/dlmalloc/mspace.c b/platform/src/dlmalloc/mspace.c
+index 5692d26..2324501 100644
+--- a/platform/src/dlmalloc/mspace.c
++++ b/platform/src/dlmalloc/mspace.c
+@@ -33,9 +33,13 @@ int ps5p_heap_unmap(void *address, size_t bytes);
+  * are 32: its compilers emit 32-byte-aligned AVX stores into plain new
+  * objects. */
+ #define MALLOC_ALIGNMENT ((size_t)32)
+-/* Each arena maps this much at a time: small enough that arenas a title
+- * barely uses hold little direct memory. */
+-#define DEFAULT_GRANULARITY ((size_t)16 << 20)
++/* Each arena maps this much at a time. Direct memory is committed whole when it
++ * is mapped, unlike libc's heap, whose pages are taken as they are touched: a
++ * payload that shares the application's pool (a Wine helper's Vulkan driver,
++ * eight arenas) held 88 MiB of 16 MiB segments where libc's heap had held about
++ * a tenth of it. 2 MiB keeps an idle arena's share small; src/heap.c's segment
++ * table is sized for the larger count of segments this makes. */
++#define DEFAULT_GRANULARITY ((size_t)2 << 20)
+ #define DEFAULT_MMAP_THRESHOLD ((size_t)32 << 20)
+ #define MALLOC_FAILURE_ACTION errno = ENOMEM
+ #define NO_MALLINFO 1
+diff --git a/platform/src/heap.c b/platform/src/heap.c
+index 3a95d30..262c57a 100644
+--- a/platform/src/heap.c
++++ b/platform/src/heap.c
+@@ -44,7 +44,9 @@ size_t mspace_usable_size(const void *pointer);
+ void mspace_free(mspace space, void *pointer);
+ 
+ 
+-#define HEAP_MAX_SEGMENTS 1024
++/* Enough segments of the arenas' 2 MiB granularity (src/dlmalloc/mspace.c) to
++ * fill the whole range: 16 GiB / 2 MiB. */
++#define HEAP_MAX_SEGMENTS 8192
+ #define HEAP_UNIT PS5P_DIRECT_UNIT
+ #define HEAP_PROTECTION (PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE)
+ 
+diff --git a/platform/tests/test_platform.c b/platform/tests/test_platform.c
+index aa1a588..94728f2 100644
+--- a/platform/tests/test_platform.c
++++ b/platform/tests/test_platform.c
+@@ -1055,6 +1055,8 @@ test_heap(void)
+    check((uintptr_t)small % 32 == 0, "heap: blocks are 32-byte aligned");
+    check(stats.segments == 1 && host_direct_allocations() == direct_before + 1,
+          "heap: the first block maps one segment");
++   check(stats.mapped_bytes <= ((size_t)2 << 20),
++         "heap: an arena's first segment is its 2 MiB granularity, not more");
+    strcpy(small, "title heap");
+    char *grown = __wrap_realloc(small, 100000);
+    check(grown && ps5_heap_owns(grown) && strcmp(grown, "title heap") == 0,

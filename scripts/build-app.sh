@@ -106,7 +106,38 @@ cmake --build "$out/llama" --target llama-server-impl
 # The app's own objects, and the title's start code from PS5_Vulkan.
 obj="$out/obj"
 mkdir -p "$obj" "$out/stubs"
-cxx() { "$root/ps5/app/ps5cxx" -std=c++17 -O2 -ffunction-sections -fdata-sections "$@"; }
+
+# The title heap with the SDK author's later fixes (patches/sdk, see its
+# README.md): segments that never join, so a freed one goes back to the pool,
+# and ps5_heap_trim. The pinned SDK is exported, patched and its two heap
+# objects compiled here, into an archive linked ahead of libps5platform.a; the
+# pinned checkout and the shared SDK cache stay as pinned.
+heap_cflags=() heap_lib=() heap_link=()
+sdk_patches=("$root"/patches/sdk/*.patch)
+if [ -e "${sdk_patches[0]}" ]; then
+    sdk_fork=${PS5_PAYLOAD_SDK_FORK:-$vk/../PS5_PayloadSDK}
+    sdk_rev=$(<"$sdk/.ps5-sdk-revision")
+    [ "$sdk_rev" = "$(<"$root/patches/sdk/BASE")" ] ||
+        { echo "build-app: patches/sdk is for SDK $(<"$root/patches/sdk/BASE"), not $sdk_rev" >&2; exit 2; }
+    git -C "$sdk_fork" cat-file -e "$sdk_rev^{commit}" 2>/dev/null ||
+        { echo "build-app: patches/sdk needs the SDK fork at $sdk_rev (PS5_PAYLOAD_SDK_FORK)" >&2; exit 2; }
+    heap="$out/sdk-heap"
+    rm -rf -- "$heap"
+    mkdir -p "$heap/src" "$heap/include/ps5platform"
+    git -C "$sdk_fork" archive "$sdk_rev" Makefile.inc include platform | tar -x -C "$heap/src"
+    for p in "${sdk_patches[@]}"; do
+        patch -s -p1 --fuzz=0 --no-backup-if-mismatch -d "$heap/src" -i "$p"
+    done
+    # The SDK Makefile's own rules and flags, for these two objects only.
+    make -s -C "$heap/src/platform" build/ps5/heap.o build/ps5/dlmalloc/mspace.o
+    "$sdk/bin/llvm-ar" rcs "$heap/libps5lm_heap.a" "$heap/src/platform/build/ps5/heap.o" \
+        "$heap/src/platform/build/ps5/dlmalloc/mspace.o"
+    cp "$heap/src/platform/include/ps5platform/heap.h" "$heap/include/ps5platform/"
+    heap_cflags=(-I "$heap/include" -DPS5LM_PATCHED_HEAP=1)
+    heap_lib=("$heap/libps5lm_heap.a")
+    heap_link=(--why-extract="$out/why-extract.txt")
+fi
+cxx() { "$root/ps5/app/ps5cxx" -std=c++17 -O2 -ffunction-sections -fdata-sections "${heap_cflags[@]}" "$@"; }
 cxx -std=c++20 -fexceptions -fcxx-exceptions -frtti -I "$headers/include" -I "$llama/ggml/include" -I "$root/third_party/ps5-homebrew-ui/src" \
     -I "$glsdk/include" -DGL_GLEXT_PROTOTYPES=1 \
     -c "$root/ps5/app/main.cpp" -o "$obj/main.o"
@@ -123,6 +154,7 @@ cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -c "$root/ps5/ap
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/ftp_writer.cpp" -o "$obj/ftp_writer.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/rpc_cache_writer.cpp" -o "$obj/rpc_cache_writer.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/rpc_park_writer.cpp" -o "$obj/rpc_park_writer.o"
+cxx -std=c++20 -fexceptions -fcxx-exceptions -c "$root/ps5/app/heap_info.cpp" -o "$obj/heap_info.o"
 cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$llama/vendor" -I "$root/ps5/app" -I "$root/third_party/ps5-homebrew-ui/src" -c "$root/ps5/app/activity.cpp" -o "$obj/activity.o"
 "$root/ps5/app/ps5cc" -O2 -I "$llama/vendor/hash" -c "$llama/vendor/hash/sha256/sha256.c" -o "$obj/sha256.o"
 "$root/ps5/app/ps5cc" -O2 -c "$root/ps5/app/compat_app.c" -o "$obj/compat_app.o"
@@ -225,13 +257,24 @@ for f in printf fprintf vprintf vfprintf puts fputs fputc putc putchar fwrite ab
 radv_link_flags=("${flags[@]}" --wrap=sceAgcInit "${log_wraps[@]}")
 mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
-    --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
+    --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL "${heap_link[@]}" \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/log_sink.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/rpc_cache_writer.o" "$obj/rpc_park_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
-    --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/log_sink.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/rpc_cache_writer.o" "$obj/rpc_park_writer.o" "$obj/heap_info.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "${heap_lib[@]}" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \
     --as-needed "$sdk"/target/lib/*.so
+# The heap came from patches/sdk, not the stock archive: lld takes the first
+# archive that defines a name, and the patched one defines every name the stock
+# heap.o and mspace.o do.
+if [ ${#heap_lib[@]} -gt 0 ]; then
+    for member in heap.o mspace.o; do
+        grep -q "libps5lm_heap.a($member)" "$out/why-extract.txt" &&
+            ! grep -q "libps5platform.a($member)" "$out/why-extract.txt" ||
+            { echo "build-app: $member did not come from patches/sdk" >&2; exit 1; }
+    done
+    echo "build-app: title heap from patches/sdk ($(ls "$root"/patches/sdk/*.patch | wc -l) patches on SDK $sdk_rev)"
+fi
 "$tool" link --in "$out/llvm-pie.elf" --out "$out/eboot.elf" \
     --stub-dir "$sdk/target/lib" --stub "$out/stubs/libSceAgc.so" \
     --stub "$out/stubs/libSceAgcDriver.so" --module-sdk 0x02000009 \
