@@ -51,6 +51,7 @@ if [[ ${1:-} == --rpc ]]; then
     fi
     python3 tests/server_kv_rotation_test.py --build "$out"
     python3 tests/server_kq_mask_test.py --build "$out"
+    python3 tests/server_vision_warmup_test.py --build "$out"
 elif [[ $# != 0 ]]; then
     echo 'usage: scripts/test-fleet.sh [--rpc]' >&2
     exit 2
