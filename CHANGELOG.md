@@ -153,8 +153,9 @@ v0.1.x are the upstream payload releases by cobanov.
   12.1875 GiB instead of 12. It applies when the app starts from the home screen,
   not when it restarts for a model.
 - **llama.cpp moves to b12600** (29b52d398, 2026-11-20), 775 commits on from b11827, for
+- **llama.cpp moves to d2bceda3d** (39 commits after b12602, 2026-11-22), 816 commits on from b11827, for
   Inkling 2 Mini: its `inkling2_loop` architecture came with that commit
-  (ggml-org/llama.cpp 32694). Tested on a host build against CPU workers only; **not yet
+  (ggml-org/llama.cpp 32694), and it reads correctly on a console only from 32669, 32735 and 32799 on. **Not yet
   built into a release or run on a console**.
   - A host and a worker must both be on this pin. llama.cpp's RPC protocol went from 8 to
     10 and a handshake between the two refuses, so a console keeps its old app until the

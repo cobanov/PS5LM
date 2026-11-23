@@ -1,6 +1,6 @@
 # Porting notes
 
-What it took to build llama.cpp for the PS5, and why. Upstream is pinned at `b12600` (2026-11-20).
+What it took to build llama.cpp for the PS5, and why. Upstream is pinned at `d2bceda3d` (39 commits after `b12602`, 2026-11-22).
 
 ## The target
 
