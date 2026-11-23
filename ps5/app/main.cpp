@@ -1284,7 +1284,7 @@ int main(int, char **) {
     // after every request and after its trim.
     bool     trim_on = ps5lm::heap_can_trim(), memory_each = false;
     uint64_t trim_seen = 0;
-    int64_t  trim_due = 0, last_trim = last;
+    int64_t  trim_due = 0, last_trim = last, last_figures = last;
     for (uint64_t n = 0;; ++n) {
         const int64_t now = hui::sys::monotonic_us();
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
@@ -1333,13 +1333,18 @@ int main(int, char **) {
             const double ms = trim_on ? ps5lm::heap_trim() : -1;
             if (after_request && memory_each && ms >= 0) {
                 log_memory("after the trim", false, ms);
-            } else if (!after_request && ps5lm::heap_can_trim()) {
-                ps5lm::heap_figures();  // the dashboard's heap figure (stats.cpp), at most 10 s old
             }
             last_trim = now;
             if (after_request) {
                 trim_due = 0;
             }
+        }
+        // The dashboard's and the report's heap figure (stats.cpp), at most 10 s
+        // old: on a clock of its own, since requests ending under 10 s apart
+        // keep putting the periodic trim off.
+        if (ps5lm::heap_can_trim() && now - last_figures >= 10000000) {
+            ps5lm::heap_figures();
+            last_figures = now;
         }
         if (n % 30 == 0) {
             models.publish(stats);
