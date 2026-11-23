@@ -126,7 +126,26 @@ struct Files {
           llama_log(root + "/llama.log"), models(root + "/models") {}
 };
 Files g_files(kFullRoot);
-constexpr const char * kFleetWorker = "/data/PS5LM/fleet-worker.txt";  // fleet needs full storage
+constexpr const char * kFleetWorker    = "/data/PS5LM/fleet-worker.txt";  // fleet needs full storage
+constexpr const char * kPromptCacheDir = "/data/PS5LM/cache/prompts";
+
+void clear_prompt_cache_dir() {
+    std::error_code ec;
+    size_t          removed = 0;
+    for (const auto & e : std::filesystem::directory_iterator(kPromptCacheDir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("ps5lm_ckpt_", 0) == 0) {
+            std::error_code rm_ec;
+            if (std::filesystem::remove(e.path(), rm_ec)) {
+                ++removed;
+            }
+        }
+    }
+    if (removed > 0) {
+        ps5lm::log_line("prompt-cache: cleared %zu cached file%s (disk cache off)\n", removed,
+                        removed == 1 ? "" : "s");
+    }
+}
 // The file tools only: a title cannot start processes (no shell command).
 constexpr const char * kTools       = "read_file,write_file,edit_file,file_glob_search,grep_search,get_info";
 constexpr const char * kAssets      = "/app0/assets";
@@ -730,7 +749,8 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, kPromptUbatch,
+                                      settings.disk_cache.c_str(), settings.disk_cache_mib, kPromptCacheDir);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -756,7 +776,8 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), kPromptUbatch,
+                                  settings.disk_cache.c_str(), settings.disk_cache_mib, kPromptCacheDir);
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -1131,6 +1152,9 @@ int main(int, char **) {
     set_activity_sink(&stats);  // llama-server's request hooks (patches/0007) report here
     Models models;
     models.settings = load_settings(g_files.settings.c_str());
+    if (models.settings.disk_cache == "off") {
+        clear_prompt_cache_dir();
+    }
     // Without full storage, downloads go where the app can write.
     if (app_storage() && models.settings.download_dir.rfind(kFullRoot, 0) == 0) {
         models.settings.download_dir = g_files.models;
@@ -1470,7 +1494,11 @@ int main(int, char **) {
             const Settings was = models.settings;
             models.settings = dash.settings();
             save_settings(g_files.settings.c_str(), models.settings);
-            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+            if (models.settings.disk_cache == "off" && models.running.empty()) {
+                clear_prompt_cache_dir();
+            }
+            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
+                was.disk_cache != models.settings.disk_cache || was.disk_cache_mib != models.settings.disk_cache_mib) {
                 models.rescan(stats);
             }
             ps5lm::log_line("settings saved\n");

@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir,
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, disk_cache, disk_cache_mib, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir,
                            storage, debug_report, report_kernel_log };
 
 struct SettingRow {
@@ -90,7 +90,7 @@ struct SettingRow {
 
 struct SettingCategory {
     const char * name;
-    SettingRow   rows[3];
+    SettingRow   rows[4];
     int          count;
 };
 
@@ -101,8 +101,10 @@ constexpr SettingCategory kCategories[] = {
       2 },
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
-        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" } },
-      2 },
+        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
+        { Setting::disk_cache, "Disk cache spillover", "Save prompt cache to SSD so switched chats stay fast without using RAM" },
+        { Setting::disk_cache_mib, "Disk cache limit", "SSD space reserved for saved prompt cache files (2 GB - 32 GB)" } },
+      4 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
         { Setting::scratch_limit, "Warn above", "A notification when that folder grows past this" },
@@ -128,6 +130,8 @@ constexpr int kDiagnostics = 6;
 
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
+constexpr const char * kDiskCacheSteps[] = { "off", "auto", "on" };
+constexpr uint32_t     kDiskCacheMibSteps[] = { 2048, 4096, 8192, 16384, 32768 };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
 constexpr int   kLogLines = 20;
@@ -402,6 +406,9 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
         }
         case Setting::ctx_cap: return format("%.0fk tokens", s.ctx_cap / 1024.0);
         case Setting::kv_type: return s.kv_type == "auto" ? "Auto" : s.kv_type;
+        case Setting::disk_cache:
+            return s.disk_cache == "on" ? "Always on" : (s.disk_cache == "auto" ? "Auto (when near full)" : "Off");
+        case Setting::disk_cache_mib: return format("%.0f GB", s.disk_cache_mib / 1024.0);
         case Setting::scratch_limit: return format("%.0f GB", (double) s.scratch_limit_gib);
         case Setting::download_dir: {
             for (const auto & d : drives) {
@@ -489,6 +496,24 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
             }
             break;
         }
+        case Setting::disk_cache: {
+            const char * labels[] = { "Off", "Auto (when near full)", "Always on" };
+            const char * notes[] = {
+                "RAM only; disables prompt cache spillover to SSD",
+                "Enable --cache-disk when headroom is under 0.75 GB",
+                "Always keep --cache-disk enabled on SSD"
+            };
+            for (int i = 0; i < 3; ++i) {
+                const std::string mode = kDiskCacheSteps[i];
+                add(labels[i], notes[i], s.disk_cache == mode, [mode](Settings & v) { v.disk_cache = mode; });
+            }
+            break;
+        }
+        case Setting::disk_cache_mib:
+            for (uint32_t m : kDiskCacheMibSteps) {
+                add(format("%.0f GB", m / 1024.0), "", s.disk_cache_mib == m, [m](Settings & v) { v.disk_cache_mib = m; });
+            }
+            break;
         case Setting::scratch_limit:
             for (uint32_t g : kScratchSteps) {
                 add(format("%.0f GB", (double) g), "", s.scratch_limit_gib == g, [g](Settings & v) { v.scratch_limit_gib = g; });
