@@ -8,6 +8,13 @@ v0.1.x are the upstream payload releases by cobanov.
 ## [Unreleased]
 
 ### Added
+- **USB keyboard, USB mouse, and HDMI-CEC TV remote input** on the native
+  dashboard: type prompts directly with a keyboard, navigate and click pages,
+  rows, hints, and dialogs with a mouse (with an auto-hiding cursor), or use a
+  TV remote over HDMI-CEC. DualSense behavior and hints stay unchanged unless
+  keyboard/mouse input is used.
+  - Limits: US ANSI keyboard layout only; NKRO gaming keyboards must be
+    switched to 6KRO/BIOS mode.
 - **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again

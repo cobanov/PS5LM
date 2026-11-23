@@ -31,6 +31,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 
 namespace ps5lm {
@@ -339,6 +340,99 @@ int first_visible(int cursor, int rows) {
     return std::clamp(cursor - kVisibleRows / 2, 0, std::max(0, rows - kVisibleRows));
 }
 
+bool in_rect(float x, float y, const Rect & r) {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+// Mirrors hui::ui::draw_hints() right-aligned layout.
+int controller_hint_hit(float px, float py, const ui::Fonts & fonts, const ui::Hint * hints, int count, float right_x,
+                        const ui::HintLayout & layout) {
+    if (count <= 0 || py < layout.cy - 28.0f || py > layout.cy + 28.0f) {
+        return -1;
+    }
+    const ui::FontRef & face   = layout.font ? *layout.font : fonts.regular;
+    float               cursor = right_x - ui::measure_hints(fonts, hints, count, layout);
+    for (int i = 0; i < count; ++i) {
+        const ui::Hint & h = hints[i];
+        float w = ui::button_width(h.button, layout.size);
+        if (h.second != ui::Button::none) {
+            w += 6.0f + ui::button_width(h.second, layout.size);
+        }
+        w += 12.0f + face.measure(h.label, layout.text_size);
+        if (px >= cursor - 10.0f && px <= cursor + w + 10.0f) {
+            return i;
+        }
+        cursor += w + layout.item_gap;
+    }
+    return -1;
+}
+
+const char * kbm_cap_label(const ui::Hint & h) {
+    if (h.button == ui::Button::l1 && h.second == ui::Button::r1) {
+        return "Tab";
+    }
+    if (h.button == ui::Button::l2 && h.second == ui::Button::r2) {
+        return "Q / E";
+    }
+    switch (h.button) {
+        case ui::Button::cross: return "Enter";
+        case ui::Button::circle: return "Esc";
+        case ui::Button::square: return "X";
+        case ui::Button::triangle: return "T";
+        case ui::Button::l1: return "[";
+        case ui::Button::r1: return "]";
+        case ui::Button::l2: return "Q";
+        case ui::Button::r2: return "E";
+        case ui::Button::dpad: return h.label && std::strcmp(h.label, "Scroll") == 0 ? "Wheel" : "Arrows";
+        case ui::Button::options: return "F10";
+        default: return "";
+    }
+}
+
+void measure_kbm_item(const ui::Fonts & fonts, const ui::Hint & h, const ui::HintLayout & layout,
+                      float * out_cap_w, float * out_label_w, float * out_total_w) {
+    const ui::FontRef & face     = layout.font ? *layout.font : fonts.regular;
+    const char *        cap_txt  = kbm_cap_label(h);
+    const float         cap_size = layout.text_size * 0.85f;
+    const float         cap_text = fonts.semibold.measure(cap_txt, cap_size);
+    const float         cap_w    = cap_txt[0] == '\0' ? 0.0f : std::max(layout.size, cap_text + 22.0f);
+    const float         lbl_w    = h.label ? face.measure(h.label, layout.text_size) : 0.0f;
+    if (out_cap_w) *out_cap_w = cap_w;
+    if (out_label_w) *out_label_w = lbl_w;
+    if (out_total_w) *out_total_w = cap_w + (cap_w > 0.0f ? 10.0f : 0.0f) + lbl_w;
+}
+
+float measure_kbm_total(const ui::Fonts & fonts, const ui::Hint * hints, int count, const ui::HintLayout & layout) {
+    float total = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        float item_w = 0.0f;
+        measure_kbm_item(fonts, hints[i], layout, nullptr, nullptr, &item_w);
+        total += item_w;
+        if (i + 1 < count) {
+            total += layout.item_gap;
+        }
+    }
+    return total;
+}
+
+// Mirrors Dashboard::draw_action_hints() KBM cap-and-label layout.
+int kbm_hint_hit(float px, float py, const ui::Fonts & fonts, const ui::Hint * hints, int count, float right_x,
+                 const ui::HintLayout & layout) {
+    if (count <= 0 || py < layout.cy - 28.0f || py > layout.cy + 28.0f) {
+        return -1;
+    }
+    float cursor = right_x - measure_kbm_total(fonts, hints, count, layout);
+    for (int i = 0; i < count; ++i) {
+        float item_w = 0.0f;
+        measure_kbm_item(fonts, hints[i], layout, nullptr, nullptr, &item_w);
+        if (px >= cursor - 10.0f && px <= cursor + item_w + 10.0f) {
+            return i;
+        }
+        cursor += item_w + layout.item_gap;
+    }
+    return -1;
+}
+
 // 2 error, 1 warning, 0 neither. llama.cpp marks its lines " E " and " W ";
 // the rest is matched by words, so "failures=0" is not an error.
 int log_level(const std::string & line) {
@@ -610,10 +704,21 @@ void Dashboard::refilter_logs() {
 
 // ---- input ------------------------------------------------------------------------
 
-void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & feedback) {
+void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & feedback,
+                       const TextInput & text, const PointerInput & pointer, const InputActivity & activity) {
+    pointer_ = pointer;
+    if (activity.pad_active) {
+        input_mode_ = InputMode::controller;
+    } else if (activity.usb_active) {
+        input_mode_ = InputMode::keyboard_mouse;
+    } else if (!activity.pad_connected && activity.usb_connected) {
+        input_mode_ = InputMode::keyboard_mouse;
+    }
+    prompt_.keyboard.style.binding_glyphs = (input_mode_ == InputMode::controller);
+
     const hui::InputFrame none{};
     const bool dialog = market_confirm_ || market_space_ || picker_ || report_dialog_ || storage_dialog_;
-    const hui::InputFrame & input = busy() ? none : raw;  // busy: the screen says so, buttons wait
+    hui::InputFrame input = busy() ? none : raw;  // busy: the screen says so, buttons wait
     age_ += dt;
     clock_ += dt;
     page_age_ += dt;
@@ -638,6 +743,13 @@ void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & fee
     }
     unfinished_ = std::move(unfinished);
 
+    if (!busy()) {
+        if (prompt_.is_open() && !text.empty()) {
+            update_prompt_text(text, feedback);
+        }
+        handle_pointer(pointer, &input, feedback);
+    }
+
     // L1/R1 walk the dock, unless a question is open. A message being typed
     // takes every button until it is sent or dropped.
     const int step = input.is_pressed(Action::page_next) ? 1 : input.is_pressed(Action::page_prev) ? -1 : 0;
@@ -648,11 +760,15 @@ void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & fee
             request_ = { Request::ask, prompt_.text() };
         }
     } else if (step != 0 && !dialog) {
-        const int next = page_ + step;
-        if (next >= 0 && next < kPages) {
-            go_to(next, &feedback);
+        if (input_mode_ == InputMode::keyboard_mouse) {
+            go_to((page_ + step + kPages) % kPages, &feedback);
         } else {
-            feedback.play(Cue::error);
+            const int next = page_ + step;
+            if (next >= 0 && next < kPages) {
+                go_to(next, &feedback);
+            } else {
+                feedback.play(Cue::error);
+            }
         }
     } else if (page_ == kHomePage) {
         update_home(input, feedback);
@@ -669,6 +785,12 @@ void Dashboard::update(const hui::InputFrame & raw, float dt, ui::Feedback & fee
         }
     } else if (page_ == kSettingsPage) {
         update_settings(input, feedback);
+    }
+    if (prompt_.is_open()) {
+        prompt_.field.set_helper(
+            input_mode_ == InputMode::keyboard_mouse
+                ? "Type on your keyboard or click keys  \xC2\xB7  Enter to send  \xC2\xB7  Esc to cancel"
+                : "");
     }
     prompt_.update(dt);
 
@@ -1131,6 +1253,8 @@ void Dashboard::draw(DashboardFrame & frame) const {
     }
     if (busy()) {
         draw_busy(frame.overlay);
+    } else if (pointer_.visible) {
+        draw_cursor(frame.overlay);
     }
 }
 
@@ -1174,82 +1298,168 @@ void Dashboard::draw_dock(gfx::DrawList & l) const {
     l.rounded_rect({ mx - 18, 1068, 36, 4 }, 2, kBlue);
 }
 
-void Dashboard::draw_hints(gfx::DrawList & l) const {
-    ui::GlyphStyle style = ui::GlyphStyle::dark();
-    style.label = kInk2;
-    ui::HintLayout layout;
-    layout.size = 32;
-    layout.text_size = 20;
-    layout.cy = 1018;
-    layout.item_gap = 36;
-    std::vector<ui::Hint> h;
+std::vector<Dashboard::ActionHint> Dashboard::current_hints() const {
     if (market_confirm_ || market_space_ || report_dialog_ || storage_dialog_ || prompt_.visible()) {
-        return;  // the dialog has its own
+        return {};  // the dialog has its own
     }
+    std::vector<ActionHint> h;
     if (picker_ && page_ == kSettingsPage) {
-        h = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Choose" } };
+        h = { { { ui::Button::circle, "Cancel" }, Action::back },
+              { { ui::Button::cross, "Choose" }, Action::confirm } };
     } else if (page_ == kHomePage) {
-        h = { { ui::Button::l1, "Pages", ui::Button::r1 } };
+        h = { { { ui::Button::l1, "Pages", ui::Button::r1 }, Action::page_next } };
         if (live_.state == ServerState::ready || live_.state == ServerState::generating) {
-            h.push_back({ ui::Button::square, "Demo" });
-            h.push_back({ ui::Button::triangle, "Message" });
+            h.push_back({ { ui::Button::square, "Demo" }, Action::west });
+            h.push_back({ { ui::Button::triangle, "Message" }, Action::north });
         }
-        h.push_back({ ui::Button::cross, live_.model_label.empty() ? "Choose a model" : "Change model" });
+        h.push_back({ { ui::Button::cross, live_.model_label.empty() ? "Choose a model" : "Change model" },
+                      Action::confirm });
     } else if (page_ == kConsolePage) {
-        h = { { ui::Button::l1, "Pages", ui::Button::r1 }, { ui::Button::l2, "Range", ui::Button::r2 } };
+        h = { { { ui::Button::l1, "Pages", ui::Button::r1 }, Action::page_next },
+              { { ui::Button::l2, "Range", ui::Button::r2 }, console_hour_ ? Action::jump_prev : Action::jump_next } };
     } else if (page_ == kModelsPage) {
         if (!in_list_) {
-            h = { { ui::Button::dpad, "Choose" }, { ui::Button::cross, "Open" } };
+            if (input_mode_ == InputMode::keyboard_mouse) {
+                h.push_back({ { ui::Button::l1, "Pages", ui::Button::r1 }, Action::page_next });
+            }
+            h.push_back({ { ui::Button::dpad, "Choose" }, Action::count });
+            h.push_back({ { ui::Button::cross, "Open" }, Action::confirm });
         } else if (section_ == kLocal) {
-            const ModelRow * m = local_cursor_ < (int) live_.models.size() ? &live_.models[(size_t) local_cursor_] : nullptr;
-            h = { { ui::Button::circle, "Back" } };
+            const ModelRow * m =
+                local_cursor_ < (int) live_.models.size() ? &live_.models[(size_t) local_cursor_] : nullptr;
+            h = { { { ui::Button::circle, "Back" }, Action::back } };
             if (m && (m->current || m->fits)) {
-                h.push_back({ ui::Button::cross, m->current ? "Unload" : "Load" });
+                h.push_back({ { ui::Button::cross, m->current ? "Unload" : "Load" }, Action::confirm });
             }
         } else if (section_ == kSuggested) {
-            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Download" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back },
+                  { { ui::Button::cross, "Download" }, Action::confirm } };
         } else if (section_ == kSearch) {
-            h = market_files_ ? std::vector<ui::Hint>{ { ui::Button::circle, "Back" }, { ui::Button::square, "Check fit" },
-                                                       { ui::Button::cross, "Download" } }
-                              : std::vector<ui::Hint>{ { ui::Button::l2, "Search", ui::Button::r2 }, { ui::Button::circle, "Back" },
-                                                       { ui::Button::cross, "Open" } };
+            if (market_files_) {
+                h = { { { ui::Button::circle, "Back" }, Action::back },
+                      { { ui::Button::square, "Check fit" }, Action::west },
+                      { { ui::Button::cross, "Download" }, Action::confirm } };
+            } else {
+                h = { { { ui::Button::l2, "Search", ui::Button::r2 }, Action::jump_next },
+                      { { ui::Button::circle, "Back" }, Action::back },
+                      { { ui::Button::cross, "Open" }, Action::confirm } };
+            }
         } else {
-            const Download * d = dl_cursor_ < (int) market_.downloads.size() ? &market_.downloads[(size_t) dl_cursor_] : nullptr;
-            h = { { ui::Button::circle, "Back" } };
+            const Download * d =
+                dl_cursor_ < (int) market_.downloads.size() ? &market_.downloads[(size_t) dl_cursor_] : nullptr;
+            h = { { { ui::Button::circle, "Back" }, Action::back } };
             if (d) {
                 const bool runs = d->state == DownloadState::running || d->state == DownloadState::retrying ||
                                   d->state == DownloadState::queued;
-                h.push_back({ ui::Button::square, d->state == DownloadState::done ? "Clear" : dl_confirm_ == dl_cursor_ ? "Yes, delete it" : "Cancel" });
+                h.push_back({ { ui::Button::square, d->state == DownloadState::done   ? "Clear"
+                                                  : dl_confirm_ == dl_cursor_ ? "Yes, delete it"
+                                                                              : "Cancel" },
+                              Action::west });
                 if (d->state != DownloadState::done) {
-                    h.push_back({ ui::Button::cross, runs ? "Pause" : d->state == DownloadState::failed ? "Try again" : "Resume" });
+                    h.push_back({ { ui::Button::cross, runs                        ? "Pause"
+                                                     : d->state == DownloadState::failed ? "Try again"
+                                                                                       : "Resume" },
+                                  Action::confirm });
                 }
             }
         }
     } else if (page_ == kApiPage) {
-        h = { { ui::Button::l1, "Pages", ui::Button::r1 } };
+        h = { { { ui::Button::l1, "Pages", ui::Button::r1 }, Action::page_next } };
     } else if (!in_rows_) {
-        h = { { ui::Button::dpad, "Choose" }, { ui::Button::cross, "Open" } };
+        if (input_mode_ == InputMode::keyboard_mouse) {
+            h.push_back({ { ui::Button::l1, "Pages", ui::Button::r1 }, Action::page_next });
+        }
+        h.push_back({ { ui::Button::dpad, "Choose" }, Action::count });
+        h.push_back({ { ui::Button::cross, "Open" }, Action::confirm });
     } else if (setting_category_ == kDiagnostics) {
-        h = { { ui::Button::dpad, "Scroll" }, { ui::Button::square, log_llama_ ? "App log" : "Server log" },
-              { ui::Button::triangle, log_errors_ ? "All lines" : "Errors only" } };
+        h = { { { ui::Button::dpad, "Scroll" }, Action::count },
+              { { ui::Button::square, log_llama_ ? "App log" : "Server log" }, Action::west },
+              { { ui::Button::triangle, log_errors_ ? "All lines" : "Errors only" }, Action::north } };
     } else {
         const Setting id = kCategories[setting_category_].rows[setting_row_].id;
         if (id == Setting::clear_scratch) {
-            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Clear" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back },
+                  { { ui::Button::cross, "Clear" }, Action::confirm } };
         } else if (id == Setting::debug_report) {
-            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, report_busy_ ? "Writing it" : "Create" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back },
+                  { { ui::Button::cross, report_busy_ ? "Writing it" : "Create" }, Action::confirm } };
         } else if (id == Setting::storage) {
-            h = { { ui::Button::circle, "Back" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back } };
             if (!full_storage_) {
-                h.push_back({ ui::Button::cross, "Options" });
+                h.push_back({ { ui::Button::cross, "Options" }, Action::confirm });
             }
         } else if (is_toggle(id)) {
-            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Switch" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back },
+                  { { ui::Button::cross, "Switch" }, Action::confirm } };
         } else {
-            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Change" } };
+            h = { { { ui::Button::circle, "Back" }, Action::back },
+                  { { ui::Button::cross, "Change" }, Action::confirm } };
         }
     }
-    ui::draw_hints(l, fonts_, style, h.data(), (int) h.size(), kRight, true, layout);
+    return h;
+}
+
+void Dashboard::draw_action_hints(gfx::DrawList & l, const ui::Hint * hints, int count, float right_x,
+                                  const ui::HintLayout & layout) const {
+    if (count <= 0) {
+        return;
+    }
+    if (input_mode_ == InputMode::controller) {
+        ui::GlyphStyle style = ui::GlyphStyle::dark();
+        style.label          = kInk2;
+        ui::draw_hints(l, fonts_, style, hints, count, right_x, true, layout);
+        return;
+    }
+
+    const ui::FontRef & face     = layout.font ? *layout.font : fonts_.regular;
+    const float         cap_size = layout.text_size * 0.85f;
+    const float         kh       = layout.size * 0.88f;
+    float               cursor   = right_x - measure_kbm_total(fonts_, hints, count, layout);
+    for (int i = 0; i < count; ++i) {
+        const ui::Hint & h      = hints[i];
+        float            cap_w  = 0.0f;
+        float            lbl_w  = 0.0f;
+        float            item_w = 0.0f;
+        measure_kbm_item(fonts_, h, layout, &cap_w, &lbl_w, &item_w);
+        const bool hovered = pointer_.visible && !busy() && pointer_.y >= layout.cy - 28.0f &&
+                             pointer_.y <= layout.cy + 28.0f && pointer_.x >= cursor - 10.0f &&
+                             pointer_.x <= cursor + item_w + 10.0f;
+        if (cap_w > 0.0f) {
+            const Rect cap{ cursor, layout.cy - kh * 0.5f, cap_w, kh };
+            l.bordered_rect(cap, 7.0f, kRaised, 1.5f, hovered ? kInk3 : kHair);
+            put(l, fonts_.semibold, kbm_cap_label(h), cap.cx(), layout.cy + cap_size * 0.35f, cap_size, kInk,
+                gfx::Align::center);
+            cursor += cap_w + 10.0f;
+        }
+        put(l, face, h.label, cursor, layout.cy + layout.text_size * 0.35f, layout.text_size, hovered ? kInk : kInk2);
+        cursor += lbl_w + layout.item_gap;
+    }
+}
+
+int Dashboard::hit_action_hints(float px, float py, const ui::Hint * hints, int count, float right_x,
+                                const ui::HintLayout & layout) const {
+    if (input_mode_ == InputMode::controller) {
+        return controller_hint_hit(px, py, fonts_, hints, count, right_x, layout);
+    }
+    return kbm_hint_hit(px, py, fonts_, hints, count, right_x, layout);
+}
+
+void Dashboard::draw_hints(gfx::DrawList & l) const {
+    const auto items = current_hints();
+    if (items.empty()) {
+        return;
+    }
+    std::vector<ui::Hint> raw;
+    raw.reserve(items.size());
+    for (const ActionHint & it : items) {
+        raw.push_back(it.hint);
+    }
+    ui::HintLayout layout;
+    layout.size      = 32;
+    layout.text_size = 20;
+    layout.cy        = 1018;
+    layout.item_gap  = 36;
+    draw_action_hints(l, raw.data(), (int) raw.size(), kRight, layout);
 }
 
 // ---- drawing: Home -------------------------------------------------------------------
@@ -1437,7 +1647,11 @@ void Dashboard::draw_home(gfx::DrawList & l) const {
     if (turns.empty()) {
         put(l, f.regular, "Requests from other devices appear here, as a chat.", x, top + 40, 22, kInk3);
         if (live_.state == ServerState::ready || live_.state == ServerState::generating) {
-            put(l, f.regular, "Square sends a demo, Triangle a message of your own.", x, top + 76, 22, kInk3);
+            put(l, f.regular,
+                input_mode_ == InputMode::keyboard_mouse
+                    ? "Press X for a demo, or click here / press T to send a message."
+                    : "Square sends a demo, Triangle a message of your own.",
+                x, top + 76, 22, kInk3);
         }
     }
     float y = bottom - total;
@@ -1642,7 +1856,11 @@ void Dashboard::draw_market(gfx::DrawList & l, const Rect & a) const {
         const MarketFile & m = open->files[(size_t) i];
         const float y = top + kRowPitch * (float) (i - first);
         put(l, f.regular, f.regular.font->fit(m.name, 26, a.w - 300), a.x + 28, y + 36, 26, m.fits == 0 ? kInk3 : kInk);
-        const std::string plan = m.checking ? "Reading its header" : m.fits == -1 ? "Square checks whether it fits" : m.plan;
+        const std::string plan = m.checking  ? "Reading its header"
+                                 : m.fits == -1 ? (input_mode_ == InputMode::keyboard_mouse
+                                                       ? "Press X or middle-click to check whether it fits"
+                                                       : "Square checks whether it fits")
+                                                : m.plan;
         put(l, f.regular, f.regular.font->fit(format("%.1f GB", m.bytes / 1073741824.0) + "    " + gb_text(plan), 20, a.w - 300), a.x + 28, y + 66,
              20, kInk3);
         put(l, f.semibold, m.fits == 1 ? "Fits" : m.fits == 0 ? "Too big" : "", a.x + a.w - 28, y + 50, 22,
@@ -1989,8 +2207,6 @@ void Dashboard::draw_dialogs(gfx::DrawList & l) const {
     const ui::Fonts & f = fonts_;
     const Rect r{ 960 - 440, 540 - 170, 880, 340 };
     sheet(l, r);
-    ui::GlyphStyle style = ui::GlyphStyle::dark();
-    style.label = kInk2;
     ui::HintLayout layout;
     layout.size = 32;
     layout.text_size = 22;
@@ -1999,14 +2215,14 @@ void Dashboard::draw_dialogs(gfx::DrawList & l) const {
         put(l, f.semibold, "Unload the model first?", r.x + 56, r.y + 86, 34, kInk);
         put(l, f.regular, "The download is faster with the memory free. The model can load again after.", r.x + 56, r.y + 136, 22, kInk2);
         const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Keep it loaded" }, { ui::Button::triangle, "Unload and download" } };
-        ui::draw_hints(l, fonts_, style, h, 3, r.x + r.w - 56, true, layout);
+        draw_action_hints(l, h, 3, r.x + r.w - 56, layout);
     } else {
         put(l, f.semibold, "Not enough space there", r.x + 56, r.y + 86, 34, kInk);
         put(l, f.regular, market_dir_.empty() ? "No drive has room for it. Free some space and try again."
                                                : "It fits on " + drive_name(market_dir_) + ".",
              r.x + 56, r.y + 136, 22, kInk2);
         const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Save it there" } };
-        ui::draw_hints(l, fonts_, style, h, market_dir_.empty() ? 1 : 2, r.x + r.w - 56, true, layout);
+        draw_action_hints(l, h, market_dir_.empty() ? 1 : 2, r.x + r.w - 56, layout);
     }
 }
 
@@ -2069,13 +2285,11 @@ void Dashboard::draw_storage_dialog(gfx::DrawList & l) const {
         para("Then start PS5LM again: it asks the HEN for /data at every start.", kInk3);
         h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Start again" } };
     }
-    ui::GlyphStyle style = ui::GlyphStyle::dark();
-    style.label = kInk2;
     ui::HintLayout layout;
     layout.size = 32;
     layout.text_size = 22;
     layout.cy = r.y + r.h - 56;
-    ui::draw_hints(l, fonts_, style, h.data(), (int) h.size(), r.x + r.w - 56, true, layout);
+    draw_action_hints(l, h.data(), (int) h.size(), r.x + r.w - 56, layout);
 }
 
 // Before the first debug report: what goes in it, and what never does.
@@ -2108,14 +2322,12 @@ void Dashboard::draw_report_dialog(gfx::DrawList & l) const {
         put(l, f.regular, line, r.x + 56, y, 22, kInk3);
         y += 32;
     }
-    ui::GlyphStyle style = ui::GlyphStyle::dark();
-    style.label = kInk2;
     ui::HintLayout layout;
     layout.size = 32;
     layout.text_size = 22;
     layout.cy = r.y + r.h - 56;
     const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Create the report" } };
-    ui::draw_hints(l, fonts_, style, h, 2, r.x + r.w - 56, true, layout);
+    draw_action_hints(l, h, 2, r.x + r.w - 56, layout);
 }
 
 // Slow work, often the app restarting for a model: the whole screen, the
@@ -2134,6 +2346,592 @@ void Dashboard::draw_busy(gfx::DrawList & l) const {
     const float t = 0.5f + 0.5f * std::sin(clock_ * 2.4f);
     l.rounded_rect({ 960 - track * 0.5f, 700, track, 3 }, 1.5f, kHair);
     l.rounded_rect({ 960 - track * 0.5f + (track - seg) * t, 700, seg, 3 }, 1.5f, kInk);
+}
+
+void Dashboard::update_prompt_text(const TextInput & text, ui::Feedback & feedback) {
+    if (!prompt_.is_open() || text.empty()) {
+        return;
+    }
+    if (text.cancel) {
+        prompt_.close(feedback);
+        return;
+    }
+    bool edited = false;
+    for (int i = 0; i < text.backspaces; ++i) {
+        if (prompt_.field.backspace(feedback) == ui::Event::changed) {
+            edited = true;
+        }
+    }
+    for (std::size_t at = 0; at < text.typed.size();) {
+        std::size_t next = at + 1;
+        while (next < text.typed.size() && (static_cast<unsigned char>(text.typed[next]) & 0xC0u) == 0x80u) {
+            ++next;
+        }
+        const std::string_view cp(text.typed.data() + at, next - at);
+        if (prompt_.field.insert(cp)) {
+            edited = true;
+            const float along = prompt_.field.style.max_length > 0
+                                    ? static_cast<float>(prompt_.field.length()) /
+                                          static_cast<float>(prompt_.field.style.max_length)
+                                    : 0.5f;
+            feedback.play(Cue::type, tween::lerp(0.96f, 1.08f, tween::clamp01(along)));
+        } else {
+            feedback.play(Cue::error);
+            break;
+        }
+        at = next;
+    }
+    if (edited) {
+        prompt_.field.set_error("");
+        prompt_.keyboard.set_length(prompt_.field.length());
+    }
+    if (text.submit) {
+        if (prompt_.style.trim) {
+            while (!prompt_.field.text().empty() && prompt_.field.text().back() == ' ') {
+                prompt_.field.backspace();
+            }
+        }
+        if (prompt_.field.text().empty() && !prompt_.style.allow_empty) {
+            prompt_.field.set_error(prompt_.style.empty_error);
+            feedback.play(Cue::error);
+            return;
+        }
+        request_ = { Request::ask, prompt_.text() };
+        feedback.play(Cue::select);
+        prompt_.dismiss();
+    }
+}
+
+void Dashboard::handle_pointer(const PointerInput & pointer, hui::InputFrame * input, ui::Feedback & feedback) {
+    const bool has_pointer = pointer.visible || pointer.moved || pointer.left_pressed || pointer.middle_pressed ||
+                             pointer.wheel != 0;
+    if (!has_pointer) {
+        return;
+    }
+
+    const float px     = pointer.x;
+    const float py     = pointer.y;
+    const auto  press  = [&](Action a) {
+        input->connected = true;
+        input->pressed |= hui::action_bit(a);
+    };
+
+    if (storage_dialog_) {
+        if (!pointer.left_pressed) {
+            return;
+        }
+        // Mirrors draw_storage_dialog() rect and action hints.
+        const Rect r{ 960.0f - 580.0f, 540.0f - 300.0f, 1160.0f, 600.0f };
+        if (!in_rect(px, py, r)) {
+            press(Action::back);
+            return;
+        }
+        ui::HintLayout layout;
+        layout.size      = 32.0f;
+        layout.text_size = 22.0f;
+        layout.cy        = r.y + r.h - 56.0f;
+        if (!storage_howto_) {
+            const ui::Hint h[] = { { ui::Button::circle, "Not now" },
+                                   { ui::Button::triangle, "How to open it" },
+                                   { ui::Button::cross, "Use the app's storage" } };
+            const int      hit = hit_action_hints(px, py, h, 3, r.x + r.w - 56.0f, layout);
+            if (hit == 0) press(Action::back);
+            else if (hit == 1) press(Action::north);
+            else if (hit == 2) press(Action::confirm);
+        } else {
+            const ui::Hint h[] = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Start again" } };
+            const int      hit = hit_action_hints(px, py, h, 2, r.x + r.w - 56.0f, layout);
+            if (hit == 0) press(Action::back);
+            else if (hit == 1) press(Action::confirm);
+        }
+        return;
+    }
+
+    if (prompt_.is_open()) {
+        const Rect panel = prompt_.panel_rect();
+        if (pointer.left_pressed && !in_rect(px, py, panel)) {
+            prompt_.close(feedback);
+            return;
+        }
+        if (prompt_.style.buttons && pointer.left_pressed) {
+            // Mirrors hui::ui::InputPrompt::button_rect() (private in ps5-homebrew-ui).
+            const float inner = panel.w - 2.0f * prompt_.style.padding;
+            const float bw    = std::min(prompt_.style.button_width, (inner - prompt_.style.button_gap) * 0.5f);
+            const float total = 2.0f * bw + prompt_.style.button_gap;
+            const float bx0   = panel.x + panel.w - prompt_.style.padding - total;
+            const float by    = panel.y + panel.h - prompt_.style.padding - prompt_.style.button_height;
+            const Rect  cancel_r{ bx0, by, bw, prompt_.style.button_height };
+            const Rect  done_r{ bx0 + bw + prompt_.style.button_gap, by, bw, prompt_.style.button_height };
+            if (in_rect(px, py, cancel_r)) {
+                prompt_.close(feedback);
+                return;
+            }
+            if (in_rect(px, py, done_r)) {
+                TextInput sub;
+                sub.submit = true;
+                update_prompt_text(sub, feedback);
+                return;
+            }
+        }
+        const int    lay     = prompt_.keyboard.layout();
+        const auto & layouts = prompt_.keyboard.layouts();
+        if (lay >= 0 && lay < (int) layouts.size()) {
+            const auto & rows = layouts[(size_t) lay].rows;
+            for (int r = 0; r < (int) rows.size(); ++r) {
+                for (int k = 0; k < (int) rows[(size_t) r].size(); ++k) {
+                    if (!in_rect(px, py, prompt_.keyboard.key_rect(r, k))) {
+                        continue;
+                    }
+                    if (!pointer.left_pressed) {
+                        if (pointer.moved && !prompt_.on_buttons() &&
+                            (prompt_.keyboard.focus_row() != r || prompt_.keyboard.focus_key() != k)) {
+                            prompt_.keyboard.set_focus(r, k, false);
+                            feedback.play(Cue::focus);
+                        }
+                        return;
+                    }
+                    if (!prompt_.on_buttons()) {
+                        prompt_.keyboard.set_focus(r, k, false);
+                        press(Action::confirm);
+                        return;
+                    }
+                    const ui::KeyboardKey & key = rows[(size_t) r][(size_t) k];
+                    switch (key.kind) {
+                        case ui::KeyKind::character: {
+                            const bool          has_shift = !key.shifted.empty() && key.shifted != key.text;
+                            const bool          cap       = has_shift && prompt_.keyboard.shift() != ui::KeyboardShift::off;
+                            const std::string & val       = cap ? key.shifted : key.text;
+                            if (prompt_.field.insert(std::string_view(val))) {
+                                prompt_.field.set_error("");
+                                prompt_.keyboard.set_length(prompt_.field.length());
+                                feedback.play(Cue::type);
+                            } else {
+                                feedback.play(Cue::error);
+                            }
+                            if (has_shift && prompt_.keyboard.shift() == ui::KeyboardShift::once) {
+                                prompt_.keyboard.set_shift(ui::KeyboardShift::off);
+                            }
+                            break;
+                        }
+                        case ui::KeyKind::space:
+                            if (prompt_.field.insert(' ', feedback) == ui::Event::changed) {
+                                prompt_.field.set_error("");
+                                prompt_.keyboard.set_length(prompt_.field.length());
+                            }
+                            break;
+                        case ui::KeyKind::backspace:
+                            if (prompt_.field.backspace(feedback) == ui::Event::changed) {
+                                prompt_.field.set_error("");
+                                prompt_.keyboard.set_length(prompt_.field.length());
+                            }
+                            break;
+                        case ui::KeyKind::shift: prompt_.keyboard.toggle_shift(feedback); break;
+                        case ui::KeyKind::layout: prompt_.keyboard.cycle_layout(feedback); break;
+                        case ui::KeyKind::done: {
+                            TextInput sub;
+                            sub.submit = true;
+                            update_prompt_text(sub, feedback);
+                            break;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    if (picker_ && page_ == kSettingsPage) {
+        // Mirrors draw_picker() dropdown geometry and row pitch.
+        const auto  all   = choices_of(settings_, kCategories[setting_category_].rows[setting_row_].id, live_.models,
+                                       live_.drives);
+        const int   n     = (int) all.size();
+        const int   shown = std::min(n, 7);
+        const float pitch = 64.0f;
+        const float w     = 700.0f;
+        const float h     = (float) shown * pitch + 24.0f;
+        const float below = kListY + kRowPitch * (float) setting_row_ + kRowH + 8.0f;
+        const Rect  r{ kRight - w, std::min(below, kDockY - 24.0f - h), w, h };
+
+        if (pointer.wheel != 0 && n > 0) {
+            const int next = std::clamp(picker_cursor_ + (pointer.wheel > 0 ? -1 : 1), 0, n - 1);
+            if (next != picker_cursor_) {
+                picker_cursor_ = next;
+                feedback.play(Cue::focus);
+            }
+        }
+        if (pointer.left_pressed) {
+            // Mirrors draw_hints() bar geometry.
+            const auto items = current_hints();
+            if (!items.empty()) {
+                std::vector<ui::Hint> raw;
+                raw.reserve(items.size());
+                for (const ActionHint & it : items) {
+                    raw.push_back(it.hint);
+                }
+                ui::HintLayout layout;
+                layout.size      = 32.0f;
+                layout.text_size = 20.0f;
+                layout.cy        = 1018.0f;
+                layout.item_gap  = 36.0f;
+                const int hit    = hit_action_hints(px, py, raw.data(), (int) raw.size(), kRight, layout);
+                if (hit >= 0 && items[(size_t) hit].action != Action::count) {
+                    press(items[(size_t) hit].action);
+                    return;
+                }
+            }
+            if (!in_rect(px, py, r)) {
+                press(Action::back);
+                return;
+            }
+        }
+        const int first = std::clamp(picker_cursor_ - shown / 2, 0, std::max(0, n - shown));
+        for (int i = first; i < first + shown; ++i) {
+            const float y   = r.y + 12.0f + pitch * (float) (i - first);
+            const Rect  row = { r.x + 10.0f, y, r.w - 20.0f, pitch };
+            if (!in_rect(px, py, row)) {
+                continue;
+            }
+            if (pointer.moved && picker_cursor_ != i &&
+                std::clamp(i - shown / 2, 0, std::max(0, n - shown)) == first) {
+                picker_cursor_ = i;
+                feedback.play(Cue::focus);
+            }
+            if (pointer.left_pressed) {
+                picker_cursor_ = i;
+                press(Action::confirm);
+            }
+            return;
+        }
+        return;
+    }
+
+    if (page_ == kSettingsPage && report_dialog_) {
+        if (!pointer.left_pressed) {
+            return;
+        }
+        // Mirrors draw_report_dialog() rect and action hints.
+        const Rect r{ 960.0f - 560.0f, 540.0f - 330.0f, 1120.0f, 660.0f };
+        if (!in_rect(px, py, r)) {
+            press(Action::back);
+            return;
+        }
+        ui::HintLayout layout;
+        layout.size      = 32.0f;
+        layout.text_size = 22.0f;
+        layout.cy        = r.y + r.h - 56.0f;
+        const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Create the report" } };
+        const int      hit = hit_action_hints(px, py, h, 2, r.x + r.w - 56.0f, layout);
+        if (hit == 0) press(Action::back);
+        else if (hit == 1) press(Action::confirm);
+        return;
+    }
+
+    if (page_ == kModelsPage && (market_confirm_ || market_space_)) {
+        if (!pointer.left_pressed) {
+            return;
+        }
+        // Mirrors draw_dialogs() rect and action hints.
+        const Rect r{ 960.0f - 440.0f, 540.0f - 170.0f, 880.0f, 340.0f };
+        if (!in_rect(px, py, r)) {
+            press(Action::back);
+            return;
+        }
+        ui::HintLayout layout;
+        layout.size      = 32.0f;
+        layout.text_size = 22.0f;
+        layout.cy        = r.y + r.h - 56.0f;
+        if (market_confirm_) {
+            const ui::Hint h[] = { { ui::Button::circle, "Cancel" },
+                                   { ui::Button::cross, "Keep it loaded" },
+                                   { ui::Button::triangle, "Unload and download" } };
+            const int      hit = hit_action_hints(px, py, h, 3, r.x + r.w - 56.0f, layout);
+            if (hit == 0) press(Action::back);
+            else if (hit == 1) press(Action::confirm);
+            else if (hit == 2) press(Action::north);
+        } else {
+            const ui::Hint h[] = { { ui::Button::circle, "Cancel" }, { ui::Button::cross, "Save it there" } };
+            const int      hit = hit_action_hints(px, py, h, market_dir_.empty() ? 1 : 2, r.x + r.w - 56.0f, layout);
+            if (hit == 0) press(Action::back);
+            else if (hit == 1 && !market_dir_.empty()) press(Action::confirm);
+        }
+        return;
+    }
+
+    // Dock page switcher along the bottom bar (mirrors draw_dock() tab pitch and bounds).
+    if (pointer.left_pressed && py >= kDockY) {
+        constexpr float pitch = 168.0f;
+        for (int i = 0; i < kPages; ++i) {
+            const float cx = kLeft + 44.0f + pitch * (float) i;
+            const Rect  tab{ cx - 72.0f, kDockY + 4.0f, 144.0f, 1080.0f - kDockY - 4.0f };
+            if (in_rect(px, py, tab)) {
+                if (i != page_) {
+                    go_to(i, &feedback);
+                }
+                return;
+            }
+        }
+    }
+
+    if (pointer.left_pressed) {
+        // Mirrors draw_hints() bar geometry.
+        const auto items = current_hints();
+        if (!items.empty()) {
+            std::vector<ui::Hint> raw;
+            raw.reserve(items.size());
+            for (const ActionHint & it : items) {
+                raw.push_back(it.hint);
+            }
+            ui::HintLayout layout;
+            layout.size      = 32.0f;
+            layout.text_size = 20.0f;
+            layout.cy        = 1018.0f;
+            layout.item_gap  = 36.0f;
+            const int hit    = hit_action_hints(px, py, raw.data(), (int) raw.size(), kRight, layout);
+            if (hit >= 0) {
+                if (items[(size_t) hit].action != Action::count) {
+                    press(items[(size_t) hit].action);
+                }
+                return;
+            }
+        }
+    }
+
+    if (page_ == kHomePage) {
+        if (!pointer.left_pressed) {
+            return;
+        }
+        // Mirrors draw_home() right-column card bounds.
+        const bool serving = live_.state == ServerState::ready || live_.state == ServerState::generating;
+        if (serving && in_rect(px, py, { 1056.0f, 196.0f, kRight - 1056.0f, 728.0f })) {
+            press(Action::north);
+        }
+        return;
+    }
+
+    if (page_ == kModelsPage) {
+        // Mirrors draw_models() section rail.
+        for (int i = 0; i < kSections; ++i) {
+            const Rect sec{ kLeft - 20.0f, kListY + kRailPitch * (float) i, kRailW, kRailH };
+            if (pointer.left_pressed && in_rect(px, py, sec)) {
+                section_      = i;
+                in_list_      = true;
+                dl_confirm_   = -1;
+                market_files_ = false;
+                feedback.play(Cue::select);
+                if (section_ == kSearch && !market_searched_) {
+                    market_searched_ = true;
+                    request_         = { Request::market_search, "" };
+                }
+                return;
+            }
+        }
+
+        // Mirrors draw_market() filter chips row.
+        const Rect area{ kListX, kListY, kRight - kListX, kDockY - 40.0f - kListY };
+        if (section_ == kSearch && pointer.left_pressed && py >= area.y && py < area.y + 56.0f) {
+            float x = area.x + 28.0f;
+            for (int i = 0; i < kMarketChipCount; ++i) {
+                const float w = fonts_.regular.measure(kMarketChips[i], 22.0f);
+                if (px >= x - 12.0f && px <= x + w + 12.0f) {
+                    market_chip_     = i;
+                    market_repo_     = 0;
+                    market_files_    = false;
+                    market_searched_ = true;
+                    request_         = { Request::market_search, i == 0 ? std::string() : std::string(kMarketChips[i]) };
+                    feedback.play(Cue::tab);
+                    return;
+                }
+                x += w + 36.0f;
+            }
+        }
+
+        const int repos = (int) market_.repos.size();
+        const MarketRepo * open = market_.open >= 0 && market_.open < repos ? &market_.repos[(size_t) market_.open] : nullptr;
+        int * cursor = section_ == kLocal     ? &local_cursor_
+                     : section_ == kSuggested ? &suggested_cursor_
+                     : section_ == kDownloads ? &dl_cursor_
+                     : market_files_          ? &market_file_
+                                              : &market_repo_;
+        const int count = section_ == kLocal     ? (int) live_.models.size()
+                        : section_ == kSuggested ? kSuggestionCount
+                        : section_ == kDownloads ? (int) market_.downloads.size()
+                        : market_files_          ? (open ? (int) open->files.size() : 0)
+                                                 : repos;
+        if (count <= 0) {
+            return;
+        }
+        *cursor = std::clamp(*cursor, 0, count - 1);
+
+        if (pointer.wheel != 0 && (in_rect(px, py, area) || in_list_)) {
+            const int next = std::clamp(*cursor + (pointer.wheel > 0 ? -1 : 1), 0, count - 1);
+            if (next != *cursor) {
+                *cursor     = next;
+                in_list_    = true;
+                dl_confirm_ = -1;
+                feedback.play(Cue::focus);
+                if (section_ == kSearch && market_files_) {
+                    request_ = { Request::market_plan, "", market_.open, *cursor };
+                }
+            }
+        }
+
+        // Mirrors draw_local(), draw_suggested(), draw_market(), and draw_downloads() list rows.
+        const float top   = area.y + (section_ == kSearch ? 72.0f : 0.0f);
+        const int   first = first_visible(*cursor, count);
+        for (int i = first; i < std::min(count, first + kVisibleRows); ++i) {
+            const Rect row{ area.x, top + kRowPitch * (float) (i - first), area.w, kRowH };
+            if (!in_rect(px, py, row)) {
+                continue;
+            }
+            if (pointer.moved && (*cursor != i || !in_list_) && first_visible(i, count) == first) {
+                in_list_    = true;
+                *cursor     = i;
+                dl_confirm_ = -1;
+                feedback.play(Cue::focus);
+                if (section_ == kSearch && market_files_) {
+                    request_ = { Request::market_plan, "", market_.open, i };
+                }
+            }
+            if (pointer.left_pressed) {
+                in_list_ = true;
+                *cursor  = i;
+                press(Action::confirm);
+            } else if (pointer.middle_pressed &&
+                       ((section_ == kSearch && market_files_) || section_ == kDownloads)) {
+                in_list_ = true;
+                *cursor  = i;
+                press(Action::west);
+            }
+            return;
+        }
+        return;
+    }
+
+    if (page_ == kConsolePage) {
+        // Mirrors draw_console() time-range tabs.
+        if (pointer.left_pressed && py >= kTitleY - 38.0f && py <= kTitleY + 18.0f) {
+            const char * ranges[] = { "Last 2 minutes", "Last hour" };
+            float        rx       = 1224.0f;
+            for (int i = 1; i >= 0; --i) {
+                const float w = fonts_.regular.measure(ranges[i], 22.0f);
+                rx -= w;
+                if (px >= rx - 12.0f && px <= rx + w + 12.0f) {
+                    if ((i == 1) != console_hour_) {
+                        console_hour_ = (i == 1);
+                        feedback.play(Cue::tab);
+                    }
+                    return;
+                }
+                rx -= 40.0f;
+            }
+        }
+        return;
+    }
+
+    if (page_ == kSettingsPage) {
+        // Mirrors draw_settings() category rail.
+        for (int i = 0; i < kCategoryCount; ++i) {
+            const Rect cat{ kLeft - 20.0f, kListY + kRailPitch * (float) i, kRailW, kRailH };
+            if (pointer.left_pressed && in_rect(px, py, cat)) {
+                setting_category_ = i;
+                setting_row_      = 0;
+                log_scroll_       = 0;
+                in_rows_          = true;
+                feedback.play(Cue::select);
+                return;
+            }
+        }
+        const Rect area{ kListX, kListY, kRight - kListX, kDockY - 40.0f - kListY };
+        if (setting_category_ == kDiagnostics) {
+            // Mirrors draw_logs() tab strip and Errors-only toggle.
+            if (pointer.left_pressed && py >= area.y + 8.0f && py <= area.y + 62.0f) {
+                const char * tabs[] = { "App", "Server" };
+                float        x      = area.x + 28.0f;
+                for (int i = 0; i < 2; ++i) {
+                    const float w = fonts_.regular.measure(tabs[i], 24.0f);
+                    if (px >= x - 12.0f && px <= x + w + 12.0f) {
+                        in_rows_ = true;
+                        if (log_llama_ != (i == 1)) {
+                            log_llama_  = (i == 1);
+                            log_scroll_ = 0;
+                            feedback.play(Cue::tab);
+                        }
+                        return;
+                    }
+                    x += w + 36.0f;
+                }
+                if (px >= area.x + area.w - 300.0f && px <= area.x + area.w) {
+                    in_rows_    = true;
+                    log_errors_ = !log_errors_;
+                    refilter_logs();
+                    log_scroll_ = 0;
+                    feedback.play(Cue::toggle);
+                    return;
+                }
+            }
+            if (pointer.wheel != 0 && in_rect(px, py, area)) {
+                const int most = std::max(0, (int) log_view().size() - kLogLines);
+                const int next = std::clamp(log_scroll_ + (pointer.wheel > 0 ? 3 : -3), 0, most);
+                if (next != log_scroll_) {
+                    in_rows_    = true;
+                    log_scroll_ = next;
+                    feedback.play(Cue::focus);
+                }
+            }
+            return;
+        }
+
+        // Mirrors draw_settings() row list.
+        const SettingCategory & c = kCategories[setting_category_];
+        for (int i = 0; i < c.count; ++i) {
+            const Rect row{ kListX, kListY + kRowPitch * (float) i, kRight - kListX, kRowH };
+            if (!in_rect(px, py, row)) {
+                continue;
+            }
+            if (pointer.moved && (!in_rows_ || setting_row_ != i)) {
+                in_rows_     = true;
+                setting_row_ = i;
+                feedback.play(Cue::focus);
+            }
+            if (pointer.left_pressed) {
+                in_rows_     = true;
+                setting_row_ = i;
+                press(Action::confirm);
+            }
+            return;
+        }
+    }
+}
+
+void Dashboard::draw_cursor(gfx::DrawList & l) const {
+    const float x = pointer_.x;
+    const float y = pointer_.y;
+    const float shadow[] = {
+        x + 2.0f, y + 3.0f,
+        x + 2.0f, y + 25.0f,
+        x + 7.5f, y + 20.0f,
+        x + 12.0f, y + 29.0f,
+        x + 15.0f, y + 27.5f,
+        x + 10.5f, y + 18.5f,
+        x + 18.0f, y + 18.5f,
+    };
+    const float body[] = {
+        x, y,
+        x, y + 22.0f,
+        x + 5.5f, y + 17.0f,
+        x + 10.0f, y + 26.0f,
+        x + 13.0f, y + 24.5f,
+        x + 8.5f, y + 15.5f,
+        x + 16.0f, y + 15.5f,
+    };
+    l.polygon(shadow, 7, kBlack.with_alpha(0.45f));
+    const Color rim = kBlack.with_alpha(0.9f);
+    for (int i = 0; i < 7; ++i) {
+        const int j = (i + 1) % 7;
+        l.line(body[i * 2], body[i * 2 + 1], body[j * 2], body[j * 2 + 1], 2.5f, rim);
+    }
+    l.polygon(body, 7, kInk);
 }
 
 }  // namespace ps5lm
