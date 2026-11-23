@@ -102,7 +102,7 @@ constexpr SettingCategory kCategories[] = {
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
         { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
-        { Setting::disk_cache, "Disk cache spillover", "Save prompt cache to SSD so switched chats stay fast without using RAM" },
+        { Setting::disk_cache, "Disk cache spillover", "Spill prompt cache to SSD and expand context when VRAM is tight" },
         { Setting::disk_cache_mib, "Disk cache limit", "SSD space reserved for saved prompt cache files (2 GB - 32 GB)" } },
       4 },
     { "Chat",
@@ -499,9 +499,9 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
         case Setting::disk_cache: {
             const char * labels[] = { "Off", "Auto (when near full)", "Always on" };
             const char * notes[] = {
-                "RAM only; disables prompt cache spillover to SSD",
-                "Enable --cache-disk when headroom is under 0.75 GB",
-                "Always keep --cache-disk enabled on SSD"
+                "RAM only; disables SSD prompt spillover and tight context expansion",
+                "Enable --cache-disk & tight context expansion when headroom is < 0.75 GB",
+                "Always enable --cache-disk & aggressive q4_0 context expansion"
             };
             for (int i = 0; i < 3; ++i) {
                 const std::string mode = kDiskCacheSteps[i];
