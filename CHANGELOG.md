@@ -275,6 +275,13 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **The planner counts only a hybrid model's attention layers as KV cache** (#107). Files that
+  list `attention.head_count_kv` per layer (Nemotron-H, Granite 4 hybrid, LFM2, Jamba) give a
+  cache only to the layers where it is not zero, and the recurrent state to the layers llama.cpp
+  makes recurrent: those without KV heads, and on Nemotron-H also without a feed-forward. Before,
+  every layer counted as attention: Nemotron Nano 9B v2 (56 layers, 4 attention) got a 64k `q4_0`
+  cache planned at about 3.9 GiB and no Mamba state. Now it is 64k `q8_0`, 0.53 GiB of cache and
+  0.14 GiB of state. Pure Mamba files now count their state, and Falcon-H1 both.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the

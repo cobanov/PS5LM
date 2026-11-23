@@ -29,6 +29,7 @@ struct ModelInfo {
     uint32_t    key_length      = 0;   // per KV head
     uint32_t    value_length    = 0;
     uint32_t    full_attn_every = 1;   // 1: every layer is attention
+    uint32_t    n_attn_layers   = 0;   // layers with a KV cache, when the file lists them per layer; 0: by full_attn_every
     uint32_t    n_swa_layers    = 0;   // attention layers that keep only a sliding window
     uint32_t    swa_window      = 0;   // that window, in tokens
     uint32_t    n_ctx_train     = 0;
@@ -41,7 +42,9 @@ struct ModelInfo {
     bool        ok              = false;
     std::string error;
 
-    uint32_t n_kv_layers() const { return full_attn_every > 1 ? n_layer / full_attn_every : n_layer; }
+    uint32_t n_kv_layers() const {
+        return n_attn_layers ? n_attn_layers : full_attn_every > 1 ? n_layer / full_attn_every : n_layer;
+    }
 };
 
 // Reads the metadata of a GGUF file (not its tensors).
