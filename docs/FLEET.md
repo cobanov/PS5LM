@@ -703,28 +703,47 @@ slow as sampling on the host.
 
 ### Inkling 2 Mini
 
-Not yet run on a console. What is known, from llama.cpp b12600's source and
-from an untrained `inkling2` fixture (`test-llama-archs -a inkling2 -o DIR`) on
-a host build with one CPU RPC worker:
+Runs on a console since llama.cpp d2bceda3d (measured on one PS5 on 11.60,
+2026-11-23; all layers on the console, `q4_0` cache, flash attention,
+`--backend-sampling`).
 
 - The file to use is `Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file` of
-  `unsloth/Inkling-2-Mini-GGUF` (architecture `inkling2_loop`). The file at
-  the repository's root (`inkling2`, with other tensors) is for Unsloth's fork
-  and does not load. `patches/0019` is needed for this file.
-- The fixture loads on the worker, and gives the tokens and logprobs of the
-  run without RPC, with a `q4_0` cache, flash attention and
-  `--backend-sampling`.
+  `unsloth/Inkling-2-Mini-GGUF` (architecture `inkling2_loop`, 9.1 GB;
+  8,469 MiB of weights on the console). The file at the repository's root
+  (`inkling2`) is for Unsloth's fork and does not load.
+- At llama.cpp b12600, the first commit that knows the architecture, it loaded
+  and wrote word salad: it needs ggml-org/llama.cpp 32704 and 32669 (the
+  experts' scales), 32735 (ggml-vulkan's SCALE on a non-contiguous input) and
+  32799 (the tokenizer), which d2bceda3d has.
+- Chat, reasoning (`thinking_budget_tokens`, `reasoning_effort`) and tool calls
+  work through llama-server's own Inkling parser. It writes about 18 tokens a
+  second on a short prompt and 13 at 105K.
+- **The batch size decides the context.** The cache costs 8.8 MiB per 1,000
+  tokens (only 8 of its 48 layer passes keep the whole context; the others
+  keep a 1,024-token window), but each layer's attention bias and mask are
+  made per head for every cell of the context, so the compute buffer is about
+  0.19 MiB x thousands of tokens x `--ubatch-size`: 2,670 MiB at 108,544 x
+  128, 535 MiB at 352,256 x 8. With 12.19 GiB:
+
+  | `--ubatch-size` | Largest context that leaves the usual margin |
+  |---|---|
+  | 128 | 108,544 |
+  | 64 | 172,032 |
+  | 32 | 245,760 |
+  | 16 | 307,200 |
+  | 8 | 352,256 |
+
+  `llama-fit-params` gives the exact buffers for a pair without loading
+  anything. Reading starts at 60 to 100 tokens a second at any of these
+  batch sizes and falls with depth (46 at 105K): every token read or written
+  uploads 6 bytes per cell of the context (the mask and the relative
+  positions are made on the host; `patches/0012` does not cover attention
+  with relative positions).
 - **Its state cannot be parked on the worker** (`save` answers 501
-  `park_unsupported`): its memory is two attention caches, one for the
-  sliding-window layers, and a recurrent state, and `patches/0015` knows the
-  plain, the hybrid and the recurrent memory only. A server for it runs
-  without `--slot-park-path`.
-- Its attention mask and the relative positions (an `[n_kv, n_tokens]` I32
-  tensor for each of the two caches) are uploaded with every batch: attention
-  with relative positions makes a dense mask itself, which `patches/0012` does
-  not replace. That is 6 bytes for each cell and token of the full-attention
-  cache: about 750 KiB per 128-token batch for every 1,000 tokens of context,
-  75 MiB a batch at 100K. The window cache stays small.
+  `park_unsupported`): its memory is two attention caches and a recurrent
+  state, and `patches/0015` knows the plain, the hybrid and the recurrent
+  memory only. A server for it runs without `--slot-park-path`, and a
+  restart reads its context again.
 - `fleet serve` has not been taught the architecture's caches; start
   llama-server directly.
 

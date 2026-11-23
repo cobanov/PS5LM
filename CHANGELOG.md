@@ -152,14 +152,16 @@ v0.1.x are the upstream payload releases by cobanov.
   (the system's default is 448 MiB), so the direct pool, where models go, is
   12.1875 GiB instead of 12. It applies when the app starts from the home screen,
   not when it restarts for a model.
-- **llama.cpp moves to b12600** (29b52d398, 2026-11-20), 775 commits on from b11827, for
-- **llama.cpp moves to d2bceda3d** (39 commits after b12602, 2026-11-22), 816 commits on from b11827, for
-  Inkling 2 Mini: its `inkling2_loop` architecture came with that commit
-  (ggml-org/llama.cpp 32694), and it reads correctly on a console only from 32669, 32735 and 32799 on. **Not yet
-  built into a release or run on a console**.
+- **llama.cpp moves to d2bceda3d** (39 commits after b12602, 2026-11-22), 816 commits on from
+  b11827, for Inkling 2 Mini (`inkling2_loop`, ggml-org/llama.cpp 32694, and the fixes it needed on
+  a console: 32669, 32704, 32735, 32799). Proven on one PS5 with Qwen3.8-27B at 1 x 155,648 against
+  the build before it (same loads, parked conversations restored identically, writing 19.1 tokens a
+  second where it was 18.6, memory no lower), and Inkling 2 Mini runs on the console
+  ([FLEET.md](docs/FLEET.md#inkling-2-mini)).
   - A host and a worker must both be on this pin. llama.cpp's RPC protocol went from 8 to
-    10 and a handshake between the two refuses, so a console keeps its old app until the
-    host is changed with it.
+    10 and a handshake between the two refuses, so a console and its host change together.
+  - Replies are not token for token what the old pin wrote: the same prompt diverges after a few
+    dozen tokens, greedy included (new attention kernels in ggml-vulkan).
   - `patches/0011` (the KV cache's rotation matrices kept on its device) is gone: llama.cpp
     does it itself (31073). `tests/server_kv_rotation_test.py` stays and holds llama.cpp to
     it.
@@ -170,22 +172,21 @@ v0.1.x are the upstream payload releases by cobanov.
   - The worker's handshake bits moved: llama.cpp took the byte they were in for flags of
     its own, counted up from bit 0, so graph-free (`patches/fleet/0006`) is bit 6 and
     parking (`patches/fleet/0009`) bit 7.
+  - `GGML_RPC_GRAPH_KEEP` (host, `patches/fleet/0006`): how many graphs the host leaves on a
+    worker for reuse, 8 by default. On this llama.cpp a 27B model's graph costs a console about
+    6.5 MiB (it was 4): with 8 a console at 1 x 155,648 settled at 41 MiB of free pool where it
+    had 61, with 1 it keeps 72 or more, at the same speed. A host that serves one slot should
+    set 1.
   - `patches/fleet/0010`, new: an RPC device no longer claims flash attention over K/V
     rows, which llama.cpp now uses for a unified KV cache when a device says it can. The
     RPC device said yes for every op without asking its worker, and ggml-vulkan has no
     such kernel, so a console would have been sent an op it cannot run.
     `GGML_RPC_KV_ROWS=1` on the host offers it again.
-  - `patches/0019`, new, carries ggml-org/llama.cpp 32704 (open, not merged): without it
-    the looped layers of `inkling2_loop` run their second and third pass without the
-    experts' scales. To be dropped when a pin has it.
   - The other patches are re-based; `0016`, `fleet/0005`, `fleet/0007` and `fleet/0009`
     with small changes for llama.cpp's reference-counted checkpoints and its new RPC
     send path. `--defrag-thold` is gone from llama-server.
-  - Known limits for Inkling 2 Mini, from reading the code and from an untrained
-    `inkling2_loop` fixture over a CPU worker ([FLEET.md](docs/FLEET.md#inkling-2-mini)):
-    its memory (two attention caches and a recurrent state) cannot be parked on the
-    worker yet, and its attention mask and relative positions are still uploaded with
-    every batch.
+  - Limits for Inkling 2 Mini: its state cannot be parked on the worker yet, and its context is
+    bounded by the batch size (108K at `--ubatch-size 128`, 352K at 8).
 - **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
   (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
   scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
