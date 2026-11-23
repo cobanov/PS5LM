@@ -232,6 +232,15 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **A streamed reply leaves its keep-alive connection open.** llama-server's chunk provider
+  called `done()` and then returned false, and cpp-httplib counted that as a cancelled response:
+  it closed the connection right after one that advertised `Keep-Alive`. A client that reused it
+  at once got a disconnect; Open WebUI agent chats stopped after their first tool call with
+  "Server Connection Error". `patches/0023` returns true once the body is complete; a failed
+  final write still fails. With the same end handled in cpp-httplib instead (memfix8), a 45+
+  tool-call Open WebUI agent turn ran on the console without a disconnect. `tests/server_stream_keepalive_test.py` sends two streams and a plain request over
+  one connection on chat, messages, responses and completion. From @MCsumz's fork,
+  [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix) (#98).
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the

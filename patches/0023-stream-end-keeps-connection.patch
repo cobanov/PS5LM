@@ -1,0 +1,17 @@
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index 8017afe..f5e3eb7 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -688,7 +688,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
+                 sink.done();
+                 SRV_DBG("%s", "http: stream ended\n");
+             }
+-            return has_next;
++            // PS5LM: after done() the body is complete. Returning false here made cpp-httplib count
++            // the response as cancelled and close the connection right after "Keep-Alive", so a
++            // client that reused it at once (Open WebUI's tool-call continuation) got a disconnect.
++            // A failed write of the end still fails: cpp-httplib checks it before this result.
++            return true;
+         };
+         const auto on_complete = [request = q_ptr, response = r_ptr, activity](bool) mutable {
+             if (activity >= 0 && ps5lm_activity_end) {
