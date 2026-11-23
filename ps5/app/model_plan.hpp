@@ -34,6 +34,8 @@ struct ModelInfo {
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
+    uint32_t    n_embd          = 0;   // embedding_length: the width a projector must feed
+    uint32_t    projection_dim  = 0;   // a projector's output width (clip.vision/audio.projection_dim), 0: unknown
     std::string mmproj;                // a vision projector beside the model, or empty
     uint64_t    mmproj_bytes    = 0;
     std::string projector_type;        // clip.projector_type: the projector's own, or the paired one's
@@ -49,8 +51,10 @@ struct ModelInfo {
 // Fetch enough to hold the metadata (16 MiB covers large vocabularies).
 ModelInfo read_model_header(const std::string & name, const std::string & head, uint64_t file_bytes);
 
-// The vision projector ("mmproj") beside a model, or empty.
-std::string find_mmproj(const std::string & model_path);
+// The vision projector ("mmproj") beside a model, or empty. With the model's
+// width (n_embd), a projector whose header gives another output width is passed
+// over for the next-best name.
+std::string find_mmproj(const std::string & model_path, uint32_t n_embd = 0);
 
 ModelInfo read_model_info(const std::string & path);
 

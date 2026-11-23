@@ -232,6 +232,15 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **A model gets only a vision projector that fits it** (#106). Projectors were paired by name
+  alone, and "qwen3" was enough: with `Qwen3.5-9B.mmproj-Q8_0.gguf` in the folder, every Qwen got
+  it. Qwen 3.8 27B (5120 wide) then planned with a 4096-wide projector and "needs 11.6 GiB with a
+  4k context", so it did not fit at all, and Qwen 3.5 0.8B (1024) was planned with images its
+  projector could not feed. Now a projector whose header gives an output width
+  (`clip.vision.projection_dim` or `clip.audio.projection_dim`) other than the model's
+  `embedding_length` is passed over for the next-best name, and without one the model runs text
+  only. A projector without the key is paired by its name, as before.
+  `ps5/app/model_plan_test.cpp` covers the three cases.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the
