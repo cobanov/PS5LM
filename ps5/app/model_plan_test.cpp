@@ -35,6 +35,14 @@ struct Gguf {
         n++;
         return *this;
     }
+    Gguf & kv(const std::string & k, const std::vector<uint32_t> & v) {  // a uint32 array
+        kvs += str(k) + raw<uint32_t>(9) + raw<uint32_t>(4) + raw<uint64_t>(v.size());
+        for (uint32_t x : v) {
+            kvs += raw(x);
+        }
+        n++;
+        return *this;
+    }
     // magic, version 3, tensor count, metadata count, metadata
     std::string bytes() const { return "GGUF" + raw<uint32_t>(3) + raw<uint64_t>(0) + raw(n) + kvs; }
 };
@@ -73,6 +81,77 @@ int main(int argc, char ** argv) {
     assert(c.ok && c.decision.empty() && ps5lm::find_preset(c));
     const ps5lm::Plan cp = ps5lm::plan_model(c, budget);
     assert(cp.fits && cp.ctx > 4096 && has_args(cp, "-ub", "64"));
+
+    // Inkling 2 Mini (inkling2_loop): layers 6 to 17 run three times, each pass
+    // with its own cache slot, so 48 slots: the full-attention layers 5 and 23
+    // once, 11 and 17 three times (8), and 40 window layers.
+    Gguf ink;
+    std::vector<bool> ink_swa(24, true);
+    for (int il : { 5, 11, 17, 23 }) {
+        ink_swa[il] = false;
+    }
+    ink.kv("general.architecture", "inkling2_loop").kv("general.name", "Inkling-2-Mini")
+        .kv("inkling2_loop.block_count", 24u).kv("inkling2_loop.attention.head_count", 24u)
+        .kv("inkling2_loop.attention.head_count_kv", 8u).kv("inkling2_loop.embedding_length", 2304u)
+        .kv("inkling2_loop.attention.key_length", 128u).kv("inkling2_loop.attention.value_length", 128u)
+        .kv("inkling2_loop.context_length", 1048576u).kv("inkling2_loop.expert_count", 128u)
+        .kv("inkling2_loop.attention.sliding_window", 1024u)
+        .kv("inkling2_loop.attention.sliding_window_pattern", ink_swa)
+        .kv("inkling2_loop.loop.count", 3u).kv("inkling2_loop.loop.start", 6u).kv("inkling2_loop.loop.end", 18u);
+    const ps5lm::ModelInfo ik = ps5lm::read_model_header("Inkling-2-Mini-UD-Q2_K_XL.gguf", ink.bytes(), 9141428384ull);
+    assert(ik.ok && ik.n_layer == 48 && ik.n_kv_layers() == 48 && ik.n_swa_layers == 40);
+    const ps5lm::Preset * ikp = ps5lm::find_preset(ik);
+    assert(ikp && std::string(ikp->label) == "Inkling 2");
+    const ps5lm::Plan ikplan = ps5lm::plan_model(ik, budget);
+    assert(ikplan.fits && ikplan.ctx >= 32768 && ikplan.total_gib <= budget);
+
+    // Nemotron Nano 9B v2 (nemotron_h): head_count_kv and feed_forward_length per
+    // layer. Only the 4 layers with KV heads keep a cache; the 27 with neither
+    // KV heads nor a feed-forward are Mamba and keep a state; the 25 MLP layers
+    // keep nothing. Counting all 56 as attention planned 3.9 GiB of q4_0 cache
+    // at 64k where q8_0 needs 0.53 GiB (issue #107).
+    {
+        const std::string layout = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-";
+        std::vector<uint32_t> nh_kv, nh_ff;
+        for (char c : layout) {
+            nh_kv.push_back(c == '*' ? 8u : 0u);
+            nh_ff.push_back(c == '-' ? 15680u : 0u);
+        }
+        Gguf nh;
+        nh.kv("general.architecture", "nemotron_h").kv("general.name", "NVIDIA-Nemotron-Nano-9B-v2")
+            .kv("nemotron_h.block_count", 56u).kv("nemotron_h.attention.head_count", 40u)
+            .kv("nemotron_h.attention.head_count_kv", nh_kv).kv("nemotron_h.feed_forward_length", nh_ff)
+            .kv("nemotron_h.embedding_length", 4480u).kv("nemotron_h.attention.key_length", 128u)
+            .kv("nemotron_h.attention.value_length", 128u).kv("nemotron_h.context_length", 131072u)
+            .kv("nemotron_h.ssm.inner_size", 10240u).kv("nemotron_h.ssm.state_size", 128u)
+            .kv("nemotron_h.ssm.group_count", 8u).kv("nemotron_h.ssm.conv_kernel", 4u);
+        const ps5lm::ModelInfo nm =
+            ps5lm::read_model_header("NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf", nh.bytes(), 6525153760ull);
+        assert(nm.ok && nm.n_layer == 56 && nm.n_kv_layers() == 4 && nm.n_head_kv == 8);
+        assert(nm.state_bytes == 27ull * (10240 * 128 + 3 * (10240 + 2 * 8 * 128)) * 4);
+        const double kv64 = ps5lm::kv_bytes_per_token(nm, "q8_0") * 65536 / (1024.0 * 1024 * 1024);
+        assert(kv64 > 0.52 && kv64 < 0.54);
+        const ps5lm::Plan np = ps5lm::plan_model(nm, budget);
+        assert(np.fits && np.ctx == 65536 && np.kv_type != "q4_0");
+    }
+
+    // Granite 4 hybrid and LFM2 also list head_count_kv per layer, without a
+    // feed-forward rule: every layer without KV heads is recurrent.
+    {
+        std::vector<uint32_t> g_kv(40, 0u);
+        for (int il : { 5, 15, 25, 35 }) {
+            g_kv[il] = 8u;
+        }
+        Gguf g;
+        g.kv("general.architecture", "granitehybrid").kv("granitehybrid.block_count", 40u)
+            .kv("granitehybrid.attention.head_count", 32u).kv("granitehybrid.attention.head_count_kv", g_kv)
+            .kv("granitehybrid.embedding_length", 4096u).kv("granitehybrid.feed_forward_length", 8192u)
+            .kv("granitehybrid.ssm.inner_size", 8192u).kv("granitehybrid.ssm.state_size", 128u)
+            .kv("granitehybrid.ssm.group_count", 1u).kv("granitehybrid.ssm.conv_kernel", 4u);
+        const ps5lm::ModelInfo gm = ps5lm::read_model_header("granite-4.0-h-small.gguf", g.bytes(), 4ull << 30);
+        assert(gm.ok && gm.n_kv_layers() == 4);
+        assert(gm.state_bytes == 36ull * (8192 * 128 + 3 * (8192 + 2 * 128)) * 4);
+    }
 
     // A larger prompt batch costs compute buffer, counted by the feed-forward width.
     Gguf wide_ff = chat;

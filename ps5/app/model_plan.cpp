@@ -171,6 +171,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
 
     std::map<std::string, uint64_t> ints;  // every scalar, and the largest element of numeric arrays
     std::map<std::string, uint64_t> sums;  // numeric arrays: the sum of their elements
+    std::map<std::string, std::vector<uint64_t>> arrs;  // numeric arrays, element by element
     std::map<std::string, std::string> strs;
     for (uint64_t i = 0; i < n_kv && !r.bad; i++) {
         const std::string key = r.str();
@@ -186,10 +187,12 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                 }
             } else if (n <= 4096) {  // per-layer values, such as head_count_kv
                 uint64_t mx = 0, sum = 0;
+                std::vector<uint64_t> & vals = arrs[key];
                 for (uint64_t j = 0; j < n; j++) {
                     const uint64_t v = read_int(r, et);
                     mx = std::max(mx, v);
                     sum += v;
+                    vals.push_back(v);
                 }
                 ints[key] = mx;
                 sums[key] = sum;
@@ -248,6 +251,37 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     // Sliding-window attention with its layers listed (true: a window layer),
     // as llama.cpp reads it. A pattern only in llama.cpp's code (Gemma) or a
     // single number is counted as full attention, which over-reserves.
+    // Which layers keep a KV cache and which a recurrent state, by llama.cpp's
+    // rule for the architecture. A per-layer head_count_kv (Nemotron-H, Granite
+    // 4 hybrid, LFM2, Jamba) gives a cache only to its non-zero layers; the
+    // others are recurrent, except on Nemotron-H, whose layers with a
+    // feed-forward keep neither. Nemotron Nano 9B v2 has 56 layers: 4
+    // attention, 25 feed-forward, 27 Mamba.
+    std::vector<uint8_t> is_kv(m.n_layer, 1), is_rec(m.n_layer, 0);
+    const auto hkv = arrs.find(a + "attention.head_count_kv");
+    const auto ffs = arrs.find(a + "feed_forward_length");
+    const bool nemotron_h = m.arch == "nemotron_h" || m.arch == "nemotron_h_moe";
+    for (uint32_t il = 0; il < m.n_layer; il++) {
+        if (hkv != arrs.end()) {
+            const bool attn = il >= hkv->second.size() || hkv->second[il] != 0;
+            const bool ff   = ffs == arrs.end() || il >= ffs->second.size() || ffs->second[il] != 0;
+            is_kv[il]  = attn;
+            is_rec[il] = !attn && !(nemotron_h && ff);
+        } else if (m.arch == "mamba" || m.arch == "mamba2") {
+            is_kv[il]  = 0;
+            is_rec[il] = 1;
+        } else if (m.arch == "falcon-h1") {  // attention and Mamba side by side in every layer
+            is_rec[il] = 1;
+        } else if (m.full_attn_every > 1) {  // Qwen 3.5/3.8: every n-th layer is attention
+            is_kv[il]  = (il + 1) % m.full_attn_every == 0;
+            is_rec[il] = !is_kv[il];
+        }
+    }
+    if (hkv != arrs.end()) {
+        m.n_attn_layers = (uint32_t) std::count(is_kv.begin(), is_kv.end(), 1);
+    }
+    uint64_t n_rec = std::count(is_rec.begin(), is_rec.end(), 1);
+
     const auto pattern = sums.find(a + "attention.sliding_window_pattern");
     if (pattern != sums.end() && num("attention.sliding_window")) {
         m.n_swa_layers = (uint32_t) std::min<uint64_t>(pattern->second, m.n_kv_layers());
@@ -255,12 +289,41 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     }
     m.n_expert        = (uint32_t) num("expert_count");
 
+    // A learned relative position bias (Inkling 2) is built per head for every
+    // cached token and ubatch token. ggml-vulkan's compute buffer grew by about
+    // 208 bytes for each (Inkling 2 Mini, -ub 64, q8_0 cache, all on the GPU):
+    // 226 MiB at 16k, 832 MiB at 64k, 1673 MiB at 128k.
+    if (num("attention.relative_extent")) {
+        m.bias_bytes = 208.0;
+    }
+
+    // Looped models (Inkling 2): the layers [loop.start, loop.end) run loop.count
+    // times a token, and llama.cpp gives every pass its own cache slot. Inkling 2
+    // Mini has 24 layers and 48 slots: 8 hold the whole context, 40 the window.
+    const uint64_t loop_count = num("loop.count"), loop_start = num("loop.start"), loop_end = num("loop.end");
+    if (loop_count > 1 && loop_start < loop_end && loop_end <= m.n_layer) {
+        const auto swa = arrs.find(a + "attention.sliding_window_pattern");
+        uint32_t n_slot = 0, n_kv = 0, n_swa = 0;
+        n_rec = 0;
+        for (uint32_t il = 0; il < m.n_layer; il++) {
+            const uint32_t passes = il >= loop_start && il < loop_end ? (uint32_t) loop_count : 1;
+            n_slot += passes;
+            n_kv   += is_kv[il] ? passes : 0;
+            n_rec  += is_rec[il] ? passes : 0;
+            if (m.swa_window && swa != arrs.end() && il < swa->second.size() && swa->second[il]) {
+                n_swa += passes;
+            }
+        }
+        m.n_layer       = n_slot;
+        m.n_attn_layers = m.n_attn_layers || m.full_attn_every > 1 ? n_kv : 0;
+        m.n_swa_layers  = m.swa_window ? std::min(n_swa, m.n_kv_layers()) : 0;
+    }
+
     // Recurrent layers (Gated DeltaNet, Mamba): a fixed f32 state each,
     // the recurrent matrix plus the convolution window.
     const uint64_t inner = num("ssm.inner_size"), state = num("ssm.state_size");
     if (inner && state) {
         const uint64_t groups = num("ssm.group_count", 1), conv = num("ssm.conv_kernel", 4);
-        const uint64_t n_rec  = m.n_layer - m.n_kv_layers();
         m.state_bytes = n_rec * (inner * state + (conv - 1) * (inner + 2 * groups * state)) * 4;
     }
     m.ok = m.n_layer > 0;
@@ -314,6 +377,9 @@ const std::vector<Preset> & presets() {
         // PrismML's model card (thinking mode); min_p 0.05 is not in the file.
         { "bonsai", "Bonsai 2", "Qwen 3.8 27B in ternary weights; Q2_0 is 7.1 GiB and keeps 64k with room to spare",
           { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05" }, 65536 },
+        // Thinking Machines' model card; the GGUF carries the same in general.sampling.*.
+        { "inkling", "Inkling 2", "26B MoE, 3.4B active, looped; UD-Q2_K_XL leaves room for a long context",
+          { "--temp", "1.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0" } },
         { "qwen3.8", "Qwen 3.8", "27B hybrid Gated DeltaNet; UD-Q2_K_XL holds 64k context on the GPU",
           { "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0" } },
         { "qwen3.6", "Qwen 3.6", "MoE 35B-A3B or dense 27B; the MoE decodes fastest",
@@ -410,7 +476,8 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             const uint32_t swa_tokens = std::min(ctx, (m.swa_window + p.ubatch + 255) / 256 * 256);
             const double   kv         = (kv_bytes_per_token(m, t) * ctx +
                                  m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
-            const double total = p.weights_gib + kv + p.state_gib + p.reserve_gib;
+            const double bias  = m.bias_bytes * ctx * p.ubatch / kGiB;
+            const double total = p.weights_gib + kv + bias + p.state_gib + p.reserve_gib;
             if (total <= budget_gib) {
                 p.fits = true;
                 p.ctx = ctx;

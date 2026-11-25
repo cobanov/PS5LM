@@ -8,6 +8,14 @@ v0.1.x are the upstream payload releases by cobanov.
 ## [Unreleased]
 
 ### Added
+- **Inkling 2 Mini** (Thinking Machines' looped MoE, 26B with 3.4B active) in Suggested, as
+  Unsloth's `UD-Q2_K_XL` from `Mainline_Support` (upstream llama.cpp cannot read the files in
+  the repository root, which use Unsloth's fork layout). The planner counts its cache slots:
+  layers 6 to 17 run three times a token, each pass with its own KV and conv state, so 48
+  slots, 8 of them full attention and 40 sliding window. Its relative position bias adds about
+  208 bytes of compute buffer per context and ubatch token (832 MiB at 64k, `-ub 64`, measured
+  with ggml-vulkan). At 11.38 GiB that is a 64k `q8_0` cache, 11.24 GiB planned. Checked on a PC
+  with ggml-vulkan and the patched tree: it answers correctly.
 - **A fleet worker leaves worker mode on request**: a `/data/PS5LM/leave-worker` file
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
@@ -267,6 +275,13 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **The planner counts only a hybrid model's attention layers as KV cache** (#107). Files that
+  list `attention.head_count_kv` per layer (Nemotron-H, Granite 4 hybrid, LFM2, Jamba) give a
+  cache only to the layers where it is not zero, and the recurrent state to the layers llama.cpp
+  makes recurrent: those without KV heads, and on Nemotron-H also without a feed-forward. Before,
+  every layer counted as attention: Nemotron Nano 9B v2 (56 layers, 4 attention) got a 64k `q4_0`
+  cache planned at about 3.9 GiB and no Mamba state. Now it is 64k `q8_0`, 0.53 GiB of cache and
+  0.14 GiB of state. Pure Mamba files now count their state, and Falcon-H1 both.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the
