@@ -15,6 +15,8 @@ struct Settings {
     std::string default_model;      // a path from the library, or empty
     uint32_t    ctx_cap   = 65536;  // the planner's longest context
     std::string kv_type   = "auto"; // "auto", "f16", "q8_0" or "q4_0"
+    std::string disk_cache = "off"; // "off", "auto", or "on"
+    uint32_t    disk_cache_mib = 4096; // SSD prompt cache limit (MiB)
     bool        sounds    = true;
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     bool        introspect = false;  // POST /v1/introspect: raw logits and activations (off by default)
