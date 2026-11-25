@@ -148,10 +148,52 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **The app without its screen**: `PS5LM_SCREEN=off` in `env.txt` starts the app
+  without its screen and dashboard, as `PS5LM_WORKER_SCREEN=off` does for a fleet
+  worker. The server answers as before and the TV keeps the system's splash; the
+  controller does nothing, and the PC's request files (`load`, `unload`, `memory`,
+  `quit`) still work. The screen's memory goes to the model: on a PS5 with
+  Qwen3.8-27B UD-Q2_K_XL and its projector at 8k, 0.57 GiB free when ready instead
+  of 0.22.
 - **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
   (the system's default is 448 MiB), so the direct pool, where models go, is
   12.1875 GiB instead of 12. It applies when the app starts from the home screen,
   not when it restarts for a model.
+- **llama.cpp moves to d2bceda3d** (39 commits after b12602, 2026-11-22), 816 commits on from
+  b11827, for Inkling 2 Mini (`inkling2_loop`, ggml-org/llama.cpp 32694, and the fixes it needed on
+  a console: 32669, 32704, 32735, 32799). Proven on one PS5 with Qwen3.8-27B at 1 x 155,648 against
+  the build before it (same loads, parked conversations restored identically, writing 19.1 tokens a
+  second where it was 18.6, memory no lower), and Inkling 2 Mini runs on the console
+  ([FLEET.md](docs/FLEET.md#inkling-2-mini)).
+  - A host and a worker must both be on this pin. llama.cpp's RPC protocol went from 8 to
+    10 and a handshake between the two refuses, so a console and its host change together.
+  - Replies are not token for token what the old pin wrote: the same prompt diverges after a few
+    dozen tokens, greedy included (new attention kernels in ggml-vulkan).
+  - `patches/0011` (the KV cache's rotation matrices kept on its device) is gone: llama.cpp
+    does it itself (31073). `tests/server_kv_rotation_test.py` stays and holds llama.cpp to
+    it.
+  - `patches/0012` (the causal mask built on the KV cache's device) is written anew on
+    llama.cpp's `llm_attn_mask`. It now also covers the full-attention half of a
+    sliding-window model's cache (Gemma 3); a model whose attention has relative
+    positions (Inkling 2) makes a dense mask itself and keeps the host mask.
+  - The worker's handshake bits moved: llama.cpp took the byte they were in for flags of
+    its own, counted up from bit 0, so graph-free (`patches/fleet/0006`) is bit 6 and
+    parking (`patches/fleet/0009`) bit 7.
+  - `GGML_RPC_GRAPH_KEEP` (host, `patches/fleet/0006`): how many graphs the host leaves on a
+    worker for reuse, 8 by default. On this llama.cpp a 27B model's graph costs a console about
+    6.5 MiB (it was 4): with 8 a console at 1 x 155,648 settled at 41 MiB of free pool where it
+    had 61, with 1 it keeps 72 or more, at the same speed. A host that serves one slot should
+    set 1.
+  - `patches/fleet/0010`, new: an RPC device no longer claims flash attention over K/V
+    rows, which llama.cpp now uses for a unified KV cache when a device says it can. The
+    RPC device said yes for every op without asking its worker, and ggml-vulkan has no
+    such kernel, so a console would have been sent an op it cannot run.
+    `GGML_RPC_KV_ROWS=1` on the host offers it again.
+  - The other patches are re-based; `0016`, `fleet/0005`, `fleet/0007` and `fleet/0009`
+    with small changes for llama.cpp's reference-counted checkpoints and its new RPC
+    send path. `--defrag-thold` is gone from llama-server.
+  - Limits for Inkling 2 Mini: its state cannot be parked on the worker yet, and its context is
+    bounded by the batch size (108K at `--ubatch-size 128`, 352K at 8).
 - **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
   (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
   scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
@@ -232,6 +274,16 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **Suggested downloads no longer fail their checksum when a repository re-uploads a file**
+  (#105). The entries pin each file's size and sha256 but were fetched from `resolve/main/`, so
+  once a repository replaced a file, the download got the new one, failed "the checksum does not
+  match", and every retry fetched it again. Four had moved: Qwen 3.8 27B, Gemma 4 E4B's vision
+  module, MiniCPM-V 4.7 1B and Clef Flash. Each entry now carries the commit its files are pinned
+  at and is fetched from `resolve/<revision>/`; the saved download queue keeps the revision, and a
+  queued file of a Suggested entry from before this update moves to its revision when the app
+  starts. A compile-time check requires a full commit id on every entry, and
+  `scripts/check-suggested.py` checks that each revision serves the pinned size and sha256 (with
+  `--find`, it names the newest commit that does).
 - **The title heap hands back memory it frees** (#75). The heap is the payload SDK's (dlmalloc in
   eight arenas over direct memory). At the pinned SDK it maps segments back to back, dlmalloc joins
   neighbours into one segment, and a joined segment can only go back whole, so one block left near its

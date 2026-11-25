@@ -894,7 +894,7 @@ int main(int, char **) {
     setenv("LLAMA_CACHE", data_path("cache").c_str(), 0);
     // Driver and backend switches to measure with, one NAME=value a line in
     // env.txt, set before the GPU opens; only the driver's, ggml's, llama's and
-    // the app's own (PS5LM_WORKER_SCREEN, below).
+    // the app's own (PS5LM_SCREEN and PS5LM_WORKER_SCREEN, below).
     for (const auto & line : read_lines(g_files.env)) {
         const size_t eq = line.find('=');
         const std::string name = line.substr(0, eq == std::string::npos ? 0 : eq);
@@ -917,18 +917,21 @@ int main(int, char **) {
                                       : "the SDK's own, no trim");
 
     // Fleet worker or not, before the screen: a worker started with
-    // PS5LM_WORKER_SCREEN=off in env.txt opens no screen at all. The screen and
-    // the dashboard take about 350 MiB of the pool (measured), which a console
-    // that is only a worker can give to the model instead.
+    // PS5LM_WORKER_SCREEN=off in env.txt opens no screen at all, and the app
+    // started with PS5LM_SCREEN=off neither. The screen and the dashboard take
+    // about 350 MiB of the pool (measured), which a console that only serves
+    // can give to the model instead.
     const FleetWorkerConfig fleet = read_fleet_worker_config(kFleetWorker);
-    const char * worker_screen = getenv("PS5LM_WORKER_SCREEN");
-    const bool headless = fleet.state == FleetWorkerConfig::enabled && worker_screen &&
-                          std::strcmp(worker_screen, "off") == 0;
+    const bool worker = fleet.state == FleetWorkerConfig::enabled;
+    const char * screen_switch = getenv(worker ? "PS5LM_WORKER_SCREEN" : "PS5LM_SCREEN");
+    const bool headless = (worker || fleet.state == FleetWorkerConfig::disabled) && screen_switch &&
+                          std::strcmp(screen_switch, "off") == 0;
 
     // The screen first: it takes from the same memory as the model.
     Display display;
     if (headless) {
-        ps5lm::log_line("fleet worker without a screen (PS5LM_WORKER_SCREEN=off)\n");
+        ps5lm::log_line(worker ? "fleet worker without a screen (PS5LM_WORKER_SCREEN=off)\n"
+                               : "no screen (PS5LM_SCREEN=off): the TV keeps the system's splash\n");
     } else if (!display.open(1920, 1080)) {
         ps5lm::log_line("no display\n");
     }
@@ -941,7 +944,7 @@ int main(int, char **) {
                        load_font(renderer, "dejavu-sans-mono.huifont", &mono, &fonts.mono);
     fonts.pixel = fonts.mono;
     fonts.hand = fonts.regular;
-    ps5lm::log_line("dashboard %s\n", ui_ok ? "ready" : "failed");
+    ps5lm::log_line("dashboard %s\n", ui_ok ? "ready" : headless ? "off" : "failed");
     // What the screen and the dashboard took, apart from the GPU's own start-up.
     log_memory("after the screen", false);
 
@@ -969,10 +972,15 @@ int main(int, char **) {
         render();
         display.swap();
     }
-    // A worker without a screen leaves the system's splash up: something on
-    // the TV, drawn by the system, from none of the app's memory.
+    // A worker or the app without a screen leaves the system's splash up:
+    // something on the TV, drawn by the system, from none of the app's memory.
     if (!headless) {
         sceSystemServiceHideSplashScreen();
+    } else if (!worker) {
+        char text[128];
+        std::snprintf(text, sizeof(text), "PS5LM: screen off (PS5LM_SCREEN in env.txt); the server answers on port %d",
+                      kPort);
+        notify(text);
     }
 
     // Fleet is a mutually exclusive startup mode, not another local model.
@@ -1252,9 +1260,11 @@ int main(int, char **) {
     hui::InputTracker tracker;
     hui::audio::Mixer mixer;
     hui::ps5::AudioOut audio_out;
-    audio_out.start(mixer);
     hui::audio::SoundBank sounds;
-    sounds.load(sandbox_path(kAssets) + "/audio/sfx");
+    if (ui_ok) {  // without a screen, no dashboard to make sounds
+        audio_out.start(mixer);
+        sounds.load(sandbox_path(kAssets) + "/audio/sfx");
+    }
 
     dash.set_busy("");
     Market    market;
@@ -1382,7 +1392,12 @@ int main(int, char **) {
                 }
             }
         }
-        dash.update(in, dt, feedback);
+        // Without a screen the controller steers nothing: a press on a page
+        // nobody sees could load or unload a model. The PC's request files
+        // below still work.
+        if (ui_ok) {
+            dash.update(in, dt, feedback);
+        }
         for (const auto & cue : feedback.cues) {
             if (!models.settings.sounds) {
                 break;
@@ -1489,7 +1504,7 @@ int main(int, char **) {
                 std::vector<MarketJob> jobs;
                 for (const SuggestedFile * f : { &s.model, &s.mmproj }) {
                     if (f->file) {
-                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "" });
+                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "", s.revision });
                     }
                 }
                 if (!market.enqueue(jobs, free_gib(dir))) {
@@ -1626,8 +1641,10 @@ int main(int, char **) {
                 const bool ok = save_screen(data_path("screen.bmp").c_str(), display.width(), display.height());
                 ps5lm::log_line("screenshot %s\n", ok ? "saved" : "failed");
             }
+            display.swap();  // paces the loop at the TV's 60 Hz
+        } else {
+            sceKernelUsleep(16667);  // the same pace without a screen
         }
-        display.swap();
         if (n % 60 == 0) {
             quit_if_asked();
         }
