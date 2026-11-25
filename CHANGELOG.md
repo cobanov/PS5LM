@@ -148,6 +148,13 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **The app without its screen**: `PS5LM_SCREEN=off` in `env.txt` starts the app
+  without its screen and dashboard, as `PS5LM_WORKER_SCREEN=off` does for a fleet
+  worker. The server answers as before and the TV keeps the system's splash; the
+  controller does nothing, and the PC's request files (`load`, `unload`, `memory`,
+  `quit`) still work. The screen's memory goes to the model: on a PS5 with
+  Qwen3.8-27B UD-Q2_K_XL and its projector at 8k, 0.57 GiB free when ready instead
+  of 0.22.
 - **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
   (the system's default is 448 MiB), so the direct pool, where models go, is
   12.1875 GiB instead of 12. It applies when the app starts from the home screen,
