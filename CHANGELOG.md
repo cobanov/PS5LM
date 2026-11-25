@@ -267,6 +267,14 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **The vision encoder's buffers are sized once**: with `--image-max-tokens N`, llama.cpp warmed a
+  Qwen-VL encoder with the largest square under N (35×35 = 1,225 tokens for 1,280), but photos get up
+  to N (a 1280×1261 photo gets 1,260). Each photo bigger than any before rebuilt the encoder's GPU
+  buffers from the largest free block and left the old ones as a hole. `patches/0021` warms with
+  exactly N tokens (40×32 for 1,280), the most an image can get, and logs when an image still grows a
+  buffer. On a PS5 (Qwen3.8-27B UD-IQ2_S, F16 projector, 25 photos) the largest free block ends at
+  1,270 MiB instead of 1,055; the warm-up reserves 6.5 MiB more. Other projectors, and runs without
+  `--image-max-tokens`, are unchanged. `tests/server_vision_warmup_test.py` checks it on a host build.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the

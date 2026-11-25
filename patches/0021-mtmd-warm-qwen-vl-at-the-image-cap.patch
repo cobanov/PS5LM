@@ -1,0 +1,132 @@
+Subject: [PATCH] mtmd: warm the Qwen-VL vision encoder at the image token cap
+
+With --image-max-tokens N below the model's warm-up count, a Qwen-VL encoder
+was warmed with the largest square under N: 35 x 35 = 1,225 tokens for 1,280.
+Photos get more. smart_resize rounds each side to 32 px and scales down only
+when the product is over N, so every count up to N is reached: a 1280x1261
+photo gets 36 x 35 = 1,260 tokens, a 1280x1024 one 40 x 32 = 1,280. Each image
+bigger than any before rebuilt the encoder's compute buffers. On a device that
+does not page, the new buffer is cut from the largest free block and the old
+one is left as a hole: on a PS5 the largest block fell in steps through the
+first 25 photos of a run, and one 1280x1261 photo ran out of memory by 148 MiB.
+
+The Qwen-VL graphs (Qwen2-VL, 2.5-VL with its window attention, 3-VL, Ling3-VL)
+size every tensor by the patch count, width times height, and never by either
+side alone (the learned position table is interpolated to the grid in one op).
+So the most the buffers ever need is N tokens, in any shape. These projectors
+now warm with exactly N: a x b == N, b the largest divisor of N not over its
+square root (1280 -> 40 x 32, a 1280x1024 image; a prime N gives 1 x N). Other
+projectors keep the square; without --image-max-tokens nothing changes.
+
+The encoder also says when an image grows a compute buffer after the warm-up
+("compute buffer grew from A to B MiB for a W x H image"); ggml's own line for
+that is a debug line compiled out of release builds.
+
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index 5caa93b42..2726c0f7b 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -89,6 +89,11 @@ struct clip_hparams {
+     // for models using dynamic image size, we need to have a smaller image size to warmup
+     // otherwise, user will get OOM every time they load the model
+     int32_t warmup_image_size = 0;
++    int32_t warmup_image_height = 0; // PS5LM: 0 = square (warmup_image_size on both sides)
++    // PS5LM: the image size alone sets every buffer (only width x height counts, never the
++    // shape) and the preprocessor never goes over --image-max-tokens: warm with exactly that
++    // many tokens, the most any image gets, instead of the largest square under it
++    bool warmup_at_max_tokens = false;
+     int32_t warmup_audio_size = 3000;
+ 
+     ffn_op_type ffn_op = FFN_GELU;
+@@ -228,8 +233,22 @@ struct clip_hparams {
+     void set_warmup_n_tokens(int n_tokens) {
+         int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
+         GGML_ASSERT(n_tok_per_side * n_tok_per_side == n_tokens && "n_tokens must be n*n");
++        warmup_image_height = 0;
+         // do not warmup with more tokens than the max allowed
+         if (custom_image_max_tokens > 0 && n_tokens > custom_image_max_tokens) {
++            if (warmup_at_max_tokens) {
++                // a x b == the cap exactly, b the largest divisor not over its square root
++                // (1280 -> 40 x 32); one token short and the first image at the cap rebuilds
++                // the buffers, cut from the largest free block, leaving the old ones as a hole
++                const int n = custom_image_max_tokens;
++                int b = std::max(1, static_cast<int>(std::sqrt(n)));
++                while (n % b != 0) {
++                    b--;
++                }
++                warmup_image_size   = (n / b) * patch_size * n_merge;
++                warmup_image_height = b * patch_size * n_merge;
++                return;
++            }
+             n_tok_per_side = std::max(1, static_cast<int>(std::sqrt(custom_image_max_tokens)));
+         }
+         warmup_image_size = n_tok_per_side * patch_size * n_merge;
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 5737400df..d4cb6cb94 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -171,6 +171,7 @@ struct clip_ctx {
+     bool no_alloc = false;
+     std::map<ggml_backend_dev_t, size_t> mem_usage;
+     std::map<ggml_backend_dev_t, size_t> mem_compute;
++    std::vector<size_t> buf_compute_size; // PS5LM: per backend, as last reserved or grown
+ 
+     bool support_batch = false;
+ 
+@@ -1793,6 +1794,7 @@ struct clip_model_loader {
+                         if (hparams.custom_image_max_tokens <= 0) {
+                             get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
+                         }
++                        hparams.warmup_at_max_tokens = true; // PS5LM: smart_resize stays within the cap
+                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
+                         if (hparams.image_min_pixels < warn_min_pixels) {
+@@ -3948,9 +3950,10 @@ struct clip_model_loader {
+         clip_image_f32_batch batch;
+         clip_image_f32 img;
+         if (ctx_clip.model.modality == CLIP_MODALITY_VISION) {
+-            const int sz = hparams.warmup_image_size;
+-            img.set_size({sz, sz}, false, false);
+-            LOG_INF("%s: warmup with image size = %d x %d\n", __func__, sz, sz);
++            const int w = hparams.warmup_image_size;
++            const int h = hparams.warmup_image_height > 0 ? hparams.warmup_image_height : w;
++            img.set_size({w, h}, false, false);
++            LOG_INF("%s: warmup with image size = %d x %d\n", __func__, w, h);
+         } else {
+             // GEMMA4UA uses n_mel_bins as a raw-waveform frame size (640), not a mel-bin count,
+             // so the [1, 256] bound only applies to FFT-based models.
+@@ -4052,6 +4055,7 @@ struct clip_model_loader {
+         ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+ 
+         ctx_clip.mem_compute.clear();
++        ctx_clip.buf_compute_size.assign(ctx_clip.backend_ptrs.size(), 0);
+         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
+             ggml_backend_t backend = ctx_clip.backend_ptrs[i];
+             ggml_backend_buffer_type_t buft = ctx_clip.backend_buft[i];
+@@ -4062,6 +4066,7 @@ struct clip_model_loader {
+                         size / 1024.0 / 1024.0);
+             }
+             ctx_clip.mem_compute[ggml_backend_get_device(backend)] += size;
++            ctx_clip.buf_compute_size[i] = size;
+         }
+ 
+         const int n_splits = ggml_backend_sched_get_n_splits(ctx_clip.sched.get());
+@@ -4876,6 +4881,18 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+         return false;
+     }
++    // PS5LM: say when an image bigger than the warm-up rebuilt a compute buffer: the new one
++    // is cut from the largest free block and the old one leaves a hole where nothing pages
++    for (size_t i = 0; i < ctx->backend_ptrs.size() && i < ctx->buf_compute_size.size(); ++i) {
++        const size_t size = ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend_ptrs[i]);
++        if (size > ctx->buf_compute_size[i]) {
++            LOG_WRN("%s: %s compute buffer grew from %.2f to %.2f MiB for a %d x %d image\n", __func__,
++                    ggml_backend_buft_name(ctx->backend_buft[i]),
++                    ctx->buf_compute_size[i] / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
++                    imgs.entries[0].nx(), imgs.entries[0].ny());
++            ctx->buf_compute_size[i] = size;
++        }
++    }
+ 
+     // set inputs
+     const auto & model   = ctx->model;
