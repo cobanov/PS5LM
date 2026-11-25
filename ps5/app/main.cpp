@@ -1408,7 +1408,7 @@ int main(int, char **) {
                 std::vector<MarketJob> jobs;
                 for (const SuggestedFile * f : { &s.model, &s.mmproj }) {
                     if (f->file) {
-                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "" });
+                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "", s.revision });
                     }
                 }
                 if (!market.enqueue(jobs, free_gib(dir))) {

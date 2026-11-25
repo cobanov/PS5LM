@@ -267,6 +267,16 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **Suggested downloads no longer fail their checksum when a repository re-uploads a file**
+  (#105). The entries pin each file's size and sha256 but were fetched from `resolve/main/`, so
+  once a repository replaced a file, the download got the new one, failed "the checksum does not
+  match", and every retry fetched it again. Four had moved: Qwen 3.8 27B, Gemma 4 E4B's vision
+  module, MiniCPM-V 4.7 1B and Clef Flash. Each entry now carries the commit its files are pinned
+  at and is fetched from `resolve/<revision>/`; the saved download queue keeps the revision, and a
+  queued file of a Suggested entry from before this update moves to its revision when the app
+  starts. A compile-time check requires a full commit id on every entry, and
+  `scripts/check-suggested.py` checks that each revision serves the pinned size and sha256 (with
+  `--find`, it names the newest commit that does).
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the
