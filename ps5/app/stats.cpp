@@ -19,7 +19,7 @@
 #include <thread>
 
 #ifdef __PROSPERO__
-#include <ps5platform/heap.h>
+#include "heap_info.hpp"
 #include <ps5platform/kernel.h>
 extern "C" int scePthreadGetaffinity(void * thread, uint64_t * mask);
 extern "C" void * scePthreadSelf(void);
@@ -384,11 +384,11 @@ void StatsCollector::run() {
         int64_t       at = 0;
         size_t        avail = 0;
         sceKernelAvailableDirectMemorySize(0, pool_bytes, 2 * 1024 * 1024, &at, &avail);
-        struct ps5_heap_stats hs = {};
-        ps5_heap_stats(&hs);
+        // Without walking the heap's blocks (heap_info.hpp): the main loop's
+        // latest figure, at most 10 s old, when asking would walk them.
         pool = pool_bytes / kGiB;
         free = avail / kGiB;
-        heap = hs.mapped_bytes / kGiB;
+        heap = ps5lm::heap_cheap().mapped / kGiB;
 #endif
 
         float soc_t = -1000, cpu_t = -1000, watts = 0, ghz = 0;

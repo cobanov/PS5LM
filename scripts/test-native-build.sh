@@ -16,7 +16,7 @@ llvm_config=$(command -v "${LLVM_CONFIG:-llvm-config}") || {
     echo "title-check: missing LLVM_CONFIG tool: ${LLVM_CONFIG:-llvm-config}" >&2; exit 2;
 }
 export LLVM_CONFIG="$llvm_config"
-for tool in git clang clang++ make wget unzip sha256sum timeout python3 cmake ninja meson rsync glslangValidator glslc pkg-config curl ffmpeg; do
+for tool in git clang clang++ make wget unzip sha256sum timeout python3 cmake ninja meson rsync glslangValidator glslc pkg-config curl ffmpeg patch; do
     command -v "$tool" >/dev/null || { echo "title-check: missing $tool" >&2; exit 2; }
 done
 # Host check, no console or server: FtpWriter refuses a path with a line break.
@@ -58,6 +58,23 @@ fetch_pinned() {
 }
 fetch_pinned https://github.com/mihawk-99/PS5_Vulkan.git "$vk" "$vk_revision"
 fetch_pinned https://github.com/mihawk-99/PS5_PayloadSDK.git "$sdk_fork" "$sdk_revision"
+
+# The title heap with the SDK author's later fixes (patches/sdk, which
+# scripts/build-app.sh links), checked first by the SDK's own host tests on a
+# patched export of the pin. The pinned checkout itself stays unmodified.
+if compgen -G "$root/patches/sdk/*.patch" > /dev/null; then
+    [[ $(<"$root/patches/sdk/BASE") == "$sdk_revision" ]] || {
+        echo "native-check: patches/sdk is not for SDK $sdk_revision" >&2; exit 2;
+    }
+    heap_test="$output/sdk-heap-test"
+    rm -rf -- "$heap_test"
+    mkdir -p "$heap_test"
+    git -C "$sdk_fork" archive "$sdk_revision" Makefile.inc include platform | tar -x -C "$heap_test"
+    for patch in "$root"/patches/sdk/*.patch; do
+        patch -s -p1 --fuzz=0 --no-backup-if-mismatch -d "$heap_test" -i "$patch"
+    done
+    timeout 300 make -s -C "$heap_test/platform" test
+fi
 
 # Upstream scripts verify the v0.42 SDK release and zlib archive SHA-256s.
 # These are public homebrew sources/tools, not proprietary firmware dumps.
@@ -149,13 +166,14 @@ title_id=$(python3 -c 'import json; print(json.load(open("ps5/app/sce_sys/param.
 app="$root/build/app-ps5/title/$title_id"
 bash "$vk/tools/inspect.sh" "$app/eboot.bin"
 "$vk/build/host/ps5-native-tool" self --inspect --file "$app/eboot.bin"
-python3 - "$output" "$app" "$mesa_base" "$mesa_patched" "$ui_revision" "$llama_revision" "$vk_revision" "$sdk_revision" <<'PY'
+python3 - "$output" "$app" "$mesa_base" "$mesa_patched" "$ui_revision" "$llama_revision" "$vk_revision" "$sdk_revision" "$root" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import sys
 
 output, app = map(Path, sys.argv[1:3])
+sdk_patches = sorted((Path(sys.argv[9]) / 'patches/sdk').glob('*.patch'))
 files = ('eboot.bin', 'payloads/ps5lm-ftpsrv.elf', 'sce_module/libc.prx', 'sce_sys/param.json', 'sce_sys/icon0.png', 'sce_sys/pic0.dds', 'sce_sys/pic1.dds')
 result = {
     'status': 'passed',
@@ -166,6 +184,8 @@ result = {
     'llama_revision': sys.argv[6],
     'ps5_vulkan_revision': sys.argv[7],
     'ps5_payload_sdk_revision': sys.argv[8],
+    # The title heap is the pinned SDK's with these applied (patches/sdk).
+    'ps5_payload_sdk_heap_patches_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sdk_patches},
     'optional_browser_ui': 'omitted; native console dashboard is built',
     'files_sha256': {name: hashlib.sha256((app / name).read_bytes()).hexdigest() for name in files},
 }
