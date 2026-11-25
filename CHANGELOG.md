@@ -284,6 +284,16 @@ v0.1.x are the upstream payload releases by cobanov.
   starts. A compile-time check requires a full commit id on every entry, and
   `scripts/check-suggested.py` checks that each revision serves the pinned size and sha256 (with
   `--find`, it names the newest commit that does).
+- **A chat no longer breaks once its text holds the media marker.** `/props` publishes the
+  marker that stands for an image in the prompt, so a tool that read `/props` put it into the
+  chat. mtmd then expected one image more than the request had, and that request and every later
+  one in the chat failed with "Failed to tokenize prompt" (HTTP 400). `patches/0022` writes the
+  marker as `[media marker]` in all message text and tool definitions, before the images get
+  theirs, on the OpenAI, Anthropic and Responses endpoints. On the console (Qwen3.5-9B with its
+  mmproj, 64k), `/props` in a message, `/props` as a tool result, an image, and an image with the
+  marker in its text were all answered. `tests/server_media_marker_test.py` checks that the marker
+  reaches no prompt as text. From @MCsumz's fork,
+  [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix) (#98).
 - **The title heap hands back memory it frees** (#75). The heap is the payload SDK's (dlmalloc in
   eight arenas over direct memory). At the pinned SDK it maps segments back to back, dlmalloc joins
   neighbours into one segment, and a joined segment can only go back whole, so one block left near its
