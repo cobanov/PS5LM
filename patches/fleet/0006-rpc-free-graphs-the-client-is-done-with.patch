@@ -10,8 +10,11 @@ one. A PS5 worker serving Qwen3.8-27B lost 7.5 to 9 MiB of its heap per 1,000
 prompt tokens read and died with "Failed to allocate input buffer" after about
 175K tokens; a CPU ggml-rpc-server grows the same way, up to 1,024 graphs.
 
-The server now sets a bit in the fourth byte of its HELLO answer (padding
-before, 0 from older servers) and takes RPC_CMD_GRAPH_FREE {device, uid}. A
+The server now sets bit 6 of the flags byte of its HELLO answer, the fourth,
+and takes RPC_CMD_GRAPH_FREE {device, uid}. (Until b12600 that byte was
+padding and this was bit 0; llama.cpp now keeps flags of its own there,
+counted up from bit 0, so the PS5LM bits count down from bit 7. A server
+without the patch leaves the bit clear.) A
 client that sees the bit keeps the 8 graphs it computed last on each device and
 sends GRAPH_FREE for each one that leaves that list; if it computes a freed
 graph again it sends it again, as for a new one. A client that does not see the
@@ -19,7 +22,13 @@ bit, and a server whose client never sends the command, behave as before, so
 either side can be updated alone (the worker stops leaking once both are).
 GGML_RPC_NO_GRAPH_FREE on either side turns it off.
 
+GGML_RPC_GRAPH_KEEP on the client sets how many it keeps (default 8). On
+llama.cpp b12600 a 27B model's graph costs a PS5 worker about 6.5 MiB (it was
+about 4), so eight came to 20 MiB more than before; a host that serves one
+slot needs two or three.
+
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 631a56d49..790c54596 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -16,6 +16,7 @@
@@ -30,7 +39,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
  #include <mutex>
  #include <unordered_map>
  #include <unordered_set>
-@@ -84,6 +85,7 @@
+@@ -84,6 +85,7 @@ enum rpc_cmd {
      RPC_CMD_COMM_INIT,
      RPC_CMD_COMM_ALLREDUCE,
      RPC_CMD_COMM_FREE,
@@ -38,7 +47,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      RPC_CMD_NONE,
      RPC_CMD_COUNT,
  };
-@@ -115,6 +117,7 @@
+@@ -115,6 +117,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
          case RPC_CMD_COMM_INIT:         return "COMM_INIT";
          case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
          case RPC_CMD_COMM_FREE:         return "COMM_FREE";
@@ -46,34 +55,26 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
          case RPC_CMD_NONE:              return "NONE";
          default:                        return "UNKNOWN";
      }
-@@ -127,6 +130,17 @@
+@@ -127,6 +130,18 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
  // so that both sides clear their caches at the same point in the message stream
  const size_t GRAPH_CACHE_MAX = 1024;
  
 +// PS5LM: a server keeps every graph it is sent (tensors and all, some MiB for a
 +// large model) until GRAPH_CACHE_MAX of them have come, and a client sends a new
 +// one for each prompt batch whose shape differs from the last: a worker lost
-+// about 4 MiB per batch read, up to 4 GiB. A server that sets this bit in its
-+// HELLO answer (the byte was padding, 0 from older servers) takes
++// about 4 MiB per batch read, up to 4 GiB. A server that sets this bit in the
++// flags byte of its HELLO answer (rpc_dispatcher_flags counts up from bit 0, the
++// PS5LM bits down from bit 7; 0 from a server without the patch) takes
 +// RPC_CMD_GRAPH_FREE, and a client that sees it keeps only the GRAPH_CACHE_KEEP
 +// graphs it used last on each device and tells the server to free the others.
 +// Either side alone behaves as before.
-+const uint8_t RPC_FEATURE_GRAPH_FREE = 1;
++const uint8_t RPC_FEATURE_GRAPH_FREE = 1 << 6;
 +const size_t  GRAPH_CACHE_KEEP       = 8;
 +
  struct rpc_msg_hello_req {
      uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
  };
-@@ -135,7 +149,7 @@
-     uint8_t major;
-     uint8_t minor;
-     uint8_t patch;
--    uint8_t padding;
-+    uint8_t features; // RPC_FEATURE_*; padding before, so 0 from a server without any
-     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
- };
- 
-@@ -246,6 +260,11 @@
+@@ -251,6 +266,11 @@ struct rpc_msg_graph_recompute_req {
      uint64_t uid;
  };
  
@@ -85,47 +86,25 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
  struct rpc_msg_get_tensor_2d_req {
      rpc_tensor tensor;
      uint64_t offset;
-@@ -426,7 +445,7 @@
- // Performs HELLO handshake with transport auto-negotiation.
- // Advertises local capabilities via conn_caps; if the server responds with
- // matching capabilities, the socket is upgraded transparently.
--static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
-+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & features) {
-     rpc_msg_hello_req request = {};
-     rpc_msg_hello_rsp response = {};
+@@ -568,6 +588,9 @@ private:
+     socket_ptr    sock;
  
-@@ -442,6 +461,7 @@
-     }
- 
-     sock->update_caps(response.conn_caps);
-+    features = response.features;
-     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
-             __func__, response.major, response.minor, response.patch, sock->transport_name());
-     return true;
-@@ -538,6 +558,9 @@
-     };
-     std::mutex graph_mutex;
-     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+     rpc_dispatcher_flags flags = {};
 +    // with graph_free: the same uids, most recently computed first
 +    std::unordered_map<uint32_t, std::list<uint64_t>> graph_lru;
-+    bool             graph_free = false;
-     rpc_msg_queue    queue;
-     socket_ptr       sock;
++    bool graph_free = false;
+ 
      std::atomic_uint busy_spin_users = 0;
-@@ -655,9 +678,11 @@
-     if (sock == nullptr) {
-         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     std::atomic_bool running;
+@@ -671,6 +694,7 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
+         LOG_ERROR("RPC handshake failed for %s\n", endpoint.c_str());
+         return false;
      }
--    if (!negotiate_hello(sock)) {
-+    uint8_t features = 0;
-+    if (!negotiate_hello(sock, features)) {
-         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
-     }
-+    graph_free = (features & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
++    graph_free = (flags & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
      LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
      running = true;
      thread = std::thread(rpc_dispatcher_trampoline, this);
-@@ -1251,6 +1276,20 @@
+@@ -1280,6 +1304,27 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph)
      auto & device_graph_uids = graph_uids[device];
      bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
      LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
@@ -134,7 +113,14 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +        auto & lru = graph_lru[device];
 +        lru.remove(cgraph->uid);
 +        lru.push_front(cgraph->uid);
-+        while (lru.size() > GRAPH_CACHE_KEEP) {
++        // GGML_RPC_GRAPH_KEEP: how many the worker keeps for this client (default GRAPH_CACHE_KEEP, at least 1).
++        // Each is a copy of the graph with all its tensors on the worker (about 4 MiB for a 27B model).
++        static const size_t keep = [] {
++            const char * e = getenv("GGML_RPC_GRAPH_KEEP");
++            const long v = e ? atol(e) : 0;
++            return v > 0 ? (size_t) v : GRAPH_CACHE_KEEP;
++        }();
++        while (lru.size() > keep) {
 +            auto request = std::make_shared<rpc_msg_graph_free_req>();
 +            request->device = device;
 +            request->uid    = lru.back();
@@ -146,7 +132,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      if (reuse) {
          auto request = std::make_shared<rpc_msg_graph_recompute_req>();
          request->device = device;
-@@ -1262,6 +1301,7 @@
+@@ -1291,6 +1336,7 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph)
                  LOG_DBG("[%s] clearing graph cache for device %u (%zu entries)\n",
                          __func__, device, device_graph_uids.size());
                  device_graph_uids.clear();
@@ -154,7 +140,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
              }
              device_graph_uids.insert(cgraph->uid);
          }
-@@ -1401,6 +1441,7 @@
+@@ -1441,6 +1487,7 @@ public:
      ~rpc_server();
  
      void hello(rpc_msg_hello_rsp & response);
@@ -162,15 +148,17 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
      bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
      bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
      bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
-@@ -1461,6 +1502,7 @@
-     response.major = RPC_PROTO_MAJOR_VERSION;
+@@ -1518,6 +1565,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
      response.minor = RPC_PROTO_MINOR_VERSION;
      response.patch = RPC_PROTO_PATCH_VERSION;
-+    response.features = std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr ? RPC_FEATURE_GRAPH_FREE : 0;
+     response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
++    if (std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr) {
++        response.flags |= RPC_FEATURE_GRAPH_FREE;
++    }
      LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
  }
  
-@@ -2269,6 +2311,19 @@
+@@ -2347,6 +2397,19 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
      return true;
  }
  
@@ -190,11 +178,10 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
  // graph compute is asynchronous; commands that read or write buffer data synchronize first
  void rpc_server::sync_all_backends() {
      for (ggml_backend_t backend : backends) {
-@@ -2766,6 +2821,16 @@
-                     return;
+@@ -2993,6 +3056,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                  }
                  break;
-+            }
+             }
 +            case RPC_CMD_GRAPH_FREE: {
 +                rpc_msg_graph_free_req request;
 +                if (!recv_msg(sock, &request, sizeof(request))) {
@@ -204,6 +191,7 @@ diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 +                    return;
 +                }
 +                break;
-             }
++            }
              case RPC_CMD_COMM_INIT: {
                  rpc_msg_comm_init_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {

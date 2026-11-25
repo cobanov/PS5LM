@@ -66,9 +66,10 @@ many differed. It fetches the full scores for every token.
 Only the host changes: the worker runs the same top-k node and answers the
 same tensor reads as before.
 diff --git a/common/common.h b/common/common.h
+index 45056f408..920920c6b 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -302,6 +302,10 @@
+@@ -306,6 +306,10 @@ struct common_params_sampling {
  
      bool backend_sampling = false;
  
@@ -80,9 +81,10 @@ diff --git a/common/common.h b/common/common.h
      std::string print() const;
  };
 diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 078bfd984..ef931bcc0 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
-@@ -170,6 +170,66 @@
+@@ -170,6 +170,66 @@ struct common_sampler {
      }
  
      mutable int64_t t_total_us = 0;
@@ -149,7 +151,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
  };
  
  std::string common_params_sampling::print() const {
-@@ -341,11 +401,24 @@
+@@ -349,11 +409,24 @@ struct common_sampler * common_sampler_init(
          }
      }
  
@@ -174,7 +176,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
              switch (cnstr) {
                  case COMMON_SAMPLER_TYPE_DRY:
                      {
-@@ -419,13 +492,44 @@
+@@ -427,13 +500,44 @@ struct common_sampler * common_sampler_init(
          llama_sampler_chain_add(chain, smpl);
      }
  
@@ -221,7 +223,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
          LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
  
          params.backend_sampling = false;
-@@ -443,6 +547,14 @@
+@@ -451,6 +555,14 @@ struct common_sampler * common_sampler_init(
          /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
      };
  
@@ -236,7 +238,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
      return result;
  }
  
-@@ -454,6 +566,7 @@
+@@ -462,6 +574,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
      llama_sampler_free(gsmpl->grmr);
      llama_sampler_free(gsmpl->rbudget);
      llama_sampler_free(gsmpl->chain);
@@ -244,7 +246,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
  
      delete gsmpl;
  }
-@@ -516,7 +629,7 @@
+@@ -524,7 +637,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
  }
  
  struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
@@ -253,7 +255,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
          /* .params  = */ gsmpl->params,
          /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
          /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-@@ -526,6 +639,16 @@
+@@ -534,6 +647,16 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
          /* .cur_p   = */ gsmpl->cur_p,
          /* .rng     = */ gsmpl->rng,
      };
@@ -270,7 +272,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
  }
  
  void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
-@@ -603,6 +726,174 @@
+@@ -611,6 +734,174 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
      return gsmpl->chain;
  }
  
@@ -445,7 +447,7 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
  llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
      llama_synchronize(ctx);
  
-@@ -616,6 +907,11 @@
+@@ -624,6 +915,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  
@@ -458,9 +460,10 @@ diff --git a/common/sampling.cpp b/common/sampling.cpp
  
      // Check if a backend sampler has already sampled a token in which case we
 diff --git a/common/sampling.h b/common/sampling.h
+index f19bd27c4..b7060a698 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
-@@ -55,6 +55,43 @@
+@@ -55,6 +55,43 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
  // get the underlying llama_sampler_chain
  struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
  
@@ -505,9 +508,10 @@ diff --git a/common/sampling.h b/common/sampling.h
  //
  // - set logits
 diff --git a/include/llama.h b/include/llama.h
+index e8db64489..acf897d6a 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -1482,6 +1482,22 @@
+@@ -1509,6 +1509,22 @@ extern "C" {
      // note: prefer initializing the context with llama_context_params.samplers when possible
      LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
  
@@ -531,9 +535,10 @@ diff --git a/include/llama.h b/include/llama.h
      LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
      LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 15518fe3c..e7ec16028 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1084,6 +1084,53 @@
+@@ -1159,6 +1159,53 @@ float * llama_context::get_logits_ith(int32_t i) {
      }
  }
  
@@ -587,7 +592,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
  float * llama_context::get_embeddings() {
      output_reorder();
  
-@@ -1408,6 +1455,9 @@
+@@ -1711,6 +1758,9 @@ bool llama_context::get_causal_attn() const {
  }
  
  bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -597,7 +602,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      if (!sampler && sampling.samplers.count(seq_id) == 0) {
          return true;
      }
-@@ -1931,6 +1981,10 @@
+@@ -2259,6 +2309,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -608,9 +613,9 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      sched_reserve();
  
      bool did_optimize = false;
-@@ -1997,9 +2051,30 @@
-     int64_t n_outputs_prev = 0;
-     int64_t n_tokens_prev  = 0;
+@@ -2359,9 +2413,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
+     }
  
 +    // PS5LM fork: logits on demand
 +    const bool on_demand = has_samplers && logits.data != nullptr;
@@ -639,7 +644,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          // count the outputs in this ubatch
          {
              int32_t n_outputs_new = 0;
-@@ -2077,6 +2152,37 @@
+@@ -2439,6 +2514,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                  GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                  ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
              }
@@ -677,7 +682,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          }
  
          // extract embeddings
-@@ -2453,6 +2559,11 @@
+@@ -2843,6 +2949,11 @@ void llama_context::output_reorder() {
              }
          }
  
@@ -689,7 +694,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          if (embd.size > 0) {
              for (uint64_t k = 0; k < n_embd_out; k++) {
                  std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
-@@ -4473,6 +4584,17 @@
+@@ -4933,6 +5044,17 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
      return ctx->set_sampler(seq_id, smpl);
  }
  
@@ -708,6 +713,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
+index 9f792f3f8..dfc2736c2 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -14,6 +14,7 @@
@@ -718,7 +724,7 @@ diff --git a/src/llama-context.h b/src/llama-context.h
  #include <vector>
  
  struct llama_model;
-@@ -269,6 +270,10 @@
+@@ -292,6 +293,10 @@ public:
  
      bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
@@ -729,7 +735,7 @@ diff --git a/src/llama-context.h b/src/llama-context.h
  private:
      llm_graph_result * get_gf_res_prev();
  
-@@ -348,6 +353,23 @@
+@@ -385,6 +390,23 @@ private:
  
          // optimization
          std::vector<llama_token> token_ids_full_vocab;
@@ -754,9 +760,10 @@ diff --git a/src/llama-context.h b/src/llama-context.h
  
      sampling_info sampling;
 diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index d8cd441a5..7c0771ffd 100644
 --- a/src/llama-sampler.cpp
 +++ b/src/llama-sampler.cpp
-@@ -2690,6 +2690,15 @@
+@@ -2691,6 +2691,15 @@ static void llama_sampler_grammar_apply(struct llama_sampler * smpl, llama_token
      }
  }
  
@@ -773,9 +780,10 @@ diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
  static struct llama_sampler * llama_sampler_init_grammar_impl(
          const struct llama_vocab * vocab,
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ae55d49cd..34b191669 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1052,6 +1052,22 @@
+@@ -1085,6 +1085,22 @@ struct server_slot {
                  "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                  llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
  
@@ -798,7 +806,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
          const int32_t n_draft_total       = stats.n_draft_tokens;
          const int32_t n_draft_accepted    = stats.n_draft_accepted;
          const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
-@@ -2345,6 +2361,11 @@
+@@ -2345,6 +2361,11 @@ private:
  
          // initialize samplers
          if (task.need_sampling()) {
@@ -810,7 +818,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
              try {
                  slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
              } catch (std::exception & e) {
-@@ -2365,7 +2386,12 @@
+@@ -2365,7 +2386,12 @@ private:
  
              // TODO: tmp until backend sampling is fully implemented
              if (use_backend_sampling) {
