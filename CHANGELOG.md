@@ -284,6 +284,16 @@ v0.1.x are the upstream payload releases by cobanov.
   starts. A compile-time check requires a full commit id on every entry, and
   `scripts/check-suggested.py` checks that each revision serves the pinned size and sha256 (with
   `--find`, it names the newest commit that does).
+- **A chat no longer breaks once its text holds the media marker.** `/props` publishes the
+  marker that stands for an image in the prompt, so a tool that read `/props` put it into the
+  chat. mtmd then expected one image more than the request had, and that request and every later
+  one in the chat failed with "Failed to tokenize prompt" (HTTP 400). `patches/0022` writes the
+  marker as `[media marker]` in all message text and tool definitions, before the images get
+  theirs, on the OpenAI, Anthropic and Responses endpoints. On the console (Qwen3.5-9B with its
+  mmproj, 64k), `/props` in a message, `/props` as a tool result, an image, and an image with the
+  marker in its text were all answered. `tests/server_media_marker_test.py` checks that the marker
+  reaches no prompt as text. From @MCsumz's fork,
+  [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix) (#98).
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the
