@@ -26,8 +26,9 @@ ggml-rpc/park.h).
   without a buffer a byte per call.
 - A title that defines ps5lm_rpc_park_write (PS5LM does) writes the files with
   it: a PS5 title's own writes slow to about 1.2 MB/s after 2 GB.
-- A server with a park folder sets bit 1 in the fourth byte of its HELLO answer
-  (bit 0 is GRAPH_FREE). A client sends the command only to such a server, as
+- A server with a park folder sets bit 7 of the flags byte of its HELLO answer
+  (bit 6 is GRAPH_FREE; llama.cpp's own flags count up from bit 0, since
+  b12600). A client sends the command only to such a server, as
   an older one drops a client whose command it does not know; an older client
   never sends it. A park command that fails answers with a status and does not
   drop the client.
@@ -35,10 +36,10 @@ ggml-rpc/park.h).
   the test of that.
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index ecf0a3a..684abd0 100644
+index 168ee774e..6f4cd4cec 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
-@@ -30,6 +30,79 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
+@@ -35,6 +35,79 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
@@ -119,7 +120,7 @@ index ecf0a3a..684abd0 100644
  }
  #endif
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e8dc5fc..a0d5d70 100644
+index 099177848..acd8c9d2a 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -26,6 +26,8 @@
@@ -147,19 +148,19 @@ index e8dc5fc..a0d5d70 100644
          case RPC_CMD_NONE:              return "NONE";
          default:                        return "UNKNOWN";
      }
-@@ -141,6 +145,11 @@ const size_t GRAPH_CACHE_MAX = 1024;
- const uint8_t RPC_FEATURE_GRAPH_FREE = 1;
+@@ -142,6 +146,11 @@ const size_t GRAPH_CACHE_MAX = 1024;
+ const uint8_t RPC_FEATURE_GRAPH_FREE = 1 << 6;
  const size_t  GRAPH_CACHE_KEEP       = 8;
  
 +// PS5LM: a server that sets this bit takes RPC_CMD_PARK (ggml-rpc.h, park.h): it
 +// has a folder for parked state. A client sends the command only to such a server,
 +// as an older one drops a client that sends a command it does not know.
-+const uint8_t RPC_FEATURE_PARK = 2;
++const uint8_t RPC_FEATURE_PARK = 1 << 7;
 +
  struct rpc_msg_hello_req {
      uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
  };
-@@ -265,6 +274,13 @@ struct rpc_msg_graph_free_req {
+@@ -271,6 +280,13 @@ struct rpc_msg_graph_free_req {
      uint64_t uid;
  };
  
@@ -173,7 +174,7 @@ index e8dc5fc..a0d5d70 100644
  struct rpc_msg_get_tensor_2d_req {
      rpc_tensor tensor;
      uint64_t offset;
-@@ -541,6 +557,9 @@ public:
+@@ -562,6 +578,9 @@ public:
  
      ~rpc_dispatcher();
  
@@ -183,15 +184,15 @@ index e8dc5fc..a0d5d70 100644
  private:
      struct rpc_msg {
          rpc_cmd                       cmd;
-@@ -683,6 +702,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
-         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+@@ -695,6 +714,7 @@ bool rpc_dispatcher::start(const std::string & endpoint) {
+         return false;
      }
-     graph_free = (features & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
-+    park = (features & RPC_FEATURE_PARK) != 0;
+     graph_free = (flags & RPC_FEATURE_GRAPH_FREE) != 0 && std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr;
++    park = (flags & RPC_FEATURE_PARK) != 0;
      LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
      running = true;
      thread = std::thread(rpc_dispatcher_trampoline, this);
-@@ -1483,6 +1503,46 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+@@ -1522,6 +1542,46 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
      *total = response.total_mem;
  }
  
@@ -225,11 +226,11 @@ index e8dc5fc..a0d5d70 100644
 +        memcpy(input.get() + sizeof(head), data_in, req->size);
 +    }
 +    if (!has_out) {
-+        dispatcher->send(RPC_CMD_PARK, input, in_size, rsp, sizeof(*rsp));
++        dispatcher->send(RPC_CMD_PARK, input, in_size, nullptr, 0, rsp, sizeof(*rsp));
 +        return true;
 +    }
 +    std::vector<uint8_t> output(sizeof(*rsp) + req->size);
-+    dispatcher->send(RPC_CMD_PARK, input, in_size, output.data(), output.size());
++    dispatcher->send(RPC_CMD_PARK, input, in_size, nullptr, 0, output.data(), output.size());
 +    memcpy(rsp, output.data(), sizeof(*rsp));
 +    memcpy(data_out, output.data() + sizeof(*rsp), req->size);
 +    return true;
@@ -238,7 +239,7 @@ index e8dc5fc..a0d5d70 100644
  // RPC server-side implementation
  
  class rpc_server {
-@@ -1496,6 +1556,8 @@ public:
+@@ -1535,6 +1595,8 @@ public:
  
      void hello(rpc_msg_hello_rsp & response);
      bool graph_free(const rpc_msg_graph_free_req & request);
@@ -247,26 +248,26 @@ index e8dc5fc..a0d5d70 100644
      bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
      bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
      bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
-@@ -1550,6 +1612,8 @@ private:
-     // computed graphs cached per backend, keyed by uid
-     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+@@ -1605,6 +1667,8 @@ private:
      std::vector<comm_state> comm_states;
+     // SET_TENSOR data is received in chunks through this buffer
+     std::vector<uint8_t> set_tensor_buf;
 +    // PS5LM device parking: the files this client parks here
 +    ggml_rpc_park::store park;
  };
  
  void rpc_server::hello(rpc_msg_hello_rsp & response) {
-@@ -1557,6 +1621,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
-     response.minor = RPC_PROTO_MINOR_VERSION;
-     response.patch = RPC_PROTO_PATCH_VERSION;
-     response.features = std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr ? RPC_FEATURE_GRAPH_FREE : 0;
+@@ -1615,6 +1679,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     if (std::getenv("GGML_RPC_NO_GRAPH_FREE") == nullptr) {
+         response.flags |= RPC_FEATURE_GRAPH_FREE;
+     }
 +    if (park.enabled()) {
-+        response.features |= RPC_FEATURE_PARK;
++        response.flags |= RPC_FEATURE_PARK;
 +    }
      LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
  }
  
-@@ -2378,6 +2445,155 @@ bool rpc_server::graph_free(const rpc_msg_graph_free_req & request) {
+@@ -2457,6 +2524,155 @@ bool rpc_server::graph_free(const rpc_msg_graph_free_req & request) {
      return true;
  }
  
@@ -422,7 +423,7 @@ index e8dc5fc..a0d5d70 100644
  // graph compute is asynchronous; commands that read or write buffer data synchronize first
  void rpc_server::sync_all_backends() {
      for (ggml_backend_t backend : backends) {
-@@ -2886,6 +3102,36 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+@@ -3113,6 +3329,36 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                  }
                  break;
              }
@@ -459,7 +460,7 @@ index e8dc5fc..a0d5d70 100644
              case RPC_CMD_COMM_INIT: {
                  rpc_msg_comm_init_req request;
                  if (!recv_msg(sock, &request, sizeof(request))) {
-@@ -3285,6 +3531,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+@@ -3521,6 +3767,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
      if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
          return (void *)ggml_backend_rpc_start_server;
      }
@@ -471,7 +472,7 @@ index e8dc5fc..a0d5d70 100644
      }
 diff --git a/ggml/src/ggml-rpc/park.h b/ggml/src/ggml-rpc/park.h
 new file mode 100644
-index 0000000..dc60b2a
+index 000000000..dc60b2af7
 --- /dev/null
 +++ b/ggml/src/ggml-rpc/park.h
 @@ -0,0 +1,708 @@
