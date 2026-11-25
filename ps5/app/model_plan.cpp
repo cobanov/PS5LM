@@ -56,7 +56,15 @@ struct Reader {
         return s;
     }
     void skip(uint64_t n) {
-        if (f ? std::fseek(f, (long) n, SEEK_CUR) != 0 : pos + n > size) {
+        if (f && n <= 4096) {
+            // Keep small metadata skips sequential so stdio can reuse its read
+            // buffer. In particular, GGUF tokenizer string arrays contain
+            // hundreds of thousands of short strings.
+            char scratch[4096];
+            if (read(scratch, (size_t) n) != n) {
+                bad = true;
+            }
+        } else if (f ? std::fseek(f, (long) n, SEEK_CUR) != 0 : pos + n > size) {
             bad = true;
         }
         pos += f ? 0 : n;
@@ -275,6 +283,11 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
 ModelInfo read_model_info(const std::string & path) {
     Reader r;
     r.f = std::fopen(path.c_str(), "rb");
+    if (r.f) {
+        // A larger stdio buffer reduces refill overhead while walking GGUF
+        // metadata. Small skips stay sequential in Reader::skip() above.
+        std::setvbuf(r.f, nullptr, _IOFBF, 1 << 20);
+    }
     ModelInfo m = parse_model_info(r, path, 0);
     m.mmproj = find_mmproj(path);
     if (!m.mmproj.empty()) {
@@ -282,6 +295,9 @@ ModelInfo read_model_info(const std::string & path) {
         m.mmproj_bytes = stat(m.mmproj.c_str(), &st) == 0 ? (uint64_t) st.st_size : 0;
         Reader pr;
         pr.f = std::fopen(m.mmproj.c_str(), "rb");
+        if (pr.f) {
+            std::setvbuf(pr.f, nullptr, _IOFBF, 1 << 20);
+        }
         m.projector_type = parse_model_info(pr, m.mmproj, 0).projector_type;
     }
     return m;
