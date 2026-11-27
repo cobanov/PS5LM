@@ -37,6 +37,7 @@ if [[ ${1:-} == --rpc ]]; then
     fi
     python3 tests/server_system_messages_test.py --build "$out"
     python3 tests/server_media_marker_test.py --build "$out"
+    python3 tests/server_stream_keepalive_test.py --build "$out"
     python3 tests/server_checkpoints_test.py --build "$out"
     python3 tests/server_reply_as_generated_test.py --build "$out"
     # the same on the named model, with its own tokens and <think> markers

@@ -307,6 +307,16 @@ v0.1.x are the upstream payload releases by cobanov.
   Measured on the console (Qwen 3.8 27B UD-IQ2_S with its F16 projector, 25 full-size photos): the
   largest free block of the pool ended at 1,316 MiB instead of 1,055, and the CPU heap at 1,100 MiB
   instead of 1,321, at the same 11.8 s a photo.
+- **A test keeps a streamed reply's keep-alive connection in check.** Until the llama.cpp move,
+  llama-server's chunk provider called `done()` and then returned false, and cpp-httplib counted
+  that as a cancelled response: it closed the connection right after one that advertised
+  `Keep-Alive`, and Open WebUI agent chats stopped after their first tool call with "Server
+  Connection Error". The fix comes with the llama.cpp move (ggml-org/llama.cpp#30492).
+  `tests/server_stream_keepalive_test.py` guards it: two streams and a plain request over one
+  connection on chat, messages, responses and completion (upstream's test covers only
+  `/completion`). On the console (Qwen 3.8 27B, Open WebUI agent chat with tool calls), no
+  connection dropped. From @MCsumz's fork,
+  [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix) (#98).
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the
