@@ -164,6 +164,15 @@ from a drive instead of holding them in memory (Qwen3.8-Flash-Next on the roadma
 | `bench-write` | Write speed by method to the data folder and a USB drive |
 | `bench-park [GiB]` | The write path of parked state ([FLEET.md](FLEET.md#parked-state)), sustained: that many GiB (4) in 8 MiB pieces through ftpsrv to the data folder, `/mnt/usb0` and `/mnt/ext0`, the speed of every GiB, then read back in 8 MiB reads and checked; on the two drives also the title's own writes. Works beside a running worker |
 | `memory` | One `memory asked` line: pools, CPU heap and ggml's devices |
+| `memory each` / `memory off` | A `memory after a request` line after every request, and `memory after the trim` after its heap trim; or no more |
+| `trim` | Trims the heap now, between a `memory before trim` and a `memory after trim` line |
+| `trim on` / `trim off` | The heap trim 0.25 s after each request and every 10 s (on by default) |
+
+The memory line ends with exact figures, for example `[MiB: largest 1843, heap 973 in 412 segments, in use 920,
+walk 2.1 ms, trim 0.4 ms, requests 12, in flight 0]`: the largest free block of the direct pool, the CPU heap's
+mapped direct memory and in how many segments, what of it is in blocks handed out, and llama-server's POST requests
+ended and in flight. The heap is the payload SDK's with [`patches/sdk`](../patches/sdk/README.md); its trim hands
+segments with nothing left in them back to the pool the GPU shares.
 
 Point `bench-read` at a model of several GiB on the drive in question (internal storage, the M.2
 drive or USB), so the cache holds little of it; the `O_DIRECT` lines are the drive itself.

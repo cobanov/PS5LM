@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 20:00:45 -0400
+Subject: [PATCH 1/4] platform: zero what is promised fresh; the console hands
+ released direct memory out as it was
+
+Measured in the RetroArch title: 64 KiB of direct memory written, released
+and allocated again came back at the same start with its old bytes. A new
+ps5_shm object, a unit ps5_vrange_commit backs and a region ps5_exec_alloc
+maps are now zeroed, and the title heap's dlmalloc no longer assumes a mapped
+chunk is clear (MMAP_CLEARS 0), so a calloc of 32 MiB or more reads zero. The
+host model hands out a pattern instead of zeros. PROBE.md records the guest
+layout, committed memory, emulated-TLS cost and what a title reads about its
+CPUs.
+
+Backported to b83202be for PS5LM from mihawk-99/PS5_PayloadSDK commit 8278ca5e9cd0b7b4a0611c4a85fc975073564bcc. Heap part only: src/dlmalloc/mspace.c, the host model and the heap test. Its shm, vrange, exec and probe changes are not taken.
+---
+ platform/src/dlmalloc/mspace.c |  3 +++
+ platform/tests/host_kernel.c   | 11 +++++++++--
+ platform/tests/test_platform.c | 11 +++++++++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/platform/src/dlmalloc/mspace.c b/platform/src/dlmalloc/mspace.c
+index e435b21..33599d6 100644
+--- a/platform/src/dlmalloc/mspace.c
++++ b/platform/src/dlmalloc/mspace.c
+@@ -24,6 +24,9 @@ int ps5p_heap_unmap(void *address, size_t bytes);
+ #define MMAP(s) ps5p_heap_map(s)
+ #define DIRECT_MMAP(s) ps5p_heap_map(s)
+ #define MUNMAP(a, s) ps5p_heap_unmap((a), (s))
++/* Direct memory comes back with what it held before (docs/PROBE.md), so a
++ * mapped chunk is not known to be clear: calloc clears it. */
++#define MMAP_CLEARS 0
+ /* The PS5 target's __STDCPP_DEFAULT_NEW_ALIGNMENT__ and __BIGGEST_ALIGNMENT__
+  * are 32: its compilers emit 32-byte-aligned AVX stores into plain new
+  * objects. */
+diff --git a/platform/tests/host_kernel.c b/platform/tests/host_kernel.c
+index 7483d65..814effa 100644
+--- a/platform/tests/host_kernel.c
++++ b/platform/tests/host_kernel.c
+@@ -115,6 +115,13 @@ sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t l
+          memset(used + first, 1, (size_t)units);
+          allocations++;
+          pthread_mutex_unlock(&lock);
++         /* Nothing promises the memory is clear (the console hands released
++          * memory out as it was): a pattern, so code that assumes zero shows. */
++         static uint8_t pattern[UNIT];
++         memset(pattern, 0xa5, sizeof(pattern));
++         for (int64_t unit = 0; unit < units; unit++)
++            if (pwrite(memory_fd, pattern, sizeof(pattern), (first + unit) * UNIT) != (ssize_t)sizeof(pattern))
++               return FAILED;
+          *physical_start = first * UNIT;
+          return 0;
+       }
+@@ -131,8 +138,8 @@ sceKernelReleaseDirectMemory(int64_t start, size_t length)
+    memset(used + start / UNIT, 0, length / (size_t)UNIT);
+    allocations--;
+    pthread_mutex_unlock(&lock);
+-   /* The pages' contents go with the allocation, as on the console. */
+-   fallocate(memory_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, (off_t)length);
++   /* The pages keep what they held: the console gives released direct memory
++    * out again as it was (docs/PROBE.md). */
+    return 0;
+ }
+ 
+diff --git a/platform/tests/test_platform.c b/platform/tests/test_platform.c
+index 0b825f5..aa1a588 100644
+--- a/platform/tests/test_platform.c
++++ b/platform/tests/test_platform.c
+@@ -1177,6 +1177,17 @@ test_heap(void)
+       handed_intact &= result != NULL;
+    }
+    check(handed_intact, "heap: blocks go back to their own arena from other threads");
++   /* A large calloc is its own mapping (dlmalloc's threshold is 32 MiB),
++    * from direct memory that may hold what it held before: cleared all the
++    * same, written, freed and asked for again. */
++   for (int round = 0; round < 2; round++) {
++      uint8_t *const large = __wrap_calloc(1, (size_t)40 << 20);
++      check(large && large[0] == 0 && large[((size_t)40 << 20) - 1] == 0 && large[(size_t)17 << 20] == 0,
++            "heap: a large calloc reads zero");
++      if (large)
++         memset(large, 0x77, (size_t)40 << 20);
++      __wrap_free(large);
++   }
+ }
+ 
+ static void

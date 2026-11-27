@@ -6,6 +6,7 @@
 #include "ftp_writer.hpp"
 #include "model_plan.hpp"
 #include "storage.hpp"
+#include "suggested.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -268,7 +269,8 @@ void Market::save_queue() {
     nlohmann::json j = nlohmann::json::array();
     for (const auto & d : view_.downloads) {
         j.push_back({ { "repo", d.repo }, { "file", d.file }, { "sha256", d.sha256 }, { "dir", d.dir }, { "bytes", d.bytes },
-                      { "state", state_name(d.state) }, { "note", d.note }, { "resume", d.resume }, { "save_as", d.save_as } });
+                      { "state", state_name(d.state) }, { "note", d.note }, { "resume", d.resume }, { "save_as", d.save_as },
+                      { "revision", d.revision } });
     }
     std::ofstream(data_path("downloads.json")) << j.dump(1) << "\n";
 }
@@ -289,6 +291,18 @@ void Market::load_queue() {
         d.bytes = e.value("bytes", (uint64_t) 0);
         d.note = e.value("note", std::string());
         d.save_as = e.value("save_as", std::string());
+        d.revision = e.value("revision", std::string());
+        // Queued before Suggested entries were pinned: a file of one of them
+        // goes to its revision, so the resumed download gets the pinned file.
+        if (d.revision.empty()) {
+            for (const Suggestion & s : kSuggestions) {
+                for (const SuggestedFile * f : { &s.model, &s.mmproj }) {
+                    if (f->file && d.repo == s.repo && d.file == f->file && d.sha256 == f->sha256) {
+                        d.revision = s.revision;
+                    }
+                }
+            }
+        }
         const std::string st = e.value("state", std::string());
         // Running when the app stopped: carry on.
         d.state = st == "paused" ? DownloadState::paused : st == "failed" ? DownloadState::failed
@@ -456,7 +470,7 @@ bool Market::fetch(Download & d) {
     constexpr uint64_t kPiece = 32ull << 20;
     const std::string part = part_path(d);
     const std::string to = part.substr(0, part.size() - 5);
-    const std::string url = std::string(kHub) + "/" + d.repo + "/resolve/main/" + d.file;
+    const std::string url = std::string(kHub) + "/" + d.repo + "/resolve/" + (d.revision.empty() ? "main" : d.revision) + "/" + d.file;
     std::error_code ec;
     std::filesystem::create_directories(d.dir, ec);
     const auto publish = [&](bool save) {

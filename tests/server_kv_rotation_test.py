@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""patches/0011 on a host llama-server: with a quantized KV cache on one RPC worker, the
-cache's Hadamard rotation matrices are kept on the worker instead of being uploaded as
-inputs to every graph, and the answer matches the same model run without RPC.
+"""On a host llama-server with a quantized KV cache on one RPC worker, the cache's Hadamard
+rotation matrices are kept on the worker instead of being uploaded as inputs to every
+graph, and the answer matches the same model run without RPC. This was patches/0011;
+llama.cpp does it itself since b12600's "kv-cache : keep rotation constants on the GPU"
+(ggml-org/llama.cpp 31073), and this test holds it to what the patch gave.
 
 Run after scripts/build-fleet-host.sh. The model is an untrained fixture with 64-wide
 heads (the narrowest that llama.cpp rotates), so only tokens and logprobs are compared.
@@ -12,11 +14,12 @@ import argparse
 import json
 import math
 import os
+import re
 
 from fleet_rpc_smoke import complete, free_ports, spawn, wait_ready
 from make_fleet_fixture import ROOT, make_fixture
 
-KEPT = "init_attn_rot_dev: rotation matrices kept on RPC0"
+KEPT = re.compile(r"init_rotation: +RPC0\[[^\]]*\] rotation buffer size")
 INPUT = "input tensor '"
 
 
@@ -49,11 +52,10 @@ def run(build, output):
         actual = complete(api)
     local_log = (output / "local.log").read_text(errors="replace")
     controller_log = (output / "controller.log").read_text(errors="replace")
-    # On the CPU the cache is in host memory and the matrices stay graph inputs.
-    assert "n_rot_k = 64" in local_log and KEPT not in local_log, "the fixture's cache is not rotated"
-    assert "attn_inp_k_rot'" in local_log, "the local run did not use the rotation inputs"
-    assert KEPT in controller_log, "the rotation matrices were not kept on the RPC worker"
-    uploads = [line for line in controller_log.splitlines() if INPUT in line and "_rot'" in line]
+    # Without RPC the matrices are in a host buffer beside the cache; with it, in one on the worker.
+    assert "n_rot_k = 64" in local_log and not KEPT.search(local_log), "the fixture's cache is not rotated"
+    assert KEPT.search(controller_log), "the rotation matrices were not kept on the RPC worker"
+    uploads = [line for line in controller_log.splitlines() if INPUT in line and "_rot" in line.split("'")[1]]
     assert not uploads, f"rotation matrices still graph inputs: {uploads[:2]}"
     assert expected["tokens"] == actual["tokens"], (expected["tokens"], actual["tokens"])
     # Byte tokens that form one character share an entry, so there can be fewer than 8.

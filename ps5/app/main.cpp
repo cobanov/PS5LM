@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,7 +63,7 @@
 #include "suggested.hpp"
 #include "version.hpp"
 
-#include <ps5platform/heap.h>
+#include "heap_info.hpp"
 #include <ps5platform/kernel.h>
 
 #include "audio/mixer.hpp"
@@ -289,34 +290,67 @@ std::string take_request_file(const std::string & path) {
 // what ggml says about each device (its GPU figure wraps once the unified
 // heap is over-committed; the raw numbers still show a change). `devices`
 // false before the GPU opens: asking ggml would open it.
-void log_memory(const char * when, bool devices = true) {
-    int64_t at = 0;
-    size_t  avail = 0, flex = 0, flex_free = 0;
-    const int64_t pool = sceKernelGetDirectMemorySize();
+std::string & appendf(std::string & s, const char * fmt, ...) __attribute__((format(printf, 2, 3)));
+std::string & appendf(std::string & s, const char * fmt, ...) {
+    char    buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        s.append(buf, std::min((size_t) n, sizeof(buf) - 1));
+    }
+    return s;
+}
+
+// Built as one string and printed once, so llama-server's own prints cannot
+// land inside it. Its start stays as it was, for scripts/bench-ubatch.py; the
+// bracket at the end has exact MiB. `trim_ms` is what the heap trim just
+// before it took, when there was one.
+void log_memory(const char * when, bool devices = true, double trim_ms = -1) {
+    constexpr double kGiB = 1073741824.0;
+    int64_t          at = 0;
+    size_t           avail = 0, flex = 0, flex_free = 0;
+    const int64_t    pool = sceKernelGetDirectMemorySize();
     sceKernelAvailableDirectMemorySize(0, pool, 2 * 1024 * 1024, &at, &avail);
     sceKernelConfiguredFlexibleMemorySize(&flex);
     sceKernelAvailableFlexibleMemorySize(&flex_free);
-    struct ps5_heap_stats heap = {};
-    ps5_heap_stats(&heap);
-    ps5lm::log_line("memory %s: pool %.4f GiB, pool free %.2f GiB, flexible %zu MiB (%zu free), cpu heap %.2f GiB "
-                    "(peak %.2f)", when, pool / 1073741824.0, avail / 1073741824.0, flex >> 20, flex_free >> 20,
-                    heap.mapped_bytes / 1073741824.0, heap.peak_bytes / 1073741824.0);
+    const ps5lm::HeapFigures heap = ps5lm::heap_figures();
+    std::string              line;
+    appendf(line, "memory %s: pool %.4f GiB, pool free %.2f GiB, flexible %zu MiB (%zu free), cpu heap %.2f GiB (",
+            when, pool / kGiB, avail / kGiB, flex >> 20, flex_free >> 20, heap.mapped / kGiB);
+    if (heap.has_in_use) {
+        appendf(line, "in use %.2f, ", heap.in_use / kGiB);
+    }
+    appendf(line, "peak %.2f)", heap.peak / kGiB);
     // The log sink's own figures: how far behind /data fell.
     const LogSinkStats sink = log_sink_stats();
     if (sink.running) {
-        std::printf(", log %llu KiB written, %llu KiB dropped, slowest write %llu ms",
-                    (unsigned long long) (sink.bytes_written >> 10), (unsigned long long) (sink.bytes_dropped >> 10),
-                    (unsigned long long) sink.slowest_write_ms);
+        appendf(line, ", log %llu KiB written, %llu KiB dropped, slowest write %llu ms",
+                (unsigned long long) (sink.bytes_written >> 10), (unsigned long long) (sink.bytes_dropped >> 10),
+                (unsigned long long) sink.slowest_write_ms);
         if (sink.bytes_failed > 0) {
-            std::printf(", %llu KiB refused by storage", (unsigned long long) (sink.bytes_failed >> 10));
+            appendf(line, ", %llu KiB refused by storage", (unsigned long long) (sink.bytes_failed >> 10));
         }
     }
+    // Exact figures: the pool's largest free block, the heap's mapped memory
+    // and segments, what of it is handed out (patches/sdk), and llama-server's
+    // POST requests ended and in flight.
+    appendf(line, " [MiB: largest %zu, heap %zu in %u segments", avail >> 20, heap.mapped >> 20, heap.segments);
+    if (heap.has_in_use) {
+        appendf(line, ", in use %zu, walk %.1f ms", heap.in_use >> 20, heap.walk_ms);
+    }
+    if (trim_ms >= 0) {
+        appendf(line, ", trim %.1f ms", trim_ms);
+    }
+    appendf(line, ", requests %llu, in flight %d]", (unsigned long long) ps5lm::heap_requests_ended(),
+            ps5lm::heap_requests_in_flight());
     for (size_t i = 0; devices && i < ggml_backend_dev_count(); i++) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(ggml_backend_dev_get(i), &free, &total);
-        std::printf(", %s free %zu total %zu", ggml_backend_dev_name(ggml_backend_dev_get(i)), free, total);
+        appendf(line, ", %s free %zu total %zu", ggml_backend_dev_name(ggml_backend_dev_get(i)), free, total);
     }
-    std::printf("\n");
+    ps5lm::log_line("%s\n", line.c_str());
 }
 
 // Rest mode ends the title, and on a jailbroken console the controllers do not
@@ -860,7 +894,7 @@ int main(int, char **) {
     setenv("LLAMA_CACHE", data_path("cache").c_str(), 0);
     // Driver and backend switches to measure with, one NAME=value a line in
     // env.txt, set before the GPU opens; only the driver's, ggml's, llama's and
-    // the app's own (PS5LM_WORKER_SCREEN, below).
+    // the app's own (PS5LM_SCREEN and PS5LM_WORKER_SCREEN, below).
     for (const auto & line : read_lines(g_files.env)) {
         const size_t eq = line.find('=');
         const std::string name = line.substr(0, eq == std::string::npos ? 0 : eq);
@@ -878,20 +912,26 @@ int main(int, char **) {
     // What the system gave the title, before the screen and the GPU take any
     // of it: the pool size follows sce_sys/param.json.
     log_memory("at start", false);
+    ps5lm::log_line("heap: %s\n", ps5lm::heap_can_trim()
+                                      ? "patches/sdk, empty segments go back to the pool after each request and every 10 s"
+                                      : "the SDK's own, no trim");
 
     // Fleet worker or not, before the screen: a worker started with
-    // PS5LM_WORKER_SCREEN=off in env.txt opens no screen at all. The screen and
-    // the dashboard take about 350 MiB of the pool (measured), which a console
-    // that is only a worker can give to the model instead.
+    // PS5LM_WORKER_SCREEN=off in env.txt opens no screen at all, and the app
+    // started with PS5LM_SCREEN=off neither. The screen and the dashboard take
+    // about 350 MiB of the pool (measured), which a console that only serves
+    // can give to the model instead.
     const FleetWorkerConfig fleet = read_fleet_worker_config(kFleetWorker);
-    const char * worker_screen = getenv("PS5LM_WORKER_SCREEN");
-    const bool headless = fleet.state == FleetWorkerConfig::enabled && worker_screen &&
-                          std::strcmp(worker_screen, "off") == 0;
+    const bool worker = fleet.state == FleetWorkerConfig::enabled;
+    const char * screen_switch = getenv(worker ? "PS5LM_WORKER_SCREEN" : "PS5LM_SCREEN");
+    const bool headless = (worker || fleet.state == FleetWorkerConfig::disabled) && screen_switch &&
+                          std::strcmp(screen_switch, "off") == 0;
 
     // The screen first: it takes from the same memory as the model.
     Display display;
     if (headless) {
-        ps5lm::log_line("fleet worker without a screen (PS5LM_WORKER_SCREEN=off)\n");
+        ps5lm::log_line(worker ? "fleet worker without a screen (PS5LM_WORKER_SCREEN=off)\n"
+                               : "no screen (PS5LM_SCREEN=off): the TV keeps the system's splash\n");
     } else if (!display.open(1920, 1080)) {
         ps5lm::log_line("no display\n");
     }
@@ -904,7 +944,7 @@ int main(int, char **) {
                        load_font(renderer, "dejavu-sans-mono.huifont", &mono, &fonts.mono);
     fonts.pixel = fonts.mono;
     fonts.hand = fonts.regular;
-    ps5lm::log_line("dashboard %s\n", ui_ok ? "ready" : "failed");
+    ps5lm::log_line("dashboard %s\n", ui_ok ? "ready" : headless ? "off" : "failed");
     // What the screen and the dashboard took, apart from the GPU's own start-up.
     log_memory("after the screen", false);
 
@@ -932,10 +972,15 @@ int main(int, char **) {
         render();
         display.swap();
     }
-    // A worker without a screen leaves the system's splash up: something on
-    // the TV, drawn by the system, from none of the app's memory.
+    // A worker or the app without a screen leaves the system's splash up:
+    // something on the TV, drawn by the system, from none of the app's memory.
     if (!headless) {
         sceSystemServiceHideSplashScreen();
+    } else if (!worker) {
+        char text[128];
+        std::snprintf(text, sizeof(text), "PS5LM: screen off (PS5LM_SCREEN in env.txt); the server answers on port %d",
+                      kPort);
+        notify(text);
     }
 
     // Fleet is a mutually exclusive startup mode, not another local model.
@@ -1027,6 +1072,11 @@ int main(int, char **) {
                 display.swap();
             } else {
                 sceKernelUsleep(16667);
+            }
+            // Every 10 s: the heap's empty segments go back to the pool.
+            if (n % 600 == 300 && ps5lm::heap_can_trim()) {
+                ps5lm::heap_trim();
+                ps5lm::heap_figures();  // the dashboard's heap figure (stats.cpp)
             }
             if (n == 120 || (n % 60 == 30 && !take_request_file("/data/PS5LM/memory").empty())) {
                 // What the worker holds: once it has started, and when asked
@@ -1210,9 +1260,11 @@ int main(int, char **) {
     hui::InputTracker tracker;
     hui::audio::Mixer mixer;
     hui::ps5::AudioOut audio_out;
-    audio_out.start(mixer);
     hui::audio::SoundBank sounds;
-    sounds.load(sandbox_path(kAssets) + "/audio/sfx");
+    if (ui_ok) {  // without a screen, no dashboard to make sounds
+        audio_out.start(mixer);
+        sounds.load(sandbox_path(kAssets) + "/audio/sfx");
+    }
 
     dash.set_busy("");
     Market    market;
@@ -1237,6 +1289,12 @@ int main(int, char **) {
     bool was_serving = false;
     bool rescanning = false;
     uint64_t restart_at = 0;  // the frame to stop the model and restart on, or 0
+    // The heap trim (heap_info.hpp), on where the heap can; the PC's request
+    // file "trim" turns it off and on, and "memory each" adds a memory line
+    // after every request and after its trim.
+    bool     trim_on = ps5lm::heap_can_trim(), memory_each = false;
+    uint64_t trim_seen = 0;
+    int64_t  trim_due = 0, last_trim = last, last_figures = last;
     for (uint64_t n = 0;; ++n) {
         const int64_t now = hui::sys::monotonic_us();
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
@@ -1265,6 +1323,39 @@ int main(int, char **) {
             log_memory("when ready");  // the weights, the cache and the compute buffers are all allocated by now
         }
         was_serving = serving;
+        // What a request freed goes back to the pool: 0.25 s after a request
+        // ends (its response and the slot's buffers are freed just after the
+        // hook that counts it), whether or not the next one has begun. In a run
+        // of requests they come 50 ms apart, and waiting for a gap would never
+        // trim. Also every 10 s. A trim hands back only segments with nothing
+        // left in them.
+        if (const uint64_t ended = ps5lm::heap_requests_ended(); ended != trim_seen) {
+            trim_seen = ended;
+            if (trim_due == 0) {
+                trim_due = now + 250000;
+            }
+        }
+        const bool after_request = trim_due != 0 && now >= trim_due;
+        if (after_request || now - last_trim >= 10000000) {
+            if (after_request && memory_each) {
+                log_memory("after a request", false);  // no device figures: the next request may be running
+            }
+            const double ms = trim_on ? ps5lm::heap_trim() : -1;
+            if (after_request && memory_each && ms >= 0) {
+                log_memory("after the trim", false, ms);
+            }
+            last_trim = now;
+            if (after_request) {
+                trim_due = 0;
+            }
+        }
+        // The dashboard's and the report's heap figure (stats.cpp), at most 10 s
+        // old: on a clock of its own, since requests ending under 10 s apart
+        // keep putting the periodic trim off.
+        if (ps5lm::heap_can_trim() && now - last_figures >= 10000000) {
+            ps5lm::heap_figures();
+            last_figures = now;
+        }
         if (n % 30 == 0) {
             models.publish(stats);
         }
@@ -1301,7 +1392,12 @@ int main(int, char **) {
                 }
             }
         }
-        dash.update(in, dt, feedback);
+        // Without a screen the controller steers nothing: a press on a page
+        // nobody sees could load or unload a model. The PC's request files
+        // below still work.
+        if (ui_ok) {
+            dash.update(in, dt, feedback);
+        }
         for (const auto & cue : feedback.cues) {
             if (!models.settings.sounds) {
                 break;
@@ -1408,7 +1504,7 @@ int main(int, char **) {
                 std::vector<MarketJob> jobs;
                 for (const SuggestedFile * f : { &s.model, &s.mmproj }) {
                     if (f->file) {
-                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "" });
+                        jobs.push_back({ s.repo, f->file, f->sha256, dir, f->bytes, f->save_as ? f->save_as : "", s.revision });
                     }
                 }
                 if (!market.enqueue(jobs, free_gib(dir))) {
@@ -1489,8 +1585,26 @@ int main(int, char **) {
                 std::thread(probe_write).detach();
             } else if (std::string g = take_request_file(data_path("bench-park")); !g.empty()) {
                 std::thread(probe_park, g).detach();
-            } else if (!take_request_file(data_path("memory")).empty()) {
-                log_memory("asked");  // scripts/bench-ubatch.py: what a prompt left allocated
+            } else if (std::string m = take_request_file(data_path("memory")); !m.empty()) {
+                if (m == "each" || m == "off") {
+                    // A line after every request and after its trim, or no more.
+                    memory_each = m == "each";
+                    ps5lm::log_line("memory lines after each request: %s\n", memory_each ? "on" : "off");
+                } else {
+                    log_memory("asked");  // scripts/bench-ubatch.py: what a prompt left allocated
+                }
+            } else if (std::string t = take_request_file(data_path("trim")); !t.empty()) {
+                // "on" or "off" for the trim after each request and every 10 s;
+                // anything else trims now, between two memory lines.
+                if (t == "on" || t == "off") {
+                    trim_on = t == "on" && ps5lm::heap_can_trim();
+                    ps5lm::log_line("heap trim after each request and every 10 s: %s%s\n", trim_on ? "on" : "off",
+                                    ps5lm::heap_can_trim() ? "" : " (this build's heap cannot trim)");
+                } else {
+                    log_memory("before trim");
+                    const double ms = ps5lm::heap_trim();
+                    log_memory("after trim", true, ms);
+                }
             } else if (std::string f = take_request_file(data_path("bench-read")); !f.empty()) {
                 std::thread(probe_read, f).detach();
             } else if (!take_request_file(data_path("bench-memory")).empty()) {
@@ -1527,8 +1641,10 @@ int main(int, char **) {
                 const bool ok = save_screen(data_path("screen.bmp").c_str(), display.width(), display.height());
                 ps5lm::log_line("screenshot %s\n", ok ? "saved" : "failed");
             }
+            display.swap();  // paces the loop at the TV's 60 Hz
+        } else {
+            sceKernelUsleep(16667);  // the same pace without a screen
         }
-        display.swap();
         if (n % 60 == 0) {
             quit_if_asked();
         }

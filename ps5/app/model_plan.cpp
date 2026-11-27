@@ -235,8 +235,11 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
 
     m.arch = strs["general.architecture"];
     m.projector_type = strs["clip.projector_type"];
+    // A projector's output width, only from files convert_hf_to_gguf.py marks as
+    // "mmproj": older LLaVA-style ones (convert_image_encoder_to_gguf.py) store
+    // the CLIP's own projection_dim there (768), not the text model's width.
     for (const char * k : { "clip.vision.projection_dim", "clip.audio.projection_dim" }) {
-        if (ints.count(k) && !m.projection_dim) {
+        if (strs["general.type"] == "mmproj" && ints.count(k) && !m.projection_dim) {
             m.projection_dim = (uint32_t) ints[k];
         }
     }

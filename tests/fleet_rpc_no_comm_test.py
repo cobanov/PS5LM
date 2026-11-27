@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression for the pinned v8 RPC server's server-side NO_COMM gate.
+"""Regression for the pinned v10 RPC server's server-side NO_COMM gate.
 
 Starts one loopback CPU worker. Sends only valid HELLO/COMM_INIT/DEVICE_COUNT
 frames, never model data. The requested extra port is already reserved, so even
@@ -68,7 +68,7 @@ def run(binary):
             sock.settimeout(1)
             hello = request(sock, 14, bytes(24), 28)
             # Only the major version breaks compatibility; upstream bumps the patch per new ggml op.
-            assert hello[0] == 8, hello[:3]
+            assert hello[0] == 10, hello[:3]
             for rank in (0, 1):
                 body = struct.pack('<IIII64s', 0, rank, 2, comm_port, b'127.0.0.1')
                 assert request(sock, 20, body, 1) == b'\0', f'rank {rank} was not refused'
