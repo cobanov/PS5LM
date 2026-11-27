@@ -307,6 +307,17 @@ v0.1.x are the upstream payload releases by cobanov.
   Measured on the console (Qwen 3.8 27B UD-IQ2_S with its F16 projector, 25 full-size photos): the
   largest free block of the pool ended at 1,316 MiB instead of 1,055, and the CPU heap at 1,100 MiB
   instead of 1,321, at the same 11.8 s a photo.
+- **A model gets only a vision projector that fits it** (#106). Projectors were paired by name
+  alone, and "qwen3" was enough: with `Qwen3.5-9B.mmproj-Q8_0.gguf` in the folder, every Qwen got
+  it. Qwen 3.8 27B (5120 wide) then planned with a 4096-wide projector and "needs 11.6 GiB with a
+  4k context", so it did not fit at all, and Qwen 3.5 0.8B (1024) was planned with images its
+  projector could not feed. Now a projector whose header gives an output width
+  (`clip.vision.projection_dim` or `clip.audio.projection_dim`) other than the model's
+  `embedding_length` is passed over for the next-best name, and without one the model runs text
+  only. The width is taken only from a file marked `general.type = "mmproj"`, as
+  `convert_hf_to_gguf.py` writes them: older LLaVA-style projectors store the CLIP's own
+  `projection_dim` there (768), and they, like any projector without the key, are paired by name
+  as before. `ps5/app/model_plan_test.cpp` covers the three cases and a legacy LLaVA pair.
 - **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
   chat template renders an assistant message's thinking only after the last user message, so the
   next user message rendered the turn before it differently and the cache no longer matched: on the

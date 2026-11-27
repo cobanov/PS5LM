@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <utility>
+#include <vector>
 
 namespace ps5lm {
 
@@ -98,13 +100,19 @@ std::string lower(std::string s) {
     return s;
 }
 
+ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_bytes);
+
 }  // namespace
 
 // The vision projector for a model: an "mmproj" .gguf in the same folder.
 // With several, the one whose name shares the longest start with the
 // model's, once "mmproj" and separators are set aside
 // ("mmproj-gemma-4-E4B-f16.gguf" for "gemma-4-E4B_q4_0-it.gguf").
-std::string find_mmproj(const std::string & model_path) {
+// A name can match a whole family ("qwen3" pairs any Qwen with the 3.5 9B's
+// projector, #106), so with the model's width known, a projector whose header
+// gives another output width is passed over and the next-best name is tried.
+// A projector without that key is paired by its name alone.
+std::string find_mmproj(const std::string & model_path, uint32_t n_embd) {
     const size_t slash = model_path.find_last_of('/');
     const std::string dir = model_path.substr(0, slash);
     const auto key = [](std::string n) {
@@ -116,11 +124,10 @@ std::string find_mmproj(const std::string & model_path) {
         return n;
     };
     const std::string want = key(model_path.substr(slash + 1));
-    std::string best;
-    size_t      best_len = 0;
+    std::vector<std::pair<size_t, std::string>> found;  // name in common, file name
     DIR * d = opendir(dir.c_str());
     if (!d) {
-        return best;
+        return {};
     }
     while (dirent * e = readdir(d)) {
         const std::string n = e->d_name;
@@ -134,13 +141,27 @@ std::string find_mmproj(const std::string & model_path) {
         }
         // At least the family's name in common ("gemma4e4b"), so a lone
         // projector of another model is not paired.
-        if (common >= 5 && common > best_len) {
-            best = dir + "/" + n;
-            best_len = common;
+        if (common >= 5) {
+            found.emplace_back(common, n);
         }
     }
     closedir(d);
-    return best;
+    std::sort(found.begin(), found.end(), [](const auto & a, const auto & b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+    for (const auto & [common, n] : found) {
+        const std::string path = dir + "/" + n;
+        if (n_embd) {
+            Reader r;
+            r.f = std::fopen(path.c_str(), "rb");
+            const uint32_t width = parse_model_info(r, path, 0).projection_dim;
+            if (width && width != n_embd) {
+                continue;
+            }
+        }
+        return path;
+    }
+    return {};
 }
 
 namespace {
@@ -214,6 +235,14 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
 
     m.arch = strs["general.architecture"];
     m.projector_type = strs["clip.projector_type"];
+    // A projector's output width, only from files convert_hf_to_gguf.py marks as
+    // "mmproj": older LLaVA-style ones (convert_image_encoder_to_gguf.py) store
+    // the CLIP's own projection_dim there (768), not the text model's width.
+    for (const char * k : { "clip.vision.projection_dim", "clip.audio.projection_dim" }) {
+        if (strs["general.type"] == "mmproj" && ints.count(k) && !m.projection_dim) {
+            m.projection_dim = (uint32_t) ints[k];
+        }
+    }
     if (!strs["general.name"].empty()) {
         m.name = strs["general.name"];
     }
@@ -240,6 +269,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     const uint64_t n_head = num("attention.head_count");
     m.n_head_kv       = (uint32_t) num("attention.head_count_kv", n_head);
     const uint64_t n_embd = num("embedding_length");
+    m.n_embd          = (uint32_t) n_embd;
     const uint64_t head_dim = n_head ? n_embd / n_head : 0;
     m.key_length      = (uint32_t) num("attention.key_length", head_dim);
     m.value_length    = (uint32_t) num("attention.value_length", head_dim);
@@ -276,7 +306,7 @@ ModelInfo read_model_info(const std::string & path) {
     Reader r;
     r.f = std::fopen(path.c_str(), "rb");
     ModelInfo m = parse_model_info(r, path, 0);
-    m.mmproj = find_mmproj(path);
+    m.mmproj = find_mmproj(path, m.n_embd);
     if (!m.mmproj.empty()) {
         struct stat st = {};
         m.mmproj_bytes = stat(m.mmproj.c_str(), &st) == 0 ? (uint64_t) st.st_size : 0;

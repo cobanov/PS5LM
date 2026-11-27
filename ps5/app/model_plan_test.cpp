@@ -156,6 +156,71 @@ int main(int argc, char ** argv) {
         rmdir(dir);
     }
 
+    // A projector is paired by name, but "qwen3" alone matches every Qwen
+    // (#106): where both widths are in the headers and differ, the next-best
+    // name is tried, and without one the model runs text only. A projector
+    // without the key is still paired by its name (above).
+    {
+        char dir[] = "/tmp/model_plan_test.XXXXXX";
+        assert(mkdtemp(dir));
+        const std::string at = dir;
+        std::vector<std::string> files;
+        const auto write = [&](const std::string & name, const Gguf & g) {
+            std::ofstream(at + "/" + name, std::ios::binary) << g.bytes();
+            files.push_back(at + "/" + name);
+        };
+        const auto qwen = [](uint32_t width) {
+            Gguf g;
+            g.kv("general.architecture", "qwen35").kv("qwen35.block_count", 32u)
+                .kv("qwen35.attention.head_count", 16u).kv("qwen35.attention.head_count_kv", 4u)
+                .kv("qwen35.embedding_length", width).kv("qwen35.context_length", 262144u);
+            return g;
+        };
+        const auto projector = [](uint32_t width) {
+            Gguf g;
+            g.kv("general.architecture", "clip").kv("general.type", "mmproj")
+                .kv("clip.projector_type", "qwen3vl_merger").kv("clip.vision.projection_dim", width);
+            return g;
+        };
+        // An older LLaVA-style projector: no general.type, and projection_dim is
+        // the CLIP's own (768), not the 4096 its model needs.
+        Gguf llava;
+        llava.kv("general.architecture", "llama").kv("llama.block_count", 32u)
+            .kv("llama.attention.head_count", 32u).kv("llama.attention.head_count_kv", 32u)
+            .kv("llama.embedding_length", 4096u).kv("llama.context_length", 4096u);
+        Gguf llava_projector;
+        llava_projector.kv("general.architecture", "clip").kv("clip.projector_type", "mlp")
+            .kv("clip.vision.projection_dim", 768u);
+        write("Qwen3.5-9B-Q4_K_M.gguf", qwen(4096));
+        write("Qwen3.8-27B-UD-Q2_K_XL.gguf", qwen(5120));
+        write("Qwen3.5-0.8B-Q4_K_M.gguf", qwen(1024));
+        write("Qwen3.5-9B.mmproj-Q8_0.gguf", projector(4096));
+        write("mmproj-Qwen3-F16.gguf", projector(1024));
+        write("llava-v1.5-7b-Q5_K_M.gguf", llava);
+        write("llava-v1.5-7b-mmproj-model-f16.gguf", llava_projector);
+
+        const ps5lm::ModelInfo nine = ps5lm::read_model_info(at + "/Qwen3.5-9B-Q4_K_M.gguf");
+        assert(nine.n_embd == 4096 && nine.mmproj == at + "/Qwen3.5-9B.mmproj-Q8_0.gguf");
+        // 9B's projector is the best name for 0.8B, but feeds 4096 wide: the next one fits.
+        const ps5lm::ModelInfo small = ps5lm::read_model_info(at + "/Qwen3.5-0.8B-Q4_K_M.gguf");
+        assert(small.mmproj == at + "/mmproj-Qwen3-F16.gguf");
+        // No projector feeds 5120: text only, and the plan has no images.
+        const ps5lm::ModelInfo big = ps5lm::read_model_info(at + "/Qwen3.8-27B-UD-Q2_K_XL.gguf");
+        assert(big.n_embd == 5120 && big.mmproj.empty() && big.mmproj_bytes == 0);
+        const ps5lm::Plan bp = ps5lm::plan_model(big, budget, 8192);
+        assert(std::find(bp.args.begin(), bp.args.end(), "--mmproj") == bp.args.end());
+        // A legacy projector's 768 is not a model width: it pairs by name.
+        const ps5lm::ModelInfo lv = ps5lm::read_model_info(at + "/llava-v1.5-7b-Q5_K_M.gguf");
+        assert(lv.n_embd == 4096 && lv.mmproj == at + "/llava-v1.5-7b-mmproj-model-f16.gguf");
+        // Without the model's width, the name alone decides, as before.
+        assert(ps5lm::find_mmproj(at + "/Qwen3.8-27B-UD-Q2_K_XL.gguf") == at + "/Qwen3.5-9B.mmproj-Q8_0.gguf");
+
+        for (const auto & f : files) {
+            unlink(f.c_str());
+        }
+        rmdir(dir);
+    }
+
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
         return 0;
