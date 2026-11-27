@@ -27,12 +27,12 @@ fi
 # Keep the same patch set on the controller and the PS5 title (scripts/build-app.sh
 # applies patches/fleet too), with no protocol fork.
 "$root/scripts/apply-patches.sh" "$llama" "$root"/patches/*.patch "$root"/patches/fleet/*.patch
-# patches/0007's request hooks and patches/fleet/0005's cache writer are weak
-# and only the PS5 title defines them; ELF linkers leave them null, Apple's ld
-# must be told they may stay undefined.
+# patches/0007's request hooks, patches/fleet/0005's cache writer and
+# patches/fleet/0009's park writer are weak and only the PS5 title defines them;
+# ELF linkers leave them null, Apple's ld must be told they may stay undefined.
 link_flags=()
 if [ "$(uname -s)" = Darwin ]; then
-    link_flags=("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-U,_ps5lm_activity_begin -Wl,-U,_ps5lm_activity_data -Wl,-U,_ps5lm_activity_end -Wl,-U,_ps5lm_rpc_cache_write")
+    link_flags=("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-U,_ps5lm_activity_begin -Wl,-U,_ps5lm_activity_data -Wl,-U,_ps5lm_activity_end -Wl,-U,_ps5lm_rpc_cache_write -Wl,-U,_ps5lm_rpc_park_write")
 fi
 "$cmake_bin" -S "$llama" -B "$out" -G Ninja "${link_flags[@]}" \
     -DCMAKE_MAKE_PROGRAM="$(command -v "$ninja_bin")" \
