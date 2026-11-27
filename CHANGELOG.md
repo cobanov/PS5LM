@@ -324,6 +324,15 @@ v0.1.x are the upstream payload releases by cobanov.
   leave its visible reply empty in 4 of 6 Open WebUI follow-ups, so no empty block is rendered.
   `tests/test-chat.cpp` checks that a new message only appends and that no empty block is rendered.
   From @MCsumz's fork, [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix).
+- **MiniCPM-V 4.7 keeps an agent turn in the cache for clients that send the thinking back.** It is
+  a Qwen3.5 model with openbmb's own template, which renders an assistant message's thinking only
+  after the last user message and an empty block everywhere else, with no `preserve_thinking`
+  switch. On the console (MiniCPM-V 4.7 1B, PS5 Pro), only 24 of an agent turn's 276 prompt tokens
+  (8.7 %) were still a prefix after the next message, so the whole turn was processed again; Open
+  WebUI, which sends no thinking back, kept 100 %. `patches/0013` now gives that template the same
+  switch: with `--reasoning-preserve` (the default) a message keeps its thinking wherever it is,
+  and one without thinking keeps the template's empty block. `tests/test-chat.cpp` checks it with
+  the template from the Suggested file (`models/templates/openbmb-MiniCPM-V-4.7-1B.jinja`).
 - **A fleet worker no longer loses memory with every prompt batch**: llama.cpp's
   RPC server kept a copy of every graph a host sent (about 4 MiB for a 27B
   model) until 1,024 had come, and a host sends a new one for nearly every batch
