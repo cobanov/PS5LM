@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""patches/0023 on a host llama-server: a streamed reply leaves its keep-alive connection open.
+"""A host llama-server: a streamed reply leaves its keep-alive connection open.
 
-The chunk provider called done() and then returned false, and cpp-httplib took that as a cancelled
-response: it closed the connection right after one that advertised Keep-Alive. A client that
-reuses it at once (Open WebUI sends each tool-call continuation within a fraction of a second) got
-a disconnect. Here two streamed requests and a plain one go over one connection, on each endpoint.
+Before ggml-org/llama.cpp#30492 (cf9a9957d, in the d2bceda3d pin), the chunk provider called
+done() and then returned false, and cpp-httplib took that as a cancelled response: it closed the
+connection right after one that advertised Keep-Alive. A client that reuses it at once (Open WebUI
+sends each tool-call continuation within a fraction of a second) got a disconnect. Here two
+streamed requests and a plain one go over one connection, on each endpoint; upstream's own test
+covers only /completion.
 
 Run after scripts/build-fleet-host.sh. The model is the untrained fixture, so only the HTTP framing
 is checked, not the words.

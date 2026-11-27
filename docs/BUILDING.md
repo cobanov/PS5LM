@@ -95,7 +95,9 @@ PS5_HOST=<console IP> scripts/ps5lm-app.sh screenshot out.bmp
   `build-app.sh`) to elfldr; it starts the title for the foreground user with `sceLncUtilLaunchApp`.
   A title started without a user (shsrv's `launch`) is ended by the system after about 20 seconds.
 - `/data/PS5LM/app-args.txt` (one argument a line) overrides the planner. `/data/PS5LM/env.txt` (one
-  `NAME=value` a line) sets `RADV_`, `MESA_`, `ACO_`, `GGML_` and `LLAMA_` switches before the GPU opens.
+  `NAME=value` a line) sets `RADV_`, `MESA_`, `ACO_`, `GGML_`, `LLAMA_` and `PS5LM_` switches before the
+  GPU opens. `PS5LM_SCREEN=off` there starts the app without its screen, leaving its memory to the model;
+  remove the line and restart PS5LM (a `load` request restarts it too) to bring the screen back.
 - The artwork comes from SVG: `brand/build.py` draws the icon and the home screen background with
   their letters outlined (see `brand/README.md`), and `scripts/render-artwork.sh` renders them to PNG.
   `scripts/bake-fonts.sh` bakes Manrope for the dashboard.

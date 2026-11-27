@@ -35,6 +35,7 @@ struct MarketJob {
     std::string repo, file, sha256, dir;
     uint64_t    bytes = 0;
     std::string save_as;         // the name on the console when it is not the file's ("mmproj-<model>.gguf")
+    std::string revision;        // the commit to fetch it from (a Suggested entry's pin); empty: main
 };
 
 enum class DownloadState : uint8_t { queued, running, retrying, paused, failed, done };

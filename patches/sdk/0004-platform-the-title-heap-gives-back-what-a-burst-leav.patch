@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mihawk <163614687+mihawk-99@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:20:57 -0500
+Subject: [PATCH 4/4] platform: the title heap gives back what a burst leaves,
+ wherever it lies
+
+After a title had compiled its shaders (a recompiled game on RADV: 1,873 pipelines in 58 s) its heap stayed at 3.4 GiB
+mapped with 0.7 GiB in blocks in use, and the game beside it ran out of the direct memory they share. dlmalloc gives a
+segment back only whole, and the heap's mappings lay one after another, so dlmalloc joined them into one segment for
+each arena: any block left near its end held everything below.
+
+- src/heap.c: one unit is left unmapped between two mappings (HEAP_GAP), so segments are never joined and the ones
+  nothing is left in go back wherever they lie. ps5_heap_trim() asks every arena for that now; ps5_heap_stats has
+  in_use_bytes, what the arenas hold in blocks handed out.
+- src/dlmalloc/mspace.c: an arena keeps 32 MiB free at its top before a free returns any (DEFAULT_TRIM_THRESHOLD; 2 MiB
+  before): with the segments apart, a title that frees and allocates in bursts unmapped and mapped the same memory over
+  and over (23 fps where it had 27). mallinfo is built in, for in_use_bytes.
+- include/ps5platform/heap.h: the two, and PS5_HEAP_TRIM for a title that builds with an older SDK too.
+
+A title calls ps5_heap_trim every 10 s or so. On a PS5 Pro, the same title and run: 2.2 GiB mapped after the compile
+where it was 3.4, and 1.0-1.08 GiB in play with its caches warm where it was 1.12-1.18, at the same frame rate.
+
+make test: 324 of 324 checks; the new one (a burst of 150 MiB, most of it freed, a trim) fails with HEAP_GAP 0. make
+builds the console library with -Werror.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+Backported to b83202be for PS5LM from mihawk-99/PS5_PayloadSDK commit 55a2de04e3364f0a6c8d6c337dc95436cf091ef0. Whole commit.
+---
+ platform/include/ps5platform/heap.h | 10 ++++++++++
+ platform/src/dlmalloc/mspace.c      | 22 +++++++++++++++++++++-
+ platform/src/heap.c                 | 25 +++++++++++++++++++++++--
+ platform/tests/test_platform.c      | 27 +++++++++++++++++++++++++++
+ 4 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/platform/include/ps5platform/heap.h b/platform/include/ps5platform/heap.h
+index ca7e417..b309058 100644
+--- a/platform/include/ps5platform/heap.h
++++ b/platform/include/ps5platform/heap.h
+@@ -64,8 +64,18 @@ struct ps5_heap_stats {
+    unsigned long long libc_fallbacks;
+    /* The arenas made so far: one for each allocating thread, up to eight. */
+    unsigned arenas;
++   /* What the arenas hold in blocks handed out; the rest of mapped_bytes is
++    * free inside their segments. */
++   size_t in_use_bytes;
+ };
+ 
++/* Gives back each arena's free top and its segments with nothing in them. A
++ * free does that only past 32 MiB at an arena's top and every few thousand
++ * frees: a title calls this now and then (every 10 s, say) so that what a
++ * burst took goes back to the pool it shares with its GPU and its guest. */
++#define PS5_HEAP_TRIM 1
++void ps5_heap_trim(void);
++
+ void ps5_heap_stats(struct ps5_heap_stats *stats);
+ 
+ /* The heap itself, for a title with an allocator of its own: NULL when direct
+diff --git a/platform/src/dlmalloc/mspace.c b/platform/src/dlmalloc/mspace.c
+index 2324501..4452fe1 100644
+--- a/platform/src/dlmalloc/mspace.c
++++ b/platform/src/dlmalloc/mspace.c
+@@ -41,10 +41,30 @@ int ps5p_heap_unmap(void *address, size_t bytes);
+  * table is sized for the larger count of segments this makes. */
+ #define DEFAULT_GRANULARITY ((size_t)2 << 20)
+ #define DEFAULT_MMAP_THRESHOLD ((size_t)32 << 20)
++/* An arena keeps this much free at its top before a free gives any back. At
++ * dlmalloc's 2 MiB a title that frees and allocates in bursts (a game area
++ * loading) unmapped and mapped the same direct memory over and over: 23 fps
++ * where it had 27. What stays free goes back at ps5_heap_trim. */
++#define DEFAULT_TRIM_THRESHOLD ((size_t)32 << 20)
+ #define MALLOC_FAILURE_ACTION errno = ENOMEM
+-#define NO_MALLINFO 1
++#define NO_MALLINFO 0
+ #define NO_MALLOC_STATS 1
+ /* Direct memory's unit, so every size dlmalloc maps and unmaps is one the
+  * kernel allocates as asked. */
+ #define malloc_getpagesize ((size_t)0x10000)
+ #include "malloc.c"
++
++/* For src/heap.c's report and trim: what an arena holds in blocks it has
++ * handed out; and its free top and its segments with nothing in them given
++ * back. */
++size_t
++ps5p_mspace_in_use(mspace space)
++{
++   return (size_t)mspace_mallinfo(space).uordblks;
++}
++
++int
++ps5p_mspace_trim(mspace space)
++{
++   return mspace_trim(space, 0);
++}
+diff --git a/platform/src/heap.c b/platform/src/heap.c
+index 262c57a..3ad437f 100644
+--- a/platform/src/heap.c
++++ b/platform/src/heap.c
+@@ -42,11 +42,20 @@ void *mspace_realloc(mspace space, void *pointer, size_t bytes);
+ void *mspace_memalign(mspace space, size_t alignment, size_t bytes);
+ size_t mspace_usable_size(const void *pointer);
+ void mspace_free(mspace space, void *pointer);
++size_t ps5p_mspace_in_use(mspace space);
++int ps5p_mspace_trim(mspace space);
+ 
+ 
+ /* Enough segments of the arenas' 2 MiB granularity (src/dlmalloc/mspace.c) to
+  * fill the whole range: 16 GiB / 2 MiB. */
+ #define HEAP_MAX_SEGMENTS 8192
++/* Left unmapped between two mappings, so that dlmalloc never joins them into
++ * one segment. It gives a segment back only whole, and one that grew by
++ * joining is held by any block left anywhere in it: after a title had compiled
++ * its shaders its heap stayed at 3.4 GiB mapped with 0.7 GiB in use, and the
++ * game beside it ran out of direct memory. Apart, the segments nothing is left
++ * in go back wherever they lie (2.2 GiB mapped in the same run). */
++#define HEAP_GAP HEAP_UNIT
+ #define HEAP_UNIT PS5P_DIRECT_UNIT
+ #define HEAP_PROTECTION (PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE)
+ 
+@@ -101,9 +110,9 @@ heap_map_locked(size_t bytes)
+    unsigned slot = 0;
+    size_t offset = 0;
+    for (; slot < segment_count; slot++) {
+-      if (segments[slot].offset - offset >= bytes)
++      if (segments[slot].offset - offset >= bytes + HEAP_GAP)
+          break;
+-      offset = segments[slot].offset + segments[slot].bytes;
++      offset = segments[slot].offset + segments[slot].bytes + HEAP_GAP;
+    }
+    if (offset > range_bytes || range_bytes - offset < bytes)
+       return (void *)-1;
+@@ -275,6 +284,18 @@ ps5_heap_stats(struct ps5_heap_stats *stats)
+    for (unsigned i = 0; i < HEAP_ARENAS; i++)
+       stats->arenas += __atomic_load_n(&arena_states[i], __ATOMIC_ACQUIRE) == 2;
+    stats->libc_fallbacks = __atomic_load_n(&libc_fallbacks, __ATOMIC_RELAXED);
++   stats->in_use_bytes = 0;
++   for (unsigned i = 0; i < HEAP_ARENAS; i++)
++      if (__atomic_load_n(&arena_states[i], __ATOMIC_ACQUIRE) == 2)
++         stats->in_use_bytes += ps5p_mspace_in_use(arenas[i]);
++}
++
++void
++ps5_heap_trim(void)
++{
++   for (unsigned i = 0; i < HEAP_ARENAS; i++)
++      if (__atomic_load_n(&arena_states[i], __ATOMIC_ACQUIRE) == 2)
++         ps5p_mspace_trim(arenas[i]);
+ }
+ 
+ void
+diff --git a/platform/tests/test_platform.c b/platform/tests/test_platform.c
+index 94728f2..3bab198 100644
+--- a/platform/tests/test_platform.c
++++ b/platform/tests/test_platform.c
+@@ -1109,6 +1109,33 @@ test_heap(void)
+          "heap: freeing it returns the segment's direct memory");
+    check(stats.peak_bytes >= mapped + ((size_t)100 << 20), "heap: the peak remembers it");
+ 
++   /* What a burst leaves: after most of 150 MiB is freed, a trim gives back
++    * the segments nothing is left in, wherever they lie among the ones still
++    * held (they are never joined into one). */
++   enum { BURST = 256, BURST_BLOCK = 600000 };
++   static void *burst[BURST];
++   ps5_heap_stats(&stats);
++   const size_t before_burst = stats.mapped_bytes;
++   bool burst_made = true;
++   for (int i = 0; i < BURST; i++)
++      burst_made &= (burst[i] = __wrap_malloc(BURST_BLOCK)) != NULL;
++   ps5_heap_stats(&stats);
++   const size_t burst_mapped = stats.mapped_bytes;
++   check(burst_made && burst_mapped >= before_burst + ((size_t)140 << 20) &&
++            stats.in_use_bytes >= (size_t)BURST * BURST_BLOCK && stats.in_use_bytes <= stats.mapped_bytes,
++         "heap: a burst of blocks maps their segments, counted in use");
++   for (int i = 0; i < BURST; i++)
++      if (i % 32)
++         __wrap_free(burst[i]);
++   ps5_heap_trim();
++   ps5_heap_stats(&stats);
++   check(stats.mapped_bytes <= before_burst + ((size_t)40 << 20),
++         "heap: a trim gives back the segments a burst left empty, between the ones still held");
++   check(stats.in_use_bytes >= (size_t)(BURST / 32) * BURST_BLOCK && stats.in_use_bytes <= stats.mapped_bytes,
++         "heap: the blocks kept are still counted in use");
++   for (int i = 0; i < BURST; i += 32)
++      __wrap_free(burst[i]);
++
+    /* libc's blocks stay libc's. */
+    char *foreign = strdup("libc's own");
+    check(foreign && !ps5_heap_owns(foreign), "heap: a libc block is not the heap's");

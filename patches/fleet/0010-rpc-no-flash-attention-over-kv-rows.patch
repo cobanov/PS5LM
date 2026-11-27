@@ -1,0 +1,42 @@
+Subject: [PATCH] rpc: no flash attention over K/V rows on an RPC device
+
+llama.cpp asks each backend whether it can run flash attention with a list of
+K/V rows (ggml_flash_attn_ext_rows, a sixth source on GGML_OP_FLASH_ATTN_EXT)
+by reserving a graph and looking at where the scheduler put the node
+(llama_context::resolve_fused_ops). The RPC device answers supports_op with
+true for every op without asking its server, so on a context with a unified
+KV cache the probe found the rows supported on every RPC device, whatever is
+behind it. ggml-vulkan has no kernel for it and says so in its own
+supports_op, but the RPC server computes the graph it is sent without asking:
+a PS5 worker would have been sent an op its backend does not have.
+
+The RPC device now answers false for that one form, so a context on RPC
+devices keeps the dense mask, as at the pin before. GGML_RPC_KV_ROWS=1 on the
+host offers it again, for workers known to have the kernel (a CPU or CUDA
+ggml-rpc-server).
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index acd8c9d2a..c91412151 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3543,7 +3543,19 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+ 
+ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     GGML_UNUSED(dev);
+-    GGML_UNUSED(op);
++    // PS5LM: this answers for a device it does not ask, so llama.cpp's probe of flash attention
++    // over K/V rows (ggml_flash_attn_ext_rows, src[5]) found it "supported" on every RPC device
++    // and sent it to workers whose backend has no such kernel: ggml-vulkan refuses it in its own
++    // supports_op, and the RPC server computes what it is sent without asking. Not offered over
++    // RPC, so a context on RPC devices keeps the dense mask (GGML_RPC_KV_ROWS=1 offers it again,
++    // for workers known to have it).
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5] != nullptr) {
++        static const bool kv_rows = [] {
++            const char * e = getenv("GGML_RPC_KV_ROWS");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        return kv_rows;
++    }
+     //TODO: call the remote backend and cache the results
+     return true;
+ }

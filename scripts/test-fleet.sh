@@ -36,6 +36,7 @@ if [[ ${1:-} == --rpc ]]; then
         python3 tests/fleet_rpc_park_test.py --build "$out" --model "$PS5LM_PARK_TEST_MODEL" --output build/fleet-park-model
     fi
     python3 tests/server_system_messages_test.py --build "$out"
+    python3 tests/server_media_marker_test.py --build "$out"
     python3 tests/server_stream_keepalive_test.py --build "$out"
     python3 tests/server_checkpoints_test.py --build "$out"
     python3 tests/server_reply_as_generated_test.py --build "$out"

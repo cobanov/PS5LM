@@ -656,7 +656,7 @@ def case_crash(rig, report):
 
 
 def hello_features(rig, park):
-    """The fourth byte of a worker's HELLO answer; a worker of its own, as one serves a single client at a time."""
+    """The flags byte (the fourth) of a worker's HELLO answer; a worker of its own, as one serves a single client at a time."""
     port, = free_ports(1)
     env = dict(rig.env)
     if park:
@@ -716,9 +716,10 @@ def case_mixed(rig, report):
         seen["old host, new worker"] = "serves; has no park actions"
         rig.stop()
 
-    # what a worker says in its handshake: bit 0 is the graph-free of patches/fleet/0006, bit 1 parking
-    assert hello_features(rig, park=True) & 3 == 3
-    assert hello_features(rig, park=False) & 3 == 1
+    # what a worker says in the flags byte of its handshake: bit 6 is the graph-free of patches/fleet/0006,
+    # bit 7 parking (llama.cpp's own flags count up from bit 0)
+    assert hello_features(rig, park=True) & 0xC0 == 0xC0
+    assert hello_features(rig, park=False) & 0xC0 == 0x40
     seen["handshake"] = "parking is offered only with a park folder"
     rig.start()
     report["mixed"] = seen

@@ -1,0 +1,36 @@
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1263,6 +1263,24 @@
+             throw std::runtime_error("Invalid base64 value");
+         }
+         out_files.push_back(decoded_data);
++    }
++}
++
++// PS5LM: text that already holds the media marker made mtmd count one media part more than the
++// request had, and every later request of that chat failed with "Failed to tokenize prompt".
++// /props publishes the marker, so a tool that read it was enough. Only the media parts that
++// oaicompat_content_load_media makes may carry it; elsewhere it is written as [media marker].
++static void oaicompat_strip_media_marker(json & j) {
++    if (j.is_string()) {
++        std::string text = j.get<std::string>();
++        if (text.find(get_media_marker()) != std::string::npos) {
++            string_replace_all(text, get_media_marker(), "[media marker]");
++            j = text;
++        }
++    } else if (j.is_array() || j.is_object()) {
++        for (auto & v : j) {
++            oaicompat_strip_media_marker(v);
++        }
+     }
+ }
+ // load media files from an OAI content array, then replace each media part with a media marker text part
+@@ -1402,6 +1420,8 @@
+         throw std::invalid_argument("'messages' is required");
+     }
+     json & messages = body.at("messages");
++    oaicompat_strip_media_marker(messages);
++    oaicompat_strip_media_marker(tools);
+     if (!messages.is_array()) {
+         throw std::invalid_argument("Expected 'messages' to be an array");
+     }
