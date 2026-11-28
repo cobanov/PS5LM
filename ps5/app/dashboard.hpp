@@ -13,6 +13,7 @@
 #include "market.hpp"
 #include "settings.hpp"
 #include "stats.hpp"
+#include "usb_input.hpp"
 
 #include "core/input.hpp"
 #include "core/tween.hpp"
@@ -21,6 +22,7 @@
 #include "ui/components/input_prompt.hpp"
 #include "ui/feedback.hpp"
 #include "ui/fonts.hpp"
+#include "ui/glyphs.hpp"
 #include "ui/motion.hpp"
 
 #include <string>
@@ -77,9 +79,13 @@ class Dashboard {
         report_busy_ = busy;
         report_status_ = std::move(status);
     }
-    int  page() const { return page_; }
-    void update(const hui::InputFrame & input, float dt, hui::ui::Feedback & feedback);
-    void draw(DashboardFrame & frame) const;
+    int       page() const { return page_; }
+    bool      wants_text_input() const { return prompt_.is_open() && !busy(); }
+    InputMode input_mode() const { return input_mode_; }
+    void      update(const hui::InputFrame & input, float dt, hui::ui::Feedback & feedback,
+                     const TextInput & text = {}, const PointerInput & pointer = {},
+                     const InputActivity & activity = {});
+    void      draw(DashboardFrame & frame) const;
 
     // What the user asked for, once: load or unload a model, or the settings
     // changed (read them with settings()).
@@ -107,12 +113,15 @@ class Dashboard {
     void update_settings(const hui::InputFrame & input, hui::ui::Feedback & feedback);
     void update_picker(const hui::InputFrame & input, hui::ui::Feedback & feedback);
     void update_logs(const hui::InputFrame & input, hui::ui::Feedback & feedback);
+    void update_prompt_text(const TextInput & text, hui::ui::Feedback & feedback);
+    void handle_pointer(const PointerInput & pointer, hui::InputFrame * input, hui::ui::Feedback & feedback);
     void start_download(hui::ui::Feedback & feedback);
     void refilter_logs();
     const std::vector<std::string> & log_view() const { return log_llama_ ? llama_view_ : app_view_; }
 
     void draw_status(hui::gfx::DrawList & list) const;
     void draw_dock(hui::gfx::DrawList & list) const;
+    void draw_cursor(hui::gfx::DrawList & list) const;
     void draw_home(hui::gfx::DrawList & list) const;
     void draw_models(hui::gfx::DrawList & list) const;
     void draw_local(hui::gfx::DrawList & list, const hui::gfx::Rect & area) const;
@@ -130,6 +139,16 @@ class Dashboard {
     void update_storage_dialog(const hui::InputFrame & input, hui::ui::Feedback & feedback);
     void draw_busy(hui::gfx::DrawList & list) const;
     void draw_hints(hui::gfx::DrawList & list) const;
+
+    struct ActionHint {
+        hui::ui::Hint hint;
+        hui::Action   action = hui::Action::count;
+    };
+    std::vector<ActionHint> current_hints() const;
+    void draw_action_hints(hui::gfx::DrawList & list, const hui::ui::Hint * hints, int count, float right_x,
+                           const hui::ui::HintLayout & layout) const;
+    int  hit_action_hints(float px, float py, const hui::ui::Hint * hints, int count, float right_x,
+                          const hui::ui::HintLayout & layout) const;
 
     const hui::ui::Fonts & fonts_;
     Live        live_;
@@ -191,6 +210,9 @@ class Dashboard {
     bool  log_llama_ = false;
     bool  log_errors_ = false;
     int   log_scroll_ = 0;          // lines up from the newest
+
+    InputMode    input_mode_ = InputMode::controller;
+    PointerInput pointer_{};
 };
 
 }  // namespace ps5lm

@@ -11,7 +11,9 @@ are cancelled. There are two independent jobs:
   limits and propagation of failed background compilers. No submodule or model download
   is needed for these checks.
 - **Full PS5 title cross-build** (45-minute limit, two compiler jobs), with the
-  fleet RPC worker in it ([FLEET.md](FLEET.md)). It bootstraps the public SDK, reproduces
+  fleet RPC worker in it ([FLEET.md](FLEET.md)). It runs the host `ftp_writer_test.cpp`
+  and `usb_input_test.cpp` checks (the latter using `third_party/ps5-homebrew-ui`),
+  bootstraps the public SDK, reproduces
   clean-room `libc.prx`, builds patched RADV and llama-server/native dashboard,
   packages the title folder, and inspects its ELF/FSELF structure and integrity.
   It does not execute the resulting title.
@@ -48,6 +50,10 @@ package list in the workflow, or an x86-64 Linux host with equivalent tools:
 
 ```sh
 git submodule update --init --depth 1
+c++ -std=c++20 -O2 -Wall -Wextra -Werror -Ithird_party/ps5-homebrew-ui/src -Ips5/app \
+    ps5/app/usb_input_test.cpp ps5/app/usb_input.cpp third_party/ps5-homebrew-ui/src/core/input.cpp \
+    -o build/usb_input_test
+build/usb_input_test
 export PATH=/usr/lib/llvm-19/bin:$PATH
 LLVM_CONFIG=/usr/bin/llvm-config-19 BUILD_JOBS=2 scripts/test-native-build.sh
 ```

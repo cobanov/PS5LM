@@ -61,6 +61,7 @@
 #include "storage.hpp"
 #include "stats.hpp"
 #include "suggested.hpp"
+#include "usb_input.hpp"
 #include "version.hpp"
 
 #include "heap_info.hpp"
@@ -1258,10 +1259,12 @@ int main(int, char **) {
     hui::ps5::Pad pad;
     pad.open();
     hui::InputTracker tracker;
+    UsbInput usb_input;
     hui::audio::Mixer mixer;
     hui::ps5::AudioOut audio_out;
     hui::audio::SoundBank sounds;
-    if (ui_ok) {  // without a screen, no dashboard to make sounds
+    if (ui_ok) {  // without a screen, no dashboard to make sounds or steer with USB/CEC input
+        usb_input.open();
         audio_out.start(mixer);
         sounds.load(sandbox_path(kAssets) + "/audio/sfx");
     }
@@ -1301,7 +1304,11 @@ int main(int, char **) {
         last = now;
 
         const size_t count = pad.read(samples);
-        const hui::InputFrame input = tracker.update(std::span<const hui::PadSample>(samples, count), (uint64_t) now);
+        const hui::InputFrame pad_in = tracker.update(std::span<const hui::PadSample>(samples, count), (uint64_t) now);
+        const bool pad_active = pad_in.pressed != 0 || pad_in.nav != hui::Direction::none ||
+                                pad_in.stick_x != 0.0f || pad_in.stick_y != 0.0f;
+        const UsbFrame usb = ui_ok ? usb_input.poll((uint64_t) now, dash.wants_text_input(), pad_active) : UsbFrame{};
+        const hui::InputFrame input = merge_input(pad_in, usb.actions);
         Live live = stats.snapshot();
         if (g_server_rc >= 0 && live.state != ServerState::failed && live.state != ServerState::no_model) {
             stats.set_state(ServerState::failed);
@@ -1396,7 +1403,9 @@ int main(int, char **) {
         // nobody sees could load or unload a model. The PC's request files
         // below still work.
         if (ui_ok) {
-            dash.update(in, dt, feedback);
+            const InputActivity activity{ pad_in.connected, pad_active, usb.keyboard_connected || usb.mouse_connected,
+                                          usb.keyboard_activity || usb.mouse_activity };
+            dash.update(in, dt, feedback, usb.text, usb.pointer, activity);
         }
         for (const auto & cue : feedback.cues) {
             if (!models.settings.sounds) {

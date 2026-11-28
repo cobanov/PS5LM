@@ -220,7 +220,7 @@ done
 for pid in "${kit_pending[@]}"; do wait "$pid"; done
 rm -f "$obj/libps5lm_kit.a"
 "$sdk/bin/llvm-ar" rcs "$obj/libps5lm_kit.a" "${kit_objects[@]}"
-for src in display dashboard stats; do
+for src in display dashboard stats usb_input; do
     cxx -fexceptions -fcxx-exceptions "${kitflags[@]}" -c "$root/ps5/app/$src.cpp" -o "$obj/$src.o"
 done
 
@@ -241,6 +241,16 @@ for lib in libSceAgc libSceAgcDriver; do
     "$sdk/bin/prospero-lld" --shared -soname "$lib.prx" -o "$out/stubs/$lib.so" "$obj/${lib}_stub.o"
 done
 
+# libSceMouse is not shipped in the payload SDK's stub directory.
+cat > "$out/stubs/libSceMouse.c" <<'EOF'
+void sceMouseInit(void) {}
+void sceMouseOpen(void) {}
+void sceMouseClose(void) {}
+void sceMouseRead(void) {}
+EOF
+"$root/ps5/app/ps5cc" -O2 -fPIC -c "$out/stubs/libSceMouse.c" -o "$obj/libSceMouse_stub.o"
+"$sdk/bin/prospero-lld" --shared -soname "libSceMouse.prx" -o "$out/stubs/libSceMouse.so" "$obj/libSceMouse_stub.o"
+
 # shellcheck source=/dev/null
 source "$vk/tools/radv-link.sh"
 PS5_CLANG="$shim/clang" radv_link_recipe "$vk" "$sdk" "$archive" || exit 2
@@ -259,9 +269,9 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL "${heap_link[@]}" \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/log_sink.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/rpc_cache_writer.o" "$obj/rpc_park_writer.o" "$obj/heap_info.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/display.o" "$obj/model_plan.o" "$obj/fleet_worker.o" "$obj/settings.o" "$obj/report.o" "$obj/storage.o" "$obj/log_sink.o" "$obj/probes.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/rpc_cache_writer.o" "$obj/rpc_park_writer.o" "$obj/heap_info.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" "$obj/usb_input.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "${heap_lib[@]}" "$out/gl/libps5lm_gl.a" --end-group \
-    "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
+    "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" "$out/stubs/libSceMouse.so" \
     "${radv_link_inputs[@]}" \
     --as-needed "$sdk"/target/lib/*.so
 # The heap came from patches/sdk, not the stock archive: lld takes the first
@@ -277,7 +287,8 @@ if [ ${#heap_lib[@]} -gt 0 ]; then
 fi
 "$tool" link --in "$out/llvm-pie.elf" --out "$out/eboot.elf" \
     --stub-dir "$sdk/target/lib" --stub "$out/stubs/libSceAgc.so" \
-    --stub "$out/stubs/libSceAgcDriver.so" --module-sdk 0x02000009 \
+    --stub "$out/stubs/libSceAgcDriver.so" --stub "$out/stubs/libSceMouse.so" \
+    --module-sdk 0x02000009 \
     --companion-sdk 0x08050001 --file-name eboot.elf
 
 title_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["titleId"])' "$param")

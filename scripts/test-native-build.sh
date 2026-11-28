@@ -27,6 +27,11 @@ ui_revision=$(git ls-tree HEAD third_party/ps5-homebrew-ui | awk '{print $3}')
 [[ -f "$ui/tools/fetch-opengl-sdk.sh" && $(git -C "$ui" rev-parse HEAD) == "$ui_revision" ]] || {
     echo 'title-check: initialize the pinned UI submodule first' >&2; exit 2;
 }
+# Host check, no console: USB keyboard/mouse/HDMI-CEC mapping and merge logic.
+clang++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$ui/src" -Ips5/app \
+    ps5/app/usb_input_test.cpp ps5/app/usb_input.cpp "$ui/src/core/input.cpp" \
+    -o "$output/tools/usb_input_test"
+"$output/tools/usb_input_test"
 llama="$root/third_party/llama.cpp"
 llama_revision=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
 [[ -f "$llama/CMakeLists.txt" && $(git -C "$llama" rev-parse HEAD) == "$llama_revision" ]] || {
